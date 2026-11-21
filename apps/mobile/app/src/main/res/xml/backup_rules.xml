@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and older: back up her memory, your name and settings; skip the brains (too big for a backup). -->
+<full-backup-content>
+    <include domain="sharedpref" path="." />
+    <include domain="file" path="memory.json" />
+    <exclude domain="sharedpref" path="secrets.xml" />
+    <exclude domain="sharedpref" path="remote_secrets.xml" />
+</full-backup-content>

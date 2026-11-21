@@ -18,7 +18,13 @@ export function checkDependencies() {
   let modules = 0;
   function walk(directory) {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      if (['__pycache__', 'node_modules', 'dist', '.venv'].includes(entry.name)) continue;
+      if (
+        ['__pycache__', 'node_modules', 'dist', '.venv', '.gradle', '.cxx', 'build'].includes(
+          entry.name,
+        )
+      )
+        continue;
+      if (directory === path.join(root, 'apps') && entry.name === 'mobile') continue;
       const file = path.join(directory, entry.name);
       if (entry.isDirectory()) {
         walk(file);

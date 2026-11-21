@@ -39,7 +39,7 @@ const rootFiles = [
   '.prettierrc.json',
 ];
 export const forbiddenSource =
-  /(?:^|\/)(?:node_modules|\.runtime|\.git|\.venv|__pycache__)(?:\/|$)|^(?:data|logs|vendor|archive|release)(?:\/|$)|^docs\/audit\/(?!npm-sbom\.cdx\.json$)|^(?:apps|packages|integrations)\/[^/]+\/(?:dist|build)(?:\/|$)|\.local\.(?:json|ps1)$|\.pyc$|\.env(?:\.|$)/i;
+  /(?:^|\/)(?:node_modules|\.runtime|\.git|\.venv|__pycache__)(?:\/|$)|^(?:data|logs|vendor|archive|release)(?:\/|$)|^docs\/audit\/(?!npm-sbom\.cdx\.json$)|^apps\/mobile(?:\/|$)|^(?:apps|packages|integrations)\/[^/]+\/(?:dist|build)(?:\/|$)|\.local\.(?:json|ps1)$|\.pyc$|\.env(?:\.|$)/i;
 export function sourceFiles(sourceRoot = root) {
   const result = [];
   function walk(directory) {

@@ -1,0 +1,41 @@
+{
+  "engine": "edge",
+  "preset": "hermes",
+  "presets": {
+    "cool": {
+      "description": "Debate persona: Sharp, firm, analytical, no fluff",
+      "voice": "id-ID-ArdiNeural",
+      "pitch": "-4Hz",
+      "rate": "-4%",
+      "mode_alias": "/debate"
+    },
+    "kawaii": {
+      "description": "Assistant persona: Cheerful, friendly, lively, polite",
+      "voice": "id-ID-GadisNeural",
+      "pitch": "+8Hz",
+      "rate": "+6%",
+      "mode_alias": "/assistant"
+    },
+    "normal": {
+      "description": "Fable-mind persona: Factual, concise, neutral, empirical",
+      "voice": "id-ID-ArdiNeural",
+      "pitch": "+0Hz",
+      "rate": "-2%",
+      "mode_alias": "/fable-mind"
+    },
+    "assistant": {
+      "description": "Assistant persona: Cheerful female voice",
+      "voice": "id-ID-GadisNeural",
+      "pitch": "+8Hz",
+      "rate": "+6%",
+      "mode_alias": "/assistant"
+    },
+    "hermes": {
+      "description": "Hermes persona: Technical male voice",
+      "voice": "id-ID-ArdiNeural",
+      "pitch": "+0Hz",
+      "rate": "+0%",
+      "mode_alias": "/hermes"
+    }
+  }
+}

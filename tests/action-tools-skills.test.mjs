@@ -220,11 +220,23 @@ test('file trash keeps the busy, approval and full-access behavior of the deskto
     ['authorize', 'filesystem_control'],
     ['propose', 'trash-1', args],
   ]);
-  assert.equal((await actions.approvals.respond(pending.proposal.id, true)).ok, true);
+  let approval = pending;
+  for (let step = 1; step <= 3; step++) {
+    const result = await actions.approvals.respond(approval.proposal.id, true);
+    if (step < 3) {
+      assert.equal(result.needsApproval, true);
+      approval = result;
+    } else assert.equal(result.ok, true);
+  }
   assert.deepEqual(effects.splice(0), [['trash', 'trash-1']]);
 
   fullAccess = true;
-  assert.equal((await actions.execute('filesystem_control', 'trash-2', args)).ok, true);
+  approval = await actions.execute('filesystem_control', 'trash-2', args);
+  for (let step = 1; step <= 3; step++) {
+    const result = await actions.approvals.respond(approval.proposal.id, true);
+    if (step < 3) approval = result;
+    else assert.equal(result.ok, true);
+  }
   assert.deepEqual(effects.splice(0), [
     ['authorize', 'filesystem_control'],
     ['propose', 'trash-2', args],

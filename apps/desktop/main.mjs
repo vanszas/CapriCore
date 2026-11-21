@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import {
   InferenceApi,
   apiSettings,
@@ -90,6 +91,7 @@ import {
   readSelectedComposerFiles,
 } from './main/avatar-composer-bridge.mjs';
 import { SETTINGS_CHANNELS } from './main/settings-channels.mjs';
+import { createAgentRemoteServer } from './main/agent-remote-server.mjs';
 import {
   PANEL_SECTIONS,
   SETTINGS_SECTIONS,
@@ -707,6 +709,9 @@ async function initializeDesktop() {
   let pendingMemoryDecision, latestMemoryCandidate;
   let memoryWarmup;
   const reminderListeners = new Set();
+  const agentRemoteServer = createAgentRemoteServer({
+    file: path.join(state, 'agent-remote.json'), persist: writeJsonAtomic,
+  });
   let shuttingDown = false;
   let maintenance = false;
   let rendererReady = false;
@@ -1132,6 +1137,9 @@ async function initializeDesktop() {
     firstTextTimeoutMs: responseTiming.firstTextTimeoutMs,
     timeoutMs: responseTiming.timeoutMs,
     gatewayUrl: rt.gatewayUrl,
+    chatProvider: settings.chatProvider,
+    hermesUrl: settings.hermesUrl || process.env.CAPRI_HERMES_URL || '',
+    hermesToken: () => process.env.CAPRI_HERMES_TOKEN || '',
     agentId: settings.agentId,
     sessionKey: chatSessionKey,
     token: () => readFileSync(rt.tokenPath, 'utf8').trim(),
@@ -3125,7 +3133,8 @@ async function initializeDesktop() {
         const [core] = await startModelServices({
           core: connectBackend,
           voiceFirst: warmVoice,
-          sequential: responseTiming.sequentialModels,
+          // Always sequence model/voice/ASR services so startup/wake stays responsive without disabling features.
+          sequential: true,
           shouldContinue: () => !shuttingDown && sleepService.phase !== 'sleeping',
           voice: warmVoice
             ? () =>
@@ -5260,6 +5269,16 @@ async function initializeDesktop() {
       return { ...memory, context, processLoad: load, cpu };
     });
     handle('capri:settings-versions', settingsVersions);
+    handle('capri:agent-remote-server', async (action) => {
+      if (action?.action === 'prefill') {
+        if (!['/debate', '/fable-mind'].includes(action.command)) throw new Error('Invalid Agent Remote command.');
+        window.show();
+        window.focus();
+        emit({ type: 'composer.prefill', command: action.command });
+        return true;
+      }
+      return agentRemoteServer.run(action);
+    });
     handle('capri:skill-settings', async (change, { role }) => {
       if (change === undefined) return skillSettings.snapshot();
       if (role !== 'settings') throw new Error('Open Settings → Skills to configure a skill.');
@@ -7959,6 +7978,7 @@ async function initializeDesktop() {
       nativeNpu?.stop();
       recordingIndicator?.destroy();
       userTools.close();
+      agentRemoteServer.close();
       workflows?.close();
       privateMemory.close();
       brain.close();
@@ -8260,7 +8280,8 @@ async function initializeDesktop() {
         await startModelServices({
           core: () => connectBackend({ preload }),
           voiceFirst: warmVoice,
-          sequential: responseTiming.sequentialModels,
+          // Always sequence model/voice/ASR services so startup stays responsive without disabling features.
+          sequential: true,
           shouldContinue: () => !shuttingDown && sleepService.phase !== 'sleeping',
           voice: warmVoice
             ? () =>

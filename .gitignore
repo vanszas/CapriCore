@@ -32,3 +32,15 @@ config/*.local.json
 /.codex-remote-attachments/
 /docs/audit/*
 !/docs/audit/npm-sbom.cdx.json
+
+# Capri Mobile (Android Gradle artifacts)
+apps/mobile/.gradle/
+apps/mobile/build/
+apps/mobile/app/build/
+apps/mobile/app/.cxx/
+apps/mobile/local.properties
+
+# Local installed desktop runtime & temporary test folders
+/Software/
+/.audit-backup/
+/remote-test-*/

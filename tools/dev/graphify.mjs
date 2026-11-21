@@ -177,7 +177,10 @@ try {
     mkdirSync(cache, { recursive: true });
     const python = path.join(venv, 'Scripts', 'python.exe');
     assertPrivatePath(python);
-    if (!existsSync(python)) run('py', ['-3', '-m', 'venv', venv]);
+    if (!existsSync(python)) {
+      const launcher = process.platform === 'win32' ? 'python.exe' : (process.env.PYTHON || 'python3');
+      run(launcher, ['-m', 'venv', venv]);
+    }
     run(
       python,
       [

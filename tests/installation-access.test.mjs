@@ -90,15 +90,26 @@ test('corrupt permissions never trigger implicit reset or renewed installation a
   assert.equal(await fs.readFile(f.file, 'utf8'), '{broken');
 });
 
-test('own configuration can be replaced without a dialog, with conflict detection, recovery and undo', async (t) => {
+test('own configuration replacement requires three confirmations, with conflict detection, recovery and undo', async (t) => {
   const f = await fixture();
   f.permissions.snapshot();
   await fs.mkdir(path.join(f.root, 'config'));
   await fs.mkdir(path.join(f.root, 'data/filesystem'), { recursive: true });
+  const approvals = new ActionApprovals({ emit() {} });
+  let pending;
   const service = new FileService(f.permissions, {
     database: path.join(f.root, 'data/filesystem/operations.sqlite'),
     recovery: path.join(f.root, 'data/filesystem/recovery'),
-    review: () => assert.fail('Default installation edits must not require a dialog'),
+    review: (_detail, execute) => {
+      pending = approvals.propose({
+        title: 'Replace file?',
+        detail: 'Fixture',
+        kind: 'replace',
+        voice: false,
+        execute,
+      });
+      return pending;
+    },
     replaceFile: async ({ source, target }) => fs.rename(source, target),
   });
   t.after(() => service.close());
@@ -111,7 +122,9 @@ test('own configuration can be replaced without a dialog, with conflict detectio
     text: '{"value":2}',
     expectedHash: read.expectedHash,
   });
-  assert.equal(changed.ok, true);
+  for (let step = 1; step <= 3; step++)
+    pending = await approvals.respond(pending.proposal.id, true);
+  assert.equal(pending.ok, true);
   assert.equal(await fs.readFile(path.join(f.root, base.path), 'utf8'), '{"value":2}');
   await assert.rejects(
     service.execute('stale', {
@@ -139,7 +152,7 @@ test('own configuration can be replaced without a dialog, with conflict detectio
   );
 });
 
-test('own file removal uses the existing verified recovery path without an approval dialog', async (t) => {
+test('own file removal requires three confirmations and keeps verified recovery', async (t) => {
   const f = await fixture();
   f.permissions.snapshot();
   const state = path.join(f.root, 'data/desktop');
@@ -152,17 +165,15 @@ test('own file removal uses the existing verified recovery path without an appro
   t.after(() => catalog.close());
   const file = path.join(f.root, 'test-note.txt');
   await fs.writeFile(file, 'owned fixture');
-  const approvals = new ActionApprovals({
-    emit() {
-      assert.fail('Own file removal should not request approval');
-    },
-  });
-  const result = await catalog.execute(
+  const approvals = new ActionApprovals({ emit() {} });
+  let pending = await catalog.execute(
     'trash-own',
     { action: 'trash', scopeId: INSTALLATION_SCOPE_ID, path: 'test-note.txt' },
     approvals,
   );
-  assert.equal(result.ok, true);
+  for (let step = 1; step <= 3; step++)
+    pending = await approvals.respond(pending.proposal.id, true);
+  assert.equal(pending.ok, true);
   await assert.rejects(fs.stat(file), { code: 'ENOENT' });
   const row = catalog.db.prepare('SELECT * FROM recovery WHERE id=?').get('trash-own');
   assert.equal(

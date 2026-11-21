@@ -11,3 +11,4 @@ config/*.local.json
 package-lock.json
 config/*lock*
 config/workspace/AGENTS.md
+apps/mobile

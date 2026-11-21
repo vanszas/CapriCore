@@ -240,9 +240,85 @@ const elements = Object.fromEntries(
     'history-toggle',
     'history-close',
     'history-clear',
+    'agent-remote-open',
+    'agent-remote-panel',
+    'agent-remote-close',
+    'agent-remote-debate',
+    'agent-remote-fable',
+    'agent-remote-server-toggle',
+    'agent-remote-server-state',
+    'agent-remote-qr',
+    'agent-remote-status',
     'history-empty',
   ].map((id) => [id, document.getElementById(id)]),
 );
+const agentRemotePanel = elements['agent-remote-panel'];
+let agentRemoteQrUrl = '';
+function clearAgentRemoteQr() {
+  elements['agent-remote-qr'].hidden = true;
+  elements['agent-remote-qr'].removeAttribute('src');
+  if (agentRemoteQrUrl) {
+    URL.revokeObjectURL(agentRemoteQrUrl);
+    agentRemoteQrUrl = '';
+  }
+}
+function setAgentRemotePanel(open) {
+  agentRemotePanel.hidden = !open;
+  elements['agent-remote-open'].setAttribute('aria-expanded', String(open));
+  if (open) void refreshAgentRemoteStatus();
+}
+async function refreshAgentRemoteStatus() {
+  try {
+    const status = await api.agentRemoteServer('status');
+    elements['agent-remote-server-state'].textContent = status.running
+      ? `Server running (${status.mode || 'desktop'})`
+      : 'Server stopped';
+    elements['agent-remote-server-toggle'].setAttribute('aria-pressed', String(status.running));
+    elements['agent-remote-server-toggle'].textContent = status.running ? 'Stop server' : 'Start server';
+    clearAgentRemoteQr();
+    if (status.running) {
+      const qr = await api.agentRemoteServer('qr');
+      if (!qr.src?.startsWith('data:image/png;base64,')) throw new Error('Invalid pairing QR.');
+      const bytes = Uint8Array.from(atob(qr.src.slice('data:image/png;base64,'.length)), (c) => c.charCodeAt(0));
+      agentRemoteQrUrl = URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
+      elements['agent-remote-qr'].src = agentRemoteQrUrl;
+      await elements['agent-remote-qr'].decode();
+      elements['agent-remote-qr'].hidden = false;
+    }
+  } catch {
+    elements['agent-remote-server-state'].textContent = 'Server unavailable';
+    clearAgentRemoteQr();
+  }
+}
+async function toggleAgentRemoteServer() {
+  elements['agent-remote-server-toggle'].disabled = true;
+  try {
+    const status = await api.agentRemoteServer(
+      elements['agent-remote-server-toggle'].getAttribute('aria-pressed') === 'true' ? 'stop' : 'start',
+    );
+    elements['agent-remote-server-toggle'].setAttribute('aria-pressed', String(status.running));
+    elements['agent-remote-server-toggle'].textContent = status.running ? 'Stop server' : 'Start server';
+    await refreshAgentRemoteStatus();
+  } catch (error) {
+    elements['agent-remote-status'].textContent = error.message;
+  } finally {
+    elements['agent-remote-server-toggle'].disabled = false;
+  }
+}
+function runAgentRemoteCommand(command) {
+  elements['agent-remote-status'].textContent = `${command} queued`;
+  setAgentRemotePanel(false);
+  elements.message.value = `${command} `;
+  elements.message.focus();
+  sizeInput();
+  controls();
+}
+elements['agent-remote-open'].addEventListener('click', () => setAgentRemotePanel(agentRemotePanel.hidden));
+elements['agent-remote-close'].addEventListener('click', () => setAgentRemotePanel(false));
+elements['agent-remote-debate'].addEventListener('click', () => runAgentRemoteCommand('/debate'));
+elements['agent-remote-fable'].addEventListener('click', () => runAgentRemoteCommand('/fable-mind'));
+elements['agent-remote-server-toggle'].addEventListener('click', toggleAgentRemoteServer);
+
 const messages = new Map();
 const messageViews = new Map();
 let latestMessageId = null;
@@ -319,6 +395,15 @@ function showApplicationAccess(value) {
 document.querySelectorAll('[data-quick]').forEach((button) => {
   button.onclick = async () => {
     const feature = button.dataset.quick;
+    if (feature === 'agent-remote') {
+      if (skillState['capri.agent-remote']?.enabled !== true) {
+        void api.openSettings('agent-remote');
+        return;
+      }
+      setAgentRemotePanel(true);
+      void refreshAgentRemoteStatus();
+      return;
+    }
     if (feature === 'applications') {
       button.disabled = true;
       try {
@@ -2091,6 +2176,16 @@ function renderHistoryMessage(message, refreshLocale = false) {
 
 let interfaceLanguageRevision = 0;
 function onEvent(event) {
+  if (event.type === 'composer.prefill') {
+    if (!['/debate', '/fable-mind'].includes(event.command)) return;
+    if (elements.message.value.trim()) {
+      elements['agent-remote-status'].textContent = 'Composer has a draft. Clear it before inserting a remote command.';
+      setAgentRemotePanel(true);
+      return;
+    }
+    runAgentRemoteCommand(event.command);
+    return;
+  }
   if (event.type === 'skills.settings') {
     skillState = event.settings;
     if (event.changed === 'capri.attachment-viewer' && !skillState[event.changed]?.enabled)
@@ -2262,7 +2357,11 @@ function onEvent(event) {
     document.getElementById('action-approval').hidden = !pendingAction;
     if (pendingAction) {
       presence.reveal();
-      document.getElementById('action-approval-title').textContent = ui.text(pendingAction.title);
+      document.getElementById('action-approval-title').textContent =
+        ui.text(pendingAction.title) +
+        (pendingAction.confirmationTotal > 1
+          ? ` (${pendingAction.confirmationStep}/${pendingAction.confirmationTotal})`
+          : '');
       document.getElementById('action-approval-detail').textContent = pendingAction.detail;
       pendingActionTimer = setTimeout(
         () => {

@@ -63,7 +63,9 @@ test('several file approvals queue without executing unseen actions or losing th
   assert.equal(second.queued, true);
   assert.deepEqual(calls, []);
   assert.equal(approval.pending.id, first.proposal.id);
-  await approval.respond(first.proposal.id, true);
+  let firstStage = first;
+  for (let step = 1; step <= 3; step++)
+    firstStage = await approval.respond(firstStage.proposal.id, true);
   assert.deepEqual(calls, [1]);
   assert.equal(approval.pending.id, second.proposal.id);
   await assert.rejects(approval.respond(first.proposal.id, true), /expired/);
@@ -136,7 +138,9 @@ test('purging recovery removes only the private backup, never a restored origina
     { action: 'trash', scopeId: scope.id, path: 'note.txt' },
     f.approvals,
   );
-  await f.approvals.respond(proposal.proposal.id, true);
+  let firstStage = proposal;
+  for (let step = 1; step <= 3; step++)
+    firstStage = await f.approvals.respond(firstStage.proposal.id, true);
   assert.equal(f.catalog.recovery().length, 1);
   f.catalog.restore('trash1');
   assert.equal(await fs.readFile(original, 'utf8'), 'Owner fixture');

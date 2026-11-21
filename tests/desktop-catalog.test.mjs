@@ -393,8 +393,12 @@ test('Recycle Bin action checks exact file again and retains a verified recovery
   const args = { action: 'trash', scopeId: scope.id, path: 'note.txt' };
   let proposal = await f.catalog.execute('changed', args, f.approvals);
   writeFileSync(file, 'changed');
+  for (let step = 1; step <= 2; step++)
+    proposal = await f.approvals.respond(proposal.proposal.id, true);
   await assert.rejects(f.approvals.respond(proposal.proposal.id, true), /changed/);
   proposal = await f.catalog.execute('actual', args, f.approvals);
+  for (let step = 1; step <= 2; step++)
+    proposal = await f.approvals.respond(proposal.proposal.id, true);
   const result = await f.approvals.respond(proposal.proposal.id, true);
   assert.equal(result.recoveryId, 'actual');
   const row = f.catalog.db.prepare('SELECT * FROM recovery WHERE id=?').get('actual');

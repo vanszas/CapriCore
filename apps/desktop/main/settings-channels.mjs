@@ -151,6 +151,7 @@ export const SETTINGS_CHANNELS = [
   'spotify-access',
   'reminder-retry',
   'settings-versions',
+  'agent-remote-server',
   'avatar-layout',
   'presence-pinned',
   'stopwatch-select',

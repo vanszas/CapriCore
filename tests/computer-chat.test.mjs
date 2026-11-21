@@ -352,6 +352,111 @@ test('Escape cancellation rejects late music and explicit computer inputs while 
   }
 });
 
+test('multilingual goals reach semantic routing despite fast CPU hints and NPU dialogue, retaining approval', async () => {
+  const goals = [
+    'Kontrol PC saya untuk membuka Notepad.',
+    'Take control of my computer and launch Notepad.',
+    'Prends le contrôle de mon ordinateur et lance Notepad.',
+    'Übernimm die Steuerung meines Computers und starte Notepad.',
+    'Toma el control de mi ordenador e inicia Notepad.',
+    'Возьми управление моим компьютером и запусти Notepad.',
+    '私のパソコンを操作してメモ帳を起動してください。',
+    '请控制我的电脑并启动记事本。',
+    'تحكم في حاسوبي وشغّل المفكرة.',
+  ];
+  for (const goal of goals) {
+    let classified = 0;
+    const f = fixture({
+      requestRouter: { classify: async () => ({ mode: 'fast', reason: 'simple-dialogue' }) },
+      npuDialogue: async () => assert.fail('Desktop intent must not become NPU dialogue'),
+      computerIntent: computerIntentClassifier({
+        url: 'http://127.0.0.1:11434',
+        model: 'fixture',
+        fetchImpl: async (_url, options) => {
+          classified++;
+          const request = JSON.parse(options.body);
+          const owner = JSON.parse(request.messages.at(-1).content);
+          assert.equal(owner.latestOwnerMessage, goal);
+          assert.equal(owner.fullComputerAccess, false);
+          assert.match(request.messages[0].content, /every language, without requiring particular keywords/);
+          return new Response(JSON.stringify({
+            done: true,
+            message: { content: JSON.stringify({ intent: 'task_with_access', usesPrevious: false }) },
+          }));
+        },
+      }),
+    });
+    const pending = f.send(goal);
+    for (let i = 0; i < 100 && !f.dialogs.length; i++) await delay(1);
+    assert.equal(classified, 1, goal);
+    assert.equal(f.access.enabled, false, goal);
+    assert.deepEqual(f.goals, [], goal);
+    assert.equal(f.dialogs.length, 1, goal);
+    assert.equal(f.accept(), true, goal);
+    await pending;
+    assert.deepEqual(f.goals, [goal], goal);
+    assert.equal(f.access.enabled, true, goal);
+    assert.equal(f.modelCalls, 1, goal);
+    assert.equal(f.events.at(-1).type, 'turn.completed', goal);
+  }
+});
+
+test('live Discord status questions reach the executor with the host grant, never grant access themselves', async () => {
+  for (const fullComputerAccess of [false, true]) {
+    for (const goal of [
+      'What is my current Discord status?',
+      'Какой у меня сейчас статус в Дискорде?',
+      'Apa status Discord saya sekarang?',
+    ]) {
+      let classified = 0;
+      let classificationRequest;
+      const f = fixture({
+        interfaceState: () => ({ fullComputerAccess }),
+        requestRouter: { classify: async () => ({ mode: 'fast', reason: 'simple-dialogue' }) },
+        computerIntent: computerIntentClassifier({
+          url: 'http://127.0.0.1:11434',
+          model: 'fixture',
+          fetchImpl: async (_url, options) => {
+            classified++;
+            classificationRequest = JSON.parse(options.body);
+            return Response.json({
+              done: true,
+              message: { content: JSON.stringify({ intent: 'task', usesPrevious: false }) },
+            });
+          },
+        }),
+        computerTask: async (task, options) => {
+          assert.equal(fullComputerAccess, true, 'Only the host grant permits execution');
+          options.signal.throwIfAborted();
+          f.goals.push(task);
+          return { ok: true, status: 'completed', summary: 'Observed the requested status.' };
+        },
+        prepareContext: null,
+        token: () => 'fixture',
+        persona: () => 'fixture',
+        fetchImpl: async () => {
+          assert.equal(fullComputerAccess, false, 'Granted status checks must not become ordinary chat');
+          return new Response(
+            'data: ' + JSON.stringify({ choices: [{ delta: { content: 'Access is not enabled.' } }] }) + '\n\ndata: [DONE]\n\n',
+            { headers: { 'content-type': 'text/event-stream' } },
+          );
+        },
+      });
+      await f.send(goal);
+      assert.equal(classified, 1, goal);
+      const owner = JSON.parse(classificationRequest.messages.at(-1).content);
+      assert.equal(owner.latestOwnerMessage, goal);
+      assert.equal(owner.fullComputerAccess, fullComputerAccess);
+      assert.match(classificationRequest.messages[0].content, /live app status.*task/u);
+      assert.match(classificationRequest.messages[0].content, /Read-only inspection does not authorize changing/u);
+      assert.deepEqual(f.goals, fullComputerAccess ? [goal] : [], goal);
+      assert.deepEqual(f.dialogs, [], goal);
+      assert.equal(f.access.enabled, false, 'Semantic classification cannot create a grant');
+      assert.equal(f.events.at(-1).type, 'turn.completed', JSON.stringify({ goal, event: f.events.at(-1) }));
+    }
+  }
+});
+
 test('direct call commands wait for the existing full-access grant and reach the executor without a model', async () => {
   const f = fixture();
   const join = 'Join this meeting in Google Meet.';
@@ -689,6 +794,7 @@ test('Discord semantic recovery neither creates a grant nor resumes after cancel
     requestRouter: { classify: async () => ({ mode: 'fast', reason: 'simple-dialogue' }) },
     computerIntent: async () => {
       classifications++;
+      if (!f.access.enabled) return { intent: 'task', usesPrevious: false };
       return intent.promise;
     },
     prepareContext: null,
@@ -701,15 +807,15 @@ test('Discord semantic recovery neither creates a grant nor resumes after cancel
   });
   const goal = 'Rejoins le salon vocal Général sur Discord.';
   await f.send(goal);
-  assert.equal(classifications, 0);
+  assert.equal(classifications, 1);
   assert.deepEqual(f.dialogs, []);
   assert.deepEqual(f.goals, []);
   const enabling = f.send('Enable full computer access.');
   f.accept();
   await enabling;
   const task = f.send(goal);
-  for (let i = 0; i < 20 && !classifications; i++) await new Promise(setImmediate);
-  assert.equal(classifications, 1);
+  for (let i = 0; i < 20 && classifications < 2; i++) await new Promise(setImmediate);
+  assert.equal(classifications, 2);
   f.chat.cancel();
   intent.resolve({ intent: 'task', usesPrevious: false });
   await task;

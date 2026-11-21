@@ -37,6 +37,7 @@ export class FullComputerAccess {
       write: true,
       kind: 'computer',
       confirmationRequired: false,
+      destructiveConfirmationRequired: true,
     }));
   }
   async configure(enabled, { signal } = {}) {
@@ -57,7 +58,7 @@ export class FullComputerAccess {
         !(await this.confirm({
           title: 'Give access to the whole computer?',
           detail:
-            'Capri will be able to use supported file, application, keyboard and mouse actions on your local drives without repeated confirmation. Requested actions can change your files and applications. You can revoke this access here at any time. Windows permissions and separate remote-provider settings still apply.',
+            'Capri will be able to use supported non-destructive file, application, keyboard and mouse actions on your local drives without repeated confirmation. File replacement and Recycle Bin actions always require three separate owner confirmations. You can revoke this access here at any time. Windows permissions and separate remote-provider settings still apply.',
           confirmLabel: 'Give full computer access',
           danger: true,
           delayMs: 3000,

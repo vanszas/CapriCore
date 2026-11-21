@@ -4,6 +4,7 @@ import { root } from '../host/paths.mjs';
 import { MIN_COMPANION_CONTEXT, isManagedCapriModel } from './context-policy.mjs';
 import { deviceSettingsFile, readModelDevices } from '../model-device-settings.mjs';
 import { cpuExecutionProfile } from '../hardware/cpu-execution.mjs';
+import { validateChatProvider } from '../providers/chat-router.mjs';
 
 export function generationParams(value = { temperature: 0.85, repeat_last_n: 512 }) {
   if (
@@ -27,6 +28,7 @@ export function validateCoreSettings(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value))
     throw new Error('Core settings must be an object');
   const result = structuredClone(value);
+  result.chatProvider = validateChatProvider(result.chatProvider);
   if (result.modelSetupRequired !== undefined && typeof result.modelSetupRequired !== 'boolean')
     throw new Error('Invalid model setup state');
   if (

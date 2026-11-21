@@ -272,7 +272,7 @@ test('new memory request forms still refuse Portuguese secrets before persistenc
   }
 });
 
-test('Lemonade dialogue uses recent clean turns without OpenClaw tools, compaction or leaked avatar frames', async () => {
+test('Lemonade dialogue retains clean history after semantic routing without OpenClaw tools or leaked avatar frames', async () => {
   const transcript = store();
   for (const [turnId, question, reply, status] of [
     [
@@ -289,6 +289,7 @@ test('Lemonade dialogue uses recent clean turns without OpenClaw tools, compacti
   }
   const events = [];
   const commits = [];
+  let classifications = 0;
   const service = client({
     store: transcript,
     interfaceState: () => ({
@@ -296,7 +297,10 @@ test('Lemonade dialogue uses recent clean turns without OpenClaw tools, compacti
       modelToolsAvailable: false,
       languages: { conversation: 'ru' },
     }),
-    computerIntent: () => assert.fail('Ordinary NPU dialogue should make one model request'),
+    computerIntent: async () => {
+      classifications++;
+      return null;
+    },
     fetchImpl: () => assert.fail('The NPU dialogue must not go through OpenClaw'),
     commitNpuDialogue: async (user, assistant) => commits.push([user.text, assistant.text]),
     npuDialogue: async (payload) => {
@@ -318,6 +322,7 @@ test('Lemonade dialogue uses recent clean turns without OpenClaw tools, compacti
     },
   });
   await service.send({ id: randomUUID(), text: 'Как меня зовут?' }, (event) => events.push(event));
+  assert.equal(classifications, 1, 'Unknown-language intent is checked before NPU dialogue');
   assert.equal(events.at(-1).type, 'turn.completed');
   assert.equal(events.at(-1).assistant.text, 'Тест.');
   assert.deepEqual(commits, [['Как меня зовут?', 'Тест.']]);

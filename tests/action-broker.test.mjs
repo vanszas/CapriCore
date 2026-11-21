@@ -146,3 +146,34 @@ test('confirm and approve consume only real unexpired voice-enabled proposals', 
   assert.equal(await approvals.text('approve'), null);
   assert.equal(calls, 4);
 });
+
+test('destructive proposals require three separate UI confirmations and never accept voice', async () => {
+  const audit = [],
+    approvals = new ActionApprovals({ emit() {}, audit: (value) => audit.push(value) });
+  let calls = 0;
+  let proposal = approvals.propose({
+    title: 'Delete fixture?',
+    detail: 'private-token-must-not-enter-audit',
+    kind: 'trash',
+    voice: true,
+    execute: async () => ({ ok: true, count: ++calls }),
+  });
+  assert.equal(proposal.proposal.confirmationTotal, 3);
+  assert.equal(proposal.proposal.voice, false);
+  assert.match((await approvals.text('yes')).confirmation, /buttons/);
+  assert.equal(calls, 0);
+  const ids = [proposal.proposal.id];
+  for (let step = 1; step <= 3; step++) {
+    const result = await approvals.respond(proposal.proposal.id, true);
+    if (step < 3) {
+      assert.equal(result.needsApproval, true);
+      assert.equal(result.confirmationStep, step + 1);
+      proposal = result;
+      ids.push(proposal.proposal.id);
+    } else assert.deepEqual(result, { ok: true, count: 1 });
+  }
+  assert.equal(new Set(ids).size, 3);
+  assert.equal(approvals.pending, null);
+  assert.doesNotMatch(JSON.stringify(audit), /private-token/);
+  assert.ok(audit.every((entry) => !Object.hasOwn(entry, 'detail')));
+});

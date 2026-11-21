@@ -77,6 +77,15 @@ export const SKILL_SETTINGS = Object.freeze(
       'applications-open',
     ],
     [
+      'capri.agent-remote',
+      'agent-remote',
+      'Agent Remote',
+      'Connect Capri to Agent Remote, pairing QR, server status and remote commands.',
+      'M3 10h4l3-6 3 12 3-6h4M5 16h10',
+      'agent-remote-open',
+      false,
+    ],
+    [
       'capri.calculator',
       'calculator',
       'Calculator',
@@ -238,6 +247,10 @@ const russianSkills = {
   'capri.applications': [
     'Доступ к приложениям',
     'Открывает разрешённые приложения по названию и работает с ними.',
+  ],
+  'capri.agent-remote': [
+    'Agent Remote',
+    'Connect Capri to Agent Remote, pairing QR, server status and remote commands.',
   ],
   'capri.calculator': ['Калькулятор', 'Проверяет арифметические и научные вычисления.'],
   'capri.spotify': ['Spotify', 'Находит треки, управляет воспроизведением и громкостью Spotify.'],

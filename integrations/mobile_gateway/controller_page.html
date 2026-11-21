@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>AgentRemote • Game Controller</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      touch-action: none;
+    }
+    body {
+      background-color: #12141a;
+      color: #ffffff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      overflow: hidden;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      height: 52px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      background: rgba(255, 255, 255, 0.03);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      flex-shrink: 0;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+    }
+    .brand svg {
+      width: 22px;
+      height: 22px;
+    }
+    .controls-top {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .btn-toggle {
+      background: #1e222d;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: #94a3b8;
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+    .btn-toggle.armed {
+      background: rgba(34, 197, 94, 0.15);
+      border-color: #22c55e;
+      color: #4ade80;
+    }
+    .btn-panic {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid #ef4444;
+      color: #f87171;
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn-panic:active {
+      background: #ef4444;
+      color: #ffffff;
+    }
+    .arena {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 24px 32px;
+      position: relative;
+    }
+    /* D-PAD */
+    .dpad-container {
+      width: 200px;
+      height: 200px;
+      position: relative;
+    }
+    .dpad-btn {
+      position: absolute;
+      width: 64px;
+      height: 64px;
+      background: #1c202a;
+      border: 2px solid rgba(255, 255, 255, 0.12);
+      border-radius: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: background 0.05s, transform 0.05s, border-color 0.05s;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+    .dpad-btn svg {
+      width: 30px;
+      height: 30px;
+      pointer-events: none;
+    }
+    .dpad-btn.pressed {
+      background: #3b82f6 !important;
+      border-color: #60a5fa !important;
+      transform: scale(0.92);
+      box-shadow: 0 0 16px rgba(59, 130, 246, 0.6);
+    }
+    .dpad-up    { top: 0; left: 68px; }
+    .dpad-down  { bottom: 0; left: 68px; }
+    .dpad-left  { top: 68px; left: 0; }
+    .dpad-right { top: 68px; right: 0; }
+    .dpad-center {
+      position: absolute;
+      top: 68px;
+      left: 68px;
+      width: 64px;
+      height: 64px;
+      background: #151821;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .dpad-center svg {
+      width: 18px;
+      height: 18px;
+      opacity: 0.3;
+    }
+    /* ACTION CLUSTER */
+    .action-container {
+      width: 220px;
+      height: 220px;
+      position: relative;
+    }
+    .action-btn {
+      position: absolute;
+      background: #1c202a;
+      border: 2px solid rgba(255, 255, 255, 0.12);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: background 0.05s, transform 0.05s, border-color 0.05s;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+    .action-btn svg {
+      pointer-events: none;
+    }
+    .action-btn.pressed {
+      transform: scale(0.92);
+    }
+    /* Space / Jump */
+    .btn-space {
+      bottom: 0;
+      left: 40px;
+      width: 82px;
+      height: 82px;
+      background: #1e2638;
+      border-color: rgba(99, 102, 241, 0.4);
+    }
+    .btn-space svg {
+      width: 36px;
+      height: 36px;
+    }
+    .btn-space.pressed {
+      background: #6366f1 !important;
+      border-color: #818cf8 !important;
+      box-shadow: 0 0 20px rgba(99, 102, 241, 0.7);
+    }
+    /* E / Interact 1 */
+    .btn-e {
+      top: 20px;
+      left: 0;
+      width: 70px;
+      height: 70px;
+      background: #25221c;
+      border-color: rgba(245, 158, 11, 0.4);
+    }
+    .btn-e svg {
+      width: 32px;
+      height: 32px;
+    }
+    .btn-e.pressed {
+      background: #f59e0b !important;
+      border-color: #fbbf24 !important;
+      box-shadow: 0 0 16px rgba(245, 158, 11, 0.7);
+    }
+    /* F / Interact 2 */
+    .btn-f {
+      top: 30px;
+      right: 10px;
+      width: 70px;
+      height: 70px;
+      background: #251c27;
+      border-color: rgba(236, 72, 153, 0.4);
+    }
+    .btn-f svg {
+      width: 32px;
+      height: 32px;
+    }
+    .btn-f.pressed {
+      background: #ec4899 !important;
+      border-color: #f472b6 !important;
+      box-shadow: 0 0 16px rgba(236, 72, 153, 0.7);
+    }
+    /* Status banner */
+    .status-bar {
+      height: 34px;
+      background: #0d0f14;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      font-size: 11px;
+      color: #64748b;
+    }
+    .status-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #22c55e;
+    }
+    .dot.disarmed {
+      background: #eab308;
+    }
+    .dot.offline {
+      background: #ef4444;
+    }
+    .attribution {
+      color: #475569;
+      text-decoration: none;
+      font-size: 10px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <!-- Icons8 Game Controller SVG (#FFFFFF) -->
+      <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M14 12C9 12 5 16 5 21C5 25.5 8 33 11 37C12.5 39 15 39 17 37L21 33H27L31 37C33 39 35.5 39 37 37C40 33 43 25.5 43 21C43 16 39 12 34 12H14Z" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M15 20V26M12 23H18" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round"/>
+        <circle cx="31" cy="21" r="2" fill="#FFFFFF"/>
+        <circle cx="35" cy="25" r="2" fill="#FFFFFF"/>
+      </svg>
+      <span>AgentRemote Gamepad</span>
+    </div>
+    <div class="controls-top">
+      <button id="btnArm" class="btn-toggle armed" onclick="toggleArm()">
+        <span id="armText">Armed</span>
+      </button>
+      <button class="btn-panic" onclick="panicRelease()">
+        <!-- Icons8 Stop / Hand SVG -->
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="15" y1="9" x2="9" y2="15"/>
+          <line x1="9" y1="9" x2="15" y2="15"/>
+        </svg>
+        <span>Release</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="arena">
+    <!-- D-PAD (WASD) -->
+    <div class="dpad-container">
+      <!-- W: Icons8 Arrow Up (#FFFFFF) -->
+      <div id="btn-w" class="dpad-btn dpad-up" data-key="w">
+        <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M24 10L12 22M24 10L36 22M24 10V38" stroke="#FFFFFF" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <!-- A: Icons8 Arrow Left (#FFFFFF) -->
+      <div id="btn-a" class="dpad-btn dpad-left" data-key="a">
+        <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M10 24L22 12M10 24L22 36M10 24H38" stroke="#FFFFFF" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div class="dpad-center">
+        <!-- Icons8 Compass/Crosshair Center Dot -->
+        <svg viewBox="0 0 24 24" fill="#FFFFFF">
+          <circle cx="12" cy="12" r="4"/>
+        </svg>
+      </div>
+      <!-- D: Icons8 Arrow Right (#FFFFFF) -->
+      <div id="btn-d" class="dpad-btn dpad-right" data-key="d">
+        <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M38 24L26 12M38 24L26 36M38 24H10" stroke="#FFFFFF" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <!-- S: Icons8 Arrow Down (#FFFFFF) -->
+      <div id="btn-s" class="dpad-btn dpad-down" data-key="s">
+        <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M24 38L12 26M24 38L36 26M24 38V10" stroke="#FFFFFF" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+    </div>
+
+    <!-- ACTION BUTTONS (Space, E, F) -->
+    <div class="action-container">
+      <!-- E: Icons8 Hand / Grab / Action 1 (#FFFFFF) -->
+      <div id="btn-e" class="action-btn btn-e" data-key="e">
+        <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M19 16V28M24 12V28M29 14V28M34 18V28C34 35 29 40 22 40C16 40 13 36 13 30V24L10 21C8 19 8 16 10 14C12 12 15 13 17 16L19 19" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <!-- F: Icons8 Flash / Target / Action 2 (#FFFFFF) -->
+      <div id="btn-f" class="action-btn btn-f" data-key="f">
+        <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M24 6V14M24 34V42M6 24H14M34 24H42M24 16C19.58 16 16 19.58 16 24C16 28.42 19.58 32 24 32C28.42 32 32 28.42 32 24C32 19.58 28.42 16 24 16Z" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <!-- Space: Icons8 Spring / Jump (#FFFFFF) -->
+      <div id="btn-space" class="action-btn btn-space" data-key="space">
+        <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 36C12 36 16 38 24 38C32 38 36 36 36 36M16 28C16 28 19 30 24 30C29 30 32 28 32 28M20 20C20 20 21.5 21 24 21C26.5 21 28 20 28 20M24 14V6M24 6L19 11M24 6L29 11" stroke="#FFFFFF" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+    </div>
+  </main>
+
+  <footer class="status-bar">
+    <div class="status-left">
+      <div id="statusDot" class="dot"></div>
+      <span id="statusText">DirectInput Hardware Bridge Active</span>
+    </div>
+    <span class="attribution">Icons by Icons8</span>
+  </footer>
+
+  <script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const token = urlParams.get('token') || localStorage.getItem('agent_remote_token') || '';
+    if (token) localStorage.setItem('agent_remote_token', token);
+
+    let isArmed = true;
+    let pressedKeys = new Set();
+    let heartbeatTimer = null;
+
+    function toggleArm() {
+      isArmed = !isArmed;
+      const btn = document.getElementById('btnArm');
+      const text = document.getElementById('armText');
+      const dot = document.getElementById('statusDot');
+      if (isArmed) {
+        btn.classList.add('armed');
+        text.innerText = 'Armed';
+        dot.className = 'dot';
+      } else {
+        btn.classList.remove('armed');
+        text.innerText = 'Disarmed';
+        dot.className = 'dot disarmed';
+        panicRelease();
+      }
+    }
+
+    async function sendKey(key, state) {
+      if (!isArmed && state === 'down') return;
+      try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (token) headers['Authorization'] = 'Bearer ' + token;
+        const res = await fetch('/api/controller/key', {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify({ key: key, state: state })
+        });
+        if (!res.ok) {
+          console.warn('Controller key failed:', await res.text());
+        }
+      } catch (err) {
+        console.error('Network error sending key:', err);
+      }
+    }
+
+    async function panicRelease() {
+      pressedKeys.clear();
+      document.querySelectorAll('.pressed').forEach(el => el.classList.remove('pressed'));
+      try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (token) headers['Authorization'] = 'Bearer ' + token;
+        await fetch('/api/controller/release-all', {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify({})
+        });
+      } catch (e) {}
+    }
+
+    function onTouchStart(e) {
+      e.preventDefault();
+      if (!isArmed) return;
+      if (navigator.vibrate) navigator.vibrate(15);
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const touch = e.changedTouches[i];
+        const elem = document.elementFromPoint(touch.clientX, touch.clientY);
+        const btn = elem ? elem.closest('[data-key]') : null;
+        if (btn) {
+          const key = btn.getAttribute('data-key');
+          if (key && !pressedKeys.has(key)) {
+            pressedKeys.add(key);
+            btn.classList.add('pressed');
+            sendKey(key, 'down');
+          }
+        }
+      }
+      startHeartbeat();
+    }
+
+    function onTouchEnd(e) {
+      e.preventDefault();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const touch = e.changedTouches[i];
+        const elem = document.elementFromPoint(touch.clientX, touch.clientY);
+        const btn = elem ? elem.closest('[data-key]') : null;
+        if (btn) {
+          const key = btn.getAttribute('data-key');
+          if (key && pressedKeys.has(key)) {
+            pressedKeys.delete(key);
+            btn.classList.remove('pressed');
+            sendKey(key, 'up');
+          }
+        }
+      }
+      if (pressedKeys.size === 0) {
+        stopHeartbeat();
+      }
+    }
+
+    function onTouchCancel(e) {
+      e.preventDefault();
+      panicRelease();
+      stopHeartbeat();
+    }
+
+    function startHeartbeat() {
+      if (heartbeatTimer) return;
+      heartbeatTimer = setInterval(() => {
+        if (pressedKeys.size > 0 && isArmed) {
+          pressedKeys.forEach(k => sendKey(k, 'down'));
+        } else {
+          stopHeartbeat();
+        }
+      }, 200);
+    }
+
+    function stopHeartbeat() {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    }
+
+    // Attach touch & mouse events
+    const arena = document.querySelector('.arena');
+    arena.addEventListener('touchstart', onTouchStart, { passive: false });
+    arena.addEventListener('touchend', onTouchEnd, { passive: false });
+    arena.addEventListener('touchcancel', onTouchCancel, { passive: false });
+
+    // Desktop mouse fallback
+    arena.addEventListener('mousedown', (e) => {
+      const btn = e.target.closest('[data-key]');
+      if (!btn || !isArmed) return;
+      const key = btn.getAttribute('data-key');
+      pressedKeys.add(key);
+      btn.classList.add('pressed');
+      sendKey(key, 'down');
+      startHeartbeat();
+    });
+    window.addEventListener('mouseup', () => {
+      if (pressedKeys.size > 0) {
+        pressedKeys.forEach(k => sendKey(k, 'up'));
+        pressedKeys.clear();
+        document.querySelectorAll('.pressed').forEach(el => el.classList.remove('pressed'));
+        stopHeartbeat();
+      }
+    });
+
+    // Auto-release on page hide/blur
+    window.addEventListener('blur', panicRelease);
+    window.addEventListener('visibilitychange', () => {
+      if (document.hidden) panicRelease();
+    });
+    window.addEventListener('pagehide', panicRelease);
+  </script>
+</body>
+</html>

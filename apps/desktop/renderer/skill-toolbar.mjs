@@ -74,7 +74,9 @@ export function skillToolbar({ ui, openSettings, onLayout, inputMic }) {
     group.setAttribute('aria-label', ui.text('Skills'));
     for (const { button, composer, existing, skill, syncComposer } of buttons) {
       const entry = settings[skill.id];
-      button.hidden = !(entry?.showButton ?? skill.showButton);
+      button.hidden =
+        !(entry?.showButton ?? skill.showButton) ||
+        (skill.id === 'capri.agent-remote' && entry?.enabled !== true);
       button.dataset.skillEnabled = String(entry?.enabled === true);
       if (!existing || !entry?.enabled) {
         button.title = ui.text(skill.name);

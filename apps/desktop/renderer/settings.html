@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' blob: data:; connect-src capri://desktop/index.html capri://desktop/hall-of-fame.json capri://desktop/shared/languages.json capri://desktop/shared/interface-locales.json capri://desktop/locales/; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' blob: data:; connect-src capri://desktop/index.html capri://desktop/hall-of-fame.json capri://desktop/shared/languages.json capri://desktop/shared/interface-locales.json capri://desktop/locales/ http://127.0.0.1:9120; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'"
     />
     <title>Capri Settings</title>
     <link rel="icon" type="image/svg+xml" href="/brand/capricore.svg" />
@@ -98,6 +98,25 @@
         </div>
         <button id="settings-open" class="sr-only">Settings</button>
         <div id="settings-forms">
+          <section id="agent-remote-panel" class="preferences-panel" data-panel-cut="12" aria-label="Agent Remote" hidden>
+            <h2>Agent Remote</h2>
+            <div class="preferences-content">
+              <label><input id="agent-remote-settings-enabled" type="checkbox" role="switch" /> Enable Agent Remote quick-bar button</label>
+              <p>Pair below. Commands fill the composer; press Send yourself.</p>
+              <label for="agent-remote-settings-mode">Network mode</label>
+              <select id="agent-remote-settings-mode">
+                <option value="desktop">Desktop only (loopback)</option>
+                <option value="tailscale">Tailscale (Android)</option>
+              </select>
+              <p id="agent-remote-settings-server-state" role="status">Server unavailable</p>
+              <button id="agent-remote-settings-server" type="button" aria-pressed="false">Start server</button>
+              <img id="agent-remote-settings-qr" class="agent-remote-qr" alt="Agent Remote pairing QR" hidden />
+              <div class="agent-remote-actions">
+                <button id="agent-remote-settings-debate" type="button">/debate</button>
+                <button id="agent-remote-settings-fable" type="button">/fable-mind</button>
+              </div>
+            </div>
+          </section>
           <section
             id="call-audio-panel"
             class="preferences-panel"

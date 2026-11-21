@@ -1,5 +1,7 @@
 import { conversationInstruction } from './language-context.mjs';
 import { freemem } from 'node:os';
+import { startHermesDebate } from '../../packages/runtime/src/client.mjs';
+import { validateChatProvider } from '../../packages/runtime/src/providers/chat-router.mjs';
 import { coordinateTurn, TURN_HANDLED } from '../../packages/core/src/turn-coordinator.mjs';
 import {
   withResponseTiming,
@@ -329,6 +331,10 @@ export class ChatService {
     ownerMemory = null,
     ownerMemoryWorkspace = null,
     fetchImpl = fetch,
+    chatProvider = 'openclaw',
+    hermesUrl = '',
+    hermesToken = () => '',
+    hermesModel = 'hermes-agent',
     timeoutMs = 180000,
     firstTextTimeoutMs = 30000,
     toolTimeoutMs = 45000,
@@ -338,8 +344,20 @@ export class ChatService {
     const endpoint = new URL(gatewayUrl);
     if (endpoint.protocol !== 'http:' || endpoint.hostname !== '127.0.0.1')
       throw new Error('Gateway must use local IPv4 loopback');
+    const normalizedProvider = validateChatProvider(chatProvider);
+    let normalizedHermesUrl = '';
+    if (typeof hermesUrl === 'string' && hermesUrl.trim()) {
+      const hUrl = new URL(hermesUrl.trim());
+      if (hUrl.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(hUrl.hostname))
+        throw new Error('Hermes gateway must use local HTTP loopback');
+      normalizedHermesUrl = hermesUrl.trim().replace(/\/+$/, '');
+    }
     Object.assign(this, {
       gatewayUrl,
+      chatProvider: normalizedProvider,
+      hermesUrl: normalizedHermesUrl,
+      hermesToken,
+      hermesModel,
       agentId,
       sessionKey,
       token,
@@ -510,6 +528,9 @@ export class ChatService {
 
   async sendTurn(value, emit) {
     const input = validateInput(value);
+    const fableMode = /^\/fable-mind(?:\s|$)/iu.test(input.text);
+    const debateMode = /^\/debate(?:\s|$)/iu.test(input.text);
+    if (fableMode) input.text = input.text.replace(/^\/fable-mind\s*/iu, '') || 'Jelaskan mode fable-mind.';
     markResponseTiming('chat_started', {
       inputCharacters: input.text.length,
       historyMessages: this.store.snapshot().length,
@@ -544,7 +565,7 @@ export class ChatService {
     const startedAt = Date.now();
     let gatewayStartedAt;
     const state = this.interfaceState();
-    const smallTalk = !input.mode && input.internet !== true && conversationOnly(input.text);
+    const smallTalk = !fableMode && !input.mode && input.internet !== true && conversationOnly(input.text);
     const thinking = input.thinking === true && !input.mode;
     const directSmallTalk = smallTalk && !thinking ? this.directLocalDialogue : null;
     const planningWithThinking = input.thinking === true && input.mode !== 'coding';
@@ -751,6 +772,22 @@ export class ChatService {
         webContext = '',
         reasoningInstruction = '';
       const stages = {
+        debate: debateMode && (async () => {
+          phase = 'debate';
+          const result = await startHermesDebate({
+            baseUrl: 'http://127.0.0.1:9120',
+            task: input.text,
+            runId: input.id,
+            signal: requestSignal,
+          });
+          if (!result?.ok || !result.run_id) throw new Error('Hermes debate failed to start.');
+          append(`Debat Hermes berjalan: ${result.run_id}\n${result.dashboard_url ?? ''}`, true);
+          assistant.status = 'complete';
+          assistant.followUp = false;
+          this.store.put(assistant);
+          emit({ type: 'turn.completed', turnId: input.id, assistant });
+          return TURN_HANDLED;
+        }),
         coding:
           input.mode === 'coding' &&
           (async () => {
@@ -1017,9 +1054,9 @@ export class ChatService {
           })();
         },
         computerIntent: () => {
-          // The CPU social route is a latency hint, not the final meaning of an
-          // owner request. Let the multilingual classifier recover Discord tasks
-          // under an existing grant without adding classification to ordinary chat.
+          // CPU latency hints cannot decide intent across languages. Keep deterministic
+          // conversation exclusions, then let the existing semantic classifier decide.
+          const intentDomain = toolDomain(input.text, state);
           const discordIntent = state.fullComputerAccess && mentionsDiscord(input.text);
           if (
             !(
@@ -1028,11 +1065,9 @@ export class ChatService {
               !this.active?.dedicatedMusic &&
               state.computerSkillEnabled !== false &&
               this.computerIntent &&
-              (!this.npuDialogue || state.fullComputerAccess || knownDomain === 'desktop') &&
-              (!knownDomain ||
-                knownDomain === 'desktop' ||
-                (knownDomain === 'conversation' && discordIntent)) &&
-              (state.fullComputerAccess || knownDomain === 'desktop' || routing?.mode !== 'fast')
+              (!intentDomain ||
+                intentDomain === 'desktop' ||
+                (intentDomain === 'conversation' && discordIntent))
             )
           )
             return;
@@ -1149,6 +1184,7 @@ export class ChatService {
       const preparation = coordinateTurn(
         {
           direct: [
+            ['debate', stages.debate],
             ['coding', stages.coding],
             ['memory', stages.memory],
             ['callClarification', stages.callClarification],
@@ -1210,7 +1246,7 @@ export class ChatService {
           (factualWithoutActions && !interfaceState.activeSkills.has('capri.owner-memory')));
       if (['spotify', 'calculator'].includes(domain)) this.active.verifiedDomain = domain;
       phase = 'model';
-      const directDialogue = this.npuDialogue ?? directSmallTalk;
+      const directDialogue = fableMode ? null : (this.npuDialogue ?? directSmallTalk);
       const observation = smallTalk
         ? ''
         : observationText(interfaceState.screenObservation, input.text);
@@ -1248,6 +1284,7 @@ export class ChatService {
               : []),
             ...(screenIdentity ? [screenIdentity] : []),
             conversationInstruction(interfaceState.languages, { compact: dialogueOnly }),
+            ...(fableMode ? ['Fable-mind: Ground claims in actual evidence and tool results. Distinguish verified facts from uncertainty. Never claim actions or tests succeeded without observed results.'] : []),
             ...(reasoningConversation ? [reasoningInstruction] : []),
             ...(input.internet === true ? [WEB_SEARCH_INSTRUCTION] : []),
           ].join('\n\n');
@@ -1282,9 +1319,46 @@ export class ChatService {
       // share the overall turn limit. Neither spends the model's first-text budget.
       armDeadline(initialTextTimeoutMs);
       gatewayStartedAt = performance.now();
+      const useHermes =
+        !directDialogue &&
+        (this.chatProvider === 'hermes' ||
+          (this.chatProvider === 'both' && !this.gatewayUrl && Boolean(this.hermesUrl)));
+      if (!directDialogue && this.chatProvider === 'hermes' && !this.hermesUrl) {
+        const err = new Error('Selected chat provider unavailable or unsupported');
+        err.code = 'CHAT_PROVIDER_UNAVAILABLE';
+        throw err;
+      }
+      const hermesAuth = useHermes ? String(this.hermesToken?.() ?? '').trim() : '';
       const response = directDialogue
         ? await directDialogue(directPayload, requestSignal)
-        : await this.fetchImpl(`${this.gatewayUrl}/v1/chat/completions`, {
+        : useHermes
+          ? await this.fetchImpl(`${this.hermesUrl}/v1/chat/completions`, {
+              method: 'POST',
+              signal: requestSignal,
+              redirect: 'error',
+              headers: {
+                ...(hermesAuth ? { authorization: `Bearer ${hermesAuth}` } : {}),
+                'content-type': 'application/json',
+                accept: 'text/event-stream',
+                'x-hermes-session-id': this.sessionKey,
+                'x-capri-trace-id': input.id,
+              },
+              body: JSON.stringify({
+                model: this.hermesModel || 'hermes-agent',
+                stream: true,
+                messages: [
+                  {
+                    role: 'system',
+                    content: systemPrompt,
+                  },
+                  {
+                    role: 'user',
+                    content: input.text + turnContext,
+                  },
+                ],
+              }),
+            })
+          : await this.fetchImpl(`${this.gatewayUrl}/v1/chat/completions`, {
             method: 'POST',
             signal: requestSignal,
             redirect: 'error',

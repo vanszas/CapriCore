@@ -193,6 +193,132 @@ test('model folder and device controls are admitted from the actual Settings fra
     );
   }
 });
+test('Agent Remote settings IPC is admitted from the actual Settings frame', () => {
+  const handlers = new Map(),
+    frame = { url: 'capri://desktop/settings.html' },
+    settings = { isDestroyed: () => false, webContents: { mainFrame: frame } },
+    event = { sender: settings.webContents, senderFrame: frame };
+  const handle = createIpcHandler(
+    { handle: (name, callback) => handlers.set(name, callback) },
+    {
+      getWindow: () => null,
+      getSettingsWindow: () => settings,
+      settingsUrl: frame.url,
+      settingsChannels: SETTINGS_CHANNELS,
+    },
+  );
+  handle('capri:agent-remote-server', (action, { role }) => ({ action, role }));
+  assert.deepEqual(handlers.get('capri:agent-remote-server')(event, 'status'), {
+    action: 'status',
+    role: 'settings',
+  });
+  handle('capri:agent-remote-unknown', (action) => ({ action }));
+  assert.throws(
+    () => handlers.get('capri:agent-remote-unknown')(event, 'status'),
+    /IPC channel unavailable to settings/,
+  );
+});
+
+test('Agent Remote QR uses IPC, clears failed pairing and ignores stale status responses', async () => {
+  const source = readFileSync(
+    new URL('../apps/desktop/renderer/settings-app.mjs', import.meta.url),
+    'utf8',
+  );
+  const start = source.indexOf('async function refreshAgentRemoteSettings() {');
+  const end = source.indexOf('\nasync function toggleAgentRemoteSettingsServer()', start);
+  assert(start >= 0 && end > start);
+  const state = { textContent: '' };
+  const revoked = [];
+  let decodeError = false;
+  const qr = {
+    hidden: true,
+    source: '',
+    assignments: 0,
+    decode: async () => { if (decodeError) throw new Error('PNG decode failed'); },
+    getAttribute: (name) => (name === 'src' ? qr.source : null),
+    removeAttribute: () => { qr.source = ''; },
+    set src(value) {
+      this.source = value;
+      this.assignments++;
+    },
+  };
+  const toggle = {
+    attributes: new Map([['aria-pressed', 'false']]),
+    textContent: 'Start server',
+    getAttribute(name) {
+      return this.attributes.get(name);
+    },
+    setAttribute(name, value) {
+      this.attributes.set(name, value);
+    },
+  };
+  const elements = {
+    'agent-remote-settings-server-state': state,
+    'agent-remote-settings-qr': qr,
+    'agent-remote-settings-server': toggle,
+    'agent-remote-settings-mode': { value: 'desktop', disabled: false },
+  };
+  const replies = [];
+  const context = {
+    Blob, Uint8Array, atob,
+    URL: {
+      createObjectURL: (blob) => URL.createObjectURL(blob),
+      revokeObjectURL: (url) => { revoked.push(url); URL.revokeObjectURL(url); },
+    },
+    $: (id) => elements[id],
+    raw: {
+      agentRemoteServer: (action) => action === 'qr'
+        ? Promise.resolve({ src: 'data:image/png;base64,iVBORw0KGgo=' })
+        : new Promise((resolve, reject) => replies.push({ resolve, reject })),
+    },
+  };
+  runInNewContext(
+    `let agentRemoteRefreshGeneration = 0, agentRemoteQrUrl = '';\n${source.slice(start, end)}\nglobalThis.refresh = refreshAgentRemoteSettings;`,
+    context,
+  );
+
+  const failed = context.refresh();
+  replies[0].reject(new Error('IPC unavailable'));
+  await failed;
+  assert.equal(qr.hidden, true);
+  assert.equal(qr.source, '');
+  assert.equal(state.textContent, 'IPC unavailable');
+
+  const stale = context.refresh();
+  const latest = context.refresh();
+  replies[2].resolve({ running: true, selectedMode: 'tailscale', mode: 'tailscale' });
+  await latest;
+  replies[1].resolve({ running: false });
+  await stale;
+  assert.equal(state.textContent, 'Server running (tailscale)');
+  assert.equal(elements['agent-remote-settings-mode'].value, 'tailscale');
+  assert.equal(elements['agent-remote-settings-mode'].disabled, true);
+  assert.equal(toggle.getAttribute('aria-pressed'), 'true');
+  assert.equal(toggle.textContent, 'Stop server');
+  assert.equal(qr.hidden, false);
+  assert.equal(qr.assignments, 1);
+  assert(qr.source.startsWith('blob:'));
+  const png = await fetch(qr.source);
+  assert.equal(png.headers.get('content-type'), 'image/png');
+  assert.equal(Buffer.from(await png.arrayBuffer()).toString('hex'), '89504e470d0a1a0a');
+  const resources = new Map([['/settings.html', {
+    file: fileURLToPath(new URL('../apps/desktop/renderer/settings.html', import.meta.url)), type: 'text/html',
+  }]]);
+  const csp = resourceResponse(new Request('capri://desktop/settings.html'), resources).headers.get('content-security-policy');
+  const imagePolicy = csp.split(';').find((rule) => rule.trim().startsWith('img-src'));
+  assert(imagePolicy.includes('blob:'));
+  assert(!imagePolicy.includes('data:'));
+
+  decodeError = true;
+  const invalid = context.refresh();
+  replies[3].resolve({ running: true, selectedMode: 'desktop', mode: 'desktop' });
+  await invalid;
+  assert.equal(qr.hidden, true);
+  assert.equal(qr.source, '');
+  assert.equal(state.textContent, 'PNG decode failed');
+  assert.equal(revoked.length, 2);
+});
+
 test('opaque decoration never affects native hit testing, and drag gestures expire', () => {
   let cursor = { x: 10, y: 10 },
     time = 100,

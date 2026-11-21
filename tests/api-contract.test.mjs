@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { root, runtime, initialize, settings, chat } from '../packages/runtime/src/index.mjs';
+import { root, runtime, initialize, settings, chat, startHermesDebate } from '../packages/runtime/src/index.mjs';
 
 const tempRoot = path.join(root, '.runtime/test-data');
 mkdirSync(tempRoot, { recursive: true });
@@ -23,6 +23,32 @@ async function fakeGateway(t, respond) {
   return rt;
 }
 
+test('Hermes connector rejects non-loopback targets', async () => {
+  await assert.rejects(startHermesDebate({ baseUrl: 'http://example.com:9120', task: 'test' }), /loopback/);
+  await assert.rejects(startHermesDebate({ baseUrl: 'https://127.0.0.1:9120', task: 'test' }), /loopback/);
+});
+
+test('Hermes debate connector uses isolated token and exact start route', async (t) => {
+  let seen;
+  const server = createServer(async (req, res) => {
+    let text = '';
+    for await (const chunk of req) text += chunk;
+    seen = { method: req.method, url: req.url, headers: req.headers, body: JSON.parse(text) };
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ ok: true, run_id: seen.body.run_id, task: seen.body.task }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const result = await startHermesDebate({ baseUrl, task: 'test task', runId: 'capri-test', token: 'hermes-test-only' });
+  assert.deepEqual(result, { ok: true, run_id: 'capri-test', task: 'test task' });
+  assert.equal(seen.method, 'POST');
+  assert.equal(seen.url, '/api/debate/start');
+  assert.equal(seen.headers['x-agent-remote-token'], 'hermes-test-only');
+  assert.equal(seen.body.run_id, 'capri-test');
+  assert.equal(seen.body.task, 'test task');
+  assert.equal(seen.headers.authorization, undefined);
+});
 test('desktop and Telegram ingress target the same explicit agent/session without replaying history', async (t) => {
   const seen = [];
   const rt = await fakeGateway(t, (req, body, res) => {

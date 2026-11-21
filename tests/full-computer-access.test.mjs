@@ -36,6 +36,7 @@ test('full access requires the host-enforced three-second confirmation, persists
   await pending;
   assert.equal(full.enabled, true);
   assert.equal(full.scopes().length, 2);
+  assert.equal(full.scopes()[0].destructiveConfirmationRequired, true);
   assert.match(full.scopes()[0].id, /^[a-f0-9-]{36}$/);
   const restarted = new FullComputerAccess({
     file,

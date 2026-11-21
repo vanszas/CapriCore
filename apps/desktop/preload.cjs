@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld(
   Object.freeze({
     bootstrap: () => ipcRenderer.invoke('capri:bootstrap'),
     setSkill: (change) => ipcRenderer.invoke('capri:skill-settings', change),
+    agentRemoteServer: (action) => ipcRenderer.invoke('capri:agent-remote-server', action),
     modelDevices: () => ipcRenderer.invoke('capri:model-devices'),
     nativeNpu: (value) => ipcRenderer.invoke('capri:native-npu', value),
     coding: (value) => ipcRenderer.invoke('capri:coding', value),

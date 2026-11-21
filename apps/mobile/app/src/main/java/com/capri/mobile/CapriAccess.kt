@@ -1,0 +1,309 @@
+package com.capri.mobile
+
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.content.Context
+import android.graphics.Path
+import android.graphics.Rect
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+
+/**
+ * Her eyes on your phone (optional, you switch it on in Accessibility settings). Only three things are read, and
+ * nothing is saved or sent anywhere:
+ *  - which app is in front (so she can react to TikTok, games...),
+ *  - where the app icons and buttons on screen are (so she can sit on them),
+ *  - where you just tapped a button (so she looks at it).
+ */
+class CapriAccess : AccessibilityService() {
+    interface Listener {
+        fun onApp(pkg: String)
+        fun onLedges()
+        fun onClicked(r: Rect)
+    }
+
+    companion object {
+        @Volatile var instance: CapriAccess? = null
+            private set
+        @Volatile var ledges: List<Rect> = emptyList()
+            private set
+        @Volatile var inputs: List<Rect> = emptyList()  // text boxes on screen: she lets taps through over them
+            private set
+        @Volatile var keyboard = false  // the keyboard is up
+            private set
+        @Volatile var foreground = ""
+            private set
+        var listener: Listener? = null
+
+        fun enabled(context: Context): Boolean {
+            if (instance != null) return true
+            val on = Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+            return on.split(':').any { it.startsWith(context.packageName + "/") }
+        }
+    }
+
+    private val handler = Handler(Looper.getMainLooper())
+    private var scanQueued = false
+    private val ignore by lazy { setOf(packageName, "com.android.systemui", "android") }
+
+    override fun onServiceConnected() {
+        instance = this
+        scan()
+    }
+
+    override fun onDestroy() {
+        instance = null
+        ledges = emptyList()
+        super.onDestroy()
+    }
+
+    override fun onInterrupt() = Unit
+
+    private var lastScan = 0L
+
+    private fun checkKeyboard() {
+        keyboard = runCatching { windows.any { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD } }.getOrDefault(false)
+    }
+
+    override fun onAccessibilityEvent(e: AccessibilityEvent) {
+        if (e.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) { checkKeyboard(); return }
+        val pkg = e.packageName?.toString() ?: return
+        if (pkg in ignore) return
+        when (e.eventType) {
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                if (pkg != foreground) {
+                    foreground = pkg
+                    listener?.onApp(pkg)
+                }
+                checkKeyboard()
+                queueScan(300)
+            }
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED, AccessibilityEvent.TYPE_VIEW_SCROLLED -> queueScan(1500)
+            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
+                val r = Rect()
+                e.source?.getBoundsInScreen(r)
+                if (!r.isEmpty) listener?.onClicked(r)
+            }
+        }
+    }
+
+    /** Looks over the screen at most every 1.2 s: scrolling a feed fires these events nonstop. */
+    private fun queueScan(delay: Long) {
+        if (scanQueued) return
+        scanQueued = true
+        val wait = maxOf(delay, 1200 - (android.os.SystemClock.uptimeMillis() - lastScan))
+        handler.postDelayed({ scanQueued = false; scan() }, wait)
+    }
+
+    /**
+     * A screenshot for her eyes (Android 11+), scaled down so her brain can take it in. Only when you ask her to
+     * look (or Scroll with me, when her brain has eyes); never saved.
+     */
+    fun screenshot(maxSide: Int = 768, done: (android.graphics.Bitmap?) -> Unit) {
+        if (android.os.Build.VERSION.SDK_INT < 30) { done(null); return }
+        takeScreenshot(android.view.Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+            override fun onSuccess(r: ScreenshotResult) {
+                val hw = r.hardwareBuffer
+                val full = android.graphics.Bitmap.wrapHardwareBuffer(hw, r.colorSpace)
+                    ?.copy(android.graphics.Bitmap.Config.ARGB_8888, false)
+                hw.close()
+                if (full == null) { done(null); return }
+                val k = maxSide.toFloat() / maxOf(full.width, full.height)
+                done(if (k < 1f) android.graphics.Bitmap.createScaledBitmap(full, (full.width * k).toInt(),
+                    (full.height * k).toInt(), true) else full)
+            }
+
+            override fun onFailure(errorCode: Int) = done(null)
+        })
+    }
+
+    /**
+     * The words on screen right now (captions, comments, messages, titles), for "React on her own" and for when you
+     * ask her to look; never stored. [sawPassword]: this screen has a password field, so she leaves it alone.
+     */
+    @Volatile var sawPassword = false
+
+    fun screenText(max: Int = 900): String {
+        sawPassword = false
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return ""
+        val seen = LinkedHashSet<String>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var n = 0
+        while (queue.isNotEmpty() && n < 600) {
+            val node = queue.removeFirst()
+            n++
+            if (!node.isVisibleToUser) continue
+            if (node.isPassword) sawPassword = true
+            if (node.isPassword || node.isEditable) continue  // never what you type
+            for (t in listOf(node.text, node.contentDescription)) {
+                val s = t?.toString()?.trim()?.replace(Regex("\\s+"), " ") ?: continue
+                if (s.length >= 4 && !UI_WORDS.matches(s)) seen.add(s.take(200))
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { queue.add(it) }
+        }
+        return seen.joinToString(" | ").take(max)
+    }
+
+    private val UI_WORDS = Regex("(?i)^(like|likes|share|comment|comments|follow|following|search|home|inbox|profile|" +
+        "friends|discover|reply|more|save|send|back|menu|close|add|create|shop|live|for you|explore|reels|shorts|" +
+        "subscribe|subscriptions|library|\\d+[.,]?\\d*[kKmM]?)$")
+
+    /** The tappable things on screen (app icons, buttons, cards): their tops are places she can sit. */
+    private fun scan() {
+        lastScan = android.os.SystemClock.uptimeMillis()
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return
+        val boxes = ArrayList<Rect>()
+        val dm = resources.displayMetrics
+        val minSide = (28 * dm.density).toInt()
+        val out = ArrayList<Rect>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var seen = 0
+        while (queue.isNotEmpty() && seen < 500) {
+            val n = queue.removeFirst()
+            seen++
+            if (!n.isVisibleToUser) continue
+            if (n.isEditable) Rect().also { n.getBoundsInScreen(it); boxes.add(it) }
+            if (n.isClickable || n.isLongClickable) {
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                if (r.width() in minSide..(dm.widthPixels * 0.8).toInt() && r.height() in minSide..dm.heightPixels / 3) {
+                    out.add(r)
+                }
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        ledges = out
+        inputs = boxes
+        listener?.onLedges()
+    }
+
+    // -- phone control actions -----------------------------------------------------------------------------------
+
+    fun back(): Boolean = performGlobalAction(GLOBAL_ACTION_BACK)
+    fun home(): Boolean = performGlobalAction(GLOBAL_ACTION_HOME)
+    fun recents(): Boolean = performGlobalAction(GLOBAL_ACTION_RECENTS)
+    fun notifications(): Boolean = performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+
+    fun tap(x: Float, y: Float, done: ((Boolean) -> Unit)? = null) {
+        val path = Path().apply { moveTo(x, y) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, 60L))
+            .build()
+        dispatchGesture(gesture, object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) { done?.invoke(true) }
+            override fun onCancelled(gestureDescription: GestureDescription?) { done?.invoke(false) }
+        }, handler)
+    }
+
+    fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long = 280L, done: ((Boolean) -> Unit)? = null) {
+        val path = Path().apply { moveTo(x1, y1); lineTo(x2, y2) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, durationMs.coerceIn(60L, 2000L)))
+            .build()
+        dispatchGesture(gesture, object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) { done?.invoke(true) }
+            override fun onCancelled(gestureDescription: GestureDescription?) { done?.invoke(false) }
+        }, handler)
+    }
+
+    fun scrollDown() {
+        val dm = resources.displayMetrics
+        val cx = dm.widthPixels * 0.5f
+        swipe(cx, dm.heightPixels * 0.72f, cx, dm.heightPixels * 0.28f)
+    }
+
+    fun scrollUp() {
+        val dm = resources.displayMetrics
+        val cx = dm.widthPixels * 0.5f
+        swipe(cx, dm.heightPixels * 0.28f, cx, dm.heightPixels * 0.72f)
+    }
+
+    fun clickText(query: String): Boolean {
+        val q = query.trim().lowercase()
+        if (q.isEmpty()) return false
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return false
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var best: AccessibilityNodeInfo? = null
+        var seen = 0
+        while (queue.isNotEmpty() && seen < 500) {
+            val n = queue.removeFirst()
+            seen++
+            if (!n.isVisibleToUser) continue
+            val text = n.text?.toString()?.trim().orEmpty()
+            val desc = n.contentDescription?.toString()?.trim().orEmpty()
+            if (text.equals(q, ignoreCase = true) || desc.equals(q, ignoreCase = true)) {
+                best = n
+                break
+            }
+            if (best == null && (text.lowercase().contains(q) || desc.lowercase().contains(q))) {
+                best = n
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        val target = best ?: return false
+        var clickable: AccessibilityNodeInfo? = target
+        while (clickable != null && !clickable.isClickable) clickable = clickable.parent
+        if (clickable != null && clickable.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+        val r = Rect()
+        target.getBoundsInScreen(r)
+        if (!r.isEmpty) {
+            tap(r.exactCenterX(), r.exactCenterY())
+            return true
+        }
+        return false
+    }
+
+    fun typeText(value: String): Boolean {
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return false
+        val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (focused != null && focused.isEditable && !focused.isPassword) {
+            val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value) }
+            if (focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return true
+        }
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var seen = 0
+        while (queue.isNotEmpty() && seen < 400) {
+            val n = queue.removeFirst()
+            seen++
+            if (n.isVisibleToUser && n.isEditable && !n.isPassword) {
+                n.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value) }
+                if (n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return true
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        return false
+    }
+
+    fun dumpVisibleScreen(maxNodes: Int = 35): String {
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return ""
+        val lines = ArrayList<String>(maxNodes)
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var seen = 0
+        while (queue.isNotEmpty() && seen < 400 && lines.size < maxNodes) {
+            val n = queue.removeFirst()
+            seen++
+            if (!n.isVisibleToUser || n.isPassword) continue
+            val label = n.text?.toString()?.trim().orEmpty().ifEmpty { n.contentDescription?.toString()?.trim().orEmpty() }
+            if (label.isNotEmpty() && (n.isClickable || n.isEditable || label.length >= 2)) {
+                val tag = when {
+                    n.isEditable -> "input"
+                    n.isClickable -> "btn"
+                    else -> "txt"
+                }
+                lines.add("[$tag] ${label.take(60)}")
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        return lines.joinToString("\n")
+    }
+}

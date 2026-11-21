@@ -8,7 +8,11 @@ import {
 } from '../../packages/skills/src/action-tools.mjs';
 import { timerClient, timerSkill } from '../../packages/skills/src/timers/index.mjs';
 import { TimeService } from '../../packages/runtime/src/time/service.mjs';
-import { ActionBroker, ActionApprovals } from './action-broker.mjs';
+import {
+  ActionBroker,
+  ActionApprovals,
+  isDestructiveActionKind,
+} from './action-broker.mjs';
 import { COMPUTER_ACTIONS } from './computer-control.mjs';
 
 /** Main-process owner: survives model unload, never depends on generated conversation. */
@@ -63,12 +67,7 @@ export class CompanionActions {
       ...(typeof desktop?.execute === 'function'
         ? {
             trash: (id, args, signal) =>
-              desktop.execute(
-                id,
-                args,
-                this.fullAccess() ? { propose: (proposal) => proposal.execute() } : this.approvals,
-                signal,
-              ),
+              desktop.execute(id, args, this.approvals, signal),
           }
         : {}),
     });
@@ -172,13 +171,17 @@ export class CompanionActions {
     if (tool === 'time_control') return this.time.execute(id, args, { source: 'tool', signal });
     if (tool === 'filesystem_control')
       return invoke(ACTION_SKILLS.files, args?.action === 'trash' ? 'trash' : 'execute', args);
-    if (tool === 'desktop_control')
-      return this.desktop.execute(
-        id,
-        args,
-        this.fullAccess() ? { propose: (proposal) => proposal.execute() } : this.approvals,
-        signal,
-      );
+    if (tool === 'desktop_control') {
+      const approvals = this.fullAccess()
+        ? {
+            propose: (proposal) =>
+              isDestructiveActionKind(proposal.kind)
+                ? this.approvals.propose(proposal)
+                : proposal.execute(),
+          }
+        : this.approvals;
+      return this.desktop.execute(id, args, approvals, signal);
+    }
     if (
       tool !== 'settings_control' ||
       !args ||

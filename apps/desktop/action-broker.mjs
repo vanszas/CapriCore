@@ -210,14 +210,34 @@ export class ActionBroker {
 }
 
 /** A model can propose, never approve. One bounded proposal belongs to one UI session. */
+const DESTRUCTIVE_KINDS = new Set(['delete', 'destroy', 'replace', 'trash']);
+const confirmationTotal = (kind) => (DESTRUCTIVE_KINDS.has(kind) ? 3 : 1);
+export const isDestructiveActionKind = (kind) => DESTRUCTIVE_KINDS.has(kind);
+
 export class ActionApprovals {
-  constructor({ emit, now = Date.now }) {
-    Object.assign(this, { emit, now });
+  constructor({ emit, now = Date.now, audit = (value) => emit({ type: 'action.audit', ...value }) }) {
+    Object.assign(this, { emit, now, audit });
     this.pending = null;
     this.queue = [];
     this.executing = false;
   }
+  recordAudit({ proposal, outcome, source }) {
+    try {
+      this.audit({
+        operation: 'approval',
+        kind: proposal.kind,
+        outcome,
+        source,
+        confirmationStep: proposal.confirmationStep,
+        confirmationTotal: proposal.confirmationTotal,
+      });
+    } catch {
+      /* Audit output must never change action safety or execution. */
+    }
+  }
   propose({ title, detail, kind, execute, voice = true }) {
+    const destructive = isDestructiveActionKind(kind);
+    if (destructive) voice = false;
     if (this.pending && this.pending.expiresAt <= this.now()) this.cancel();
     const existing = [this.pending, ...this.queue].find(
       (p) => p && p.title === title && p.detail === detail && p.kind === kind && p.voice === voice,
@@ -241,8 +261,11 @@ export class ActionApprovals {
       kind,
       expiresAt: this.now() + 90000,
       voice,
+      confirmationStep: 1,
+      confirmationTotal: confirmationTotal(kind),
     };
     const queued = Boolean(this.pending || this.executing);
+    this.recordAudit({ proposal, outcome: 'pending', source: 'tool' });
     if (queued) this.queue.push({ ...proposal, execute });
     else {
       this.pending = { ...proposal, execute };
@@ -268,11 +291,41 @@ export class ActionApprovals {
     }
     if (typeof accepted !== 'boolean' || (accepted && source === 'voice' && !pending.voice))
       throw new Error('Use the confirmation buttons for this action.');
+    this.recordAudit({ proposal: pending, outcome: accepted ? 'accepted' : 'rejected', source });
+    if (accepted && pending.confirmationStep < pending.confirmationTotal) {
+      const next = {
+        ...pending,
+        id: randomUUID(),
+        confirmationStep: pending.confirmationStep + 1,
+        expiresAt: this.now() + 90000,
+      };
+      this.pending = next;
+      const { execute, ...proposal } = next;
+      this.emit({ type: 'action.approval', proposal });
+      return {
+        ok: false,
+        needsApproval: true,
+        confirmationStep: next.confirmationStep,
+        confirmationTotal: next.confirmationTotal,
+        proposal,
+        instruction:
+          'This destructive action needs three separate owner confirmations. Confirm the current on-screen request, then wait for the next request.',
+      };
+    }
     this.executing = true;
     this.pending = null;
     this.emit({ type: 'action.approval', proposal: null });
     try {
-      return accepted ? await pending.execute() : { ok: true, cancelled: true };
+      const result = accepted ? await pending.execute() : { ok: true, cancelled: true };
+      this.recordAudit({
+        proposal: pending,
+        outcome: result?.cancelled ? 'cancelled' : 'completed',
+        source,
+      });
+      return result;
+    } catch (error) {
+      this.recordAudit({ proposal: pending, outcome: 'failed', source });
+      throw error;
     } finally {
       this.executing = false;
       if (!this.pending && this.queue.length) {
@@ -325,6 +378,7 @@ export class ActionApprovals {
   cancel() {
     this.queue = [];
     if (this.pending) {
+      this.recordAudit({ proposal: this.pending, outcome: 'cancelled', source: 'system' });
       this.pending = null;
       this.emit({ type: 'action.approval', proposal: null });
     }

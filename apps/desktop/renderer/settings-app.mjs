@@ -1482,6 +1482,8 @@ skillHeader.innerHTML =
   '<h2 id="skill-settings-title"></h2><p id="skill-settings-description"></p><label class="skill-display-control"><input id="skill-show-button" type="checkbox" role="switch"><span>Show button in Capri’s toolbar</span></label><label class="skill-display-control" id="skill-composer-control"><input id="skill-show-composer" type="checkbox" role="switch"><span>Show button in the message bar</span></label>';
 const pendingSkills = new Map();
 let skillState = {};
+let agentRemoteRefreshGeneration = 0;
+let agentRemoteQrUrl = '';
 function skillGlyph(icon) {
   const glyph = document.createElementNS(svgNamespace, 'svg');
   const path = document.createElementNS(svgNamespace, 'path');
@@ -1506,6 +1508,12 @@ function showSkillSettings() {
     $('skill-show-composer').checked =
       (pendingSkills.get(skill.id)?.showComposer ?? skillState[skill.id]?.showComposer) !== false;
     $('skill-show-composer').disabled = pendingSkills.has(skill.id);
+    if (skill.id === 'capri.agent-remote') {
+      $('agent-remote-settings-enabled').checked =
+        pendingSkills.get(skill.id)?.enabled ?? skillState[skill.id]?.enabled ?? false;
+      $('agent-remote-settings-enabled').disabled = pendingSkills.has(skill.id);
+      void refreshAgentRemoteSettings();
+    }
     if (skill.id === 'capri.reasoning') {
       $('reasoning-effort').value =
         pendingSkills.get(skill.id)?.effort ?? skillState[skill.id]?.effort ?? 'medium';
@@ -1585,6 +1593,86 @@ for (const [id, key] of [
     const skill = SKILL_BY_SECTION[current];
     if (skill) void changeSkill(skill, { [key]: currentTarget.checked });
   };
+document.getElementById('agent-remote-settings-enabled').onchange = ({ currentTarget }) => {
+  const skill = SKILL_BY_SECTION[current];
+  if (skill?.id === 'capri.agent-remote') void changeSkill(skill, { enabled: currentTarget.checked });
+};
+async function refreshAgentRemoteSettings() {
+  const generation = ++agentRemoteRefreshGeneration;
+  const state = $('agent-remote-settings-server-state');
+  const qr = $('agent-remote-settings-qr');
+  qr.hidden = true;
+  qr.removeAttribute('src');
+  if (agentRemoteQrUrl) URL.revokeObjectURL(agentRemoteQrUrl);
+  agentRemoteQrUrl = '';
+  try {
+    const process = await raw.agentRemoteServer('status');
+    if (generation !== agentRemoteRefreshGeneration) return;
+    state.textContent = process.running
+      ? process.mode === 'external' ? 'External server running. Stop with ServerStop before changing mode.' : `Server running (${process.mode})`
+      : 'Server stopped';
+    const mode = $('agent-remote-settings-mode');
+    mode.value = process.selectedMode;
+    mode.disabled = process.running;
+    const toggle = $('agent-remote-settings-server');
+    toggle.setAttribute('aria-pressed', String(process.running));
+    toggle.textContent = process.running ? 'Stop server' : 'Start server';
+    if (process.running) {
+      const image = await raw.agentRemoteServer('qr');
+      if (generation !== agentRemoteRefreshGeneration) return;
+      if (!image.src?.startsWith('data:image/png;base64,')) throw new Error('Invalid pairing QR.');
+      const bytes = Uint8Array.from(atob(image.src.slice('data:image/png;base64,'.length)), (char) => char.charCodeAt(0));
+      // The protocol CSP allows blob images, not data URLs.
+      agentRemoteQrUrl = URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
+      qr.src = agentRemoteQrUrl;
+      await qr.decode();
+      if (generation !== agentRemoteRefreshGeneration) return;
+      qr.hidden = false;
+    }
+  } catch (error) {
+    if (generation === agentRemoteRefreshGeneration) {
+      qr.hidden = true;
+      qr.removeAttribute('src');
+      if (agentRemoteQrUrl) URL.revokeObjectURL(agentRemoteQrUrl);
+      agentRemoteQrUrl = '';
+      state.textContent = error.message;
+    }
+  }
+}
+async function toggleAgentRemoteSettingsServer() {
+  const toggle = $('agent-remote-settings-server');
+  toggle.disabled = true;
+  try {
+    const status = await raw.agentRemoteServer(toggle.getAttribute('aria-pressed') === 'true' ? 'stop' : 'start');
+    toggle.setAttribute('aria-pressed', String(status.running));
+    toggle.textContent = status.running ? 'Stop server' : 'Start server';
+    await refreshAgentRemoteSettings();
+  } catch (error) {
+    $('agent-remote-settings-server-state').textContent = error.message;
+  } finally {
+    toggle.disabled = false;
+  }
+}
+function sendAgentRemoteCommand(command) {
+  void raw.agentRemoteServer({ action: 'prefill', command }).catch((error) => {
+    $('agent-remote-settings-server-state').textContent = error.message;
+  });
+}
+document.getElementById('agent-remote-settings-mode').addEventListener('change', async ({ currentTarget }) => {
+  currentTarget.disabled = true;
+  try {
+    await raw.agentRemoteServer({ action: 'mode', mode: currentTarget.value });
+    await refreshAgentRemoteSettings();
+  } catch (error) {
+    await refreshAgentRemoteSettings();
+    $('agent-remote-settings-server-state').textContent = error.message;
+  } finally {
+    currentTarget.disabled = $('agent-remote-settings-server').getAttribute('aria-pressed') === 'true';
+  }
+});
+document.getElementById('agent-remote-settings-server').addEventListener('click', toggleAgentRemoteSettingsServer);
+document.getElementById('agent-remote-settings-debate').addEventListener('click', () => sendAgentRemoteCommand('/debate'));
+document.getElementById('agent-remote-settings-fable').addEventListener('click', () => sendAgentRemoteCommand('/fable-mind'));
 const navGroups = SETTINGS_GROUPS.map(({ id, labels, sections, icon }) => {
   const group = document.createElement('div');
   const heading = document.createElement('p');

@@ -27,7 +27,7 @@ Review the code and the displayed permissions, then enable it. Changing any bund
 }
 ```
 
-`runtime` supports `node`, `python` and `executable`. The latter requires an `.exe` entry. Node uses Capri’s Node runtime; Python uses its managed Python 3.11 runtime. Runtime installation is not triggered by tool discovery. Entries are relative paths; shell commands and executable argument interpolation are unsupported. JSON schemas support bounded basic types, objects, arrays, required fields, enums and numeric/string/array limits. External references and regular expressions are rejected.
+`runtime` supports `node`, `python` and `executable`. The latter requires an `.exe` entry. Node uses Capri’s Node runtime; Python uses its managed Python 3.11 runtime. Runtime installation is not triggered by tool discovery. Entries are relative paths; shell commands and executable argument interpolation are unsupported. User tools cannot bypass Capri’s scoped desktop and file-action boundary. JSON schemas support bounded basic types, objects, arrays, required fields, enums and numeric/string/array limits. External references and regular expressions are rejected.
 
 The process receives one UTF-8 JSON line on stdin:
 

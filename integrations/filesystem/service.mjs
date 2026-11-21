@@ -323,25 +323,12 @@ export class FileService {
       };
     }
     if (c.action === 'replace_text') {
-      if (
-        (!this.review &&
-          !(
-            this.permissions.canActWithoutConfirmation?.(source.scope) ??
-            this.permissions.isInstallation(source.scope)
-          )) ||
-        !this.replaceFile
-      )
+      if (!this.review || !this.replaceFile)
         throw new Error('Open Capri to review file replacement.');
       const original = await bounded(source.path, 262144);
       if (hash(original) !== c.expectedHash)
         throw new Error('The file changed. Read it again before replacing it.');
-      if (
-        !approved &&
-        !(
-          this.permissions.canActWithoutConfirmation?.(source.scope) ??
-          this.permissions.isInstallation(source.scope)
-        )
-      )
+      if (!approved)
         return this.review(
           {
             path: source.path,

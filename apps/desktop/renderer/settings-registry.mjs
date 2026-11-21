@@ -11,6 +11,7 @@ const skillPanels = {
   dialogue: 'companion-settings',
   time: 'time-panel',
   screen: 'screen-panel',
+  'agent-remote': 'agent-remote-panel',
   applications: 'applications-panel',
   music: 'music-listening-panel',
   'avatar-skill': 'companion-settings',

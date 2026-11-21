@@ -7,7 +7,13 @@ import { root, nodePath, findExecutable } from '../../packages/runtime/src/index
 const files = [];
 function walk(directory) {
   for (const item of readdirSync(directory, { withFileTypes: true })) {
-    if (['__pycache__', 'node_modules', 'dist', '.venv'].includes(item.name)) continue;
+    if (
+      ['__pycache__', 'node_modules', 'dist', '.venv', '.gradle', '.cxx', 'build'].includes(
+        item.name,
+      )
+    )
+      continue;
+    if (directory === path.join(root, 'apps') && item.name === 'mobile') continue;
     const file = path.join(directory, item.name);
     if (item.isDirectory()) walk(file);
     else if (item.isFile()) files.push(file);

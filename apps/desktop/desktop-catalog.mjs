@@ -822,7 +822,6 @@ export class DesktopCatalog {
             throw new Error('Windows did not confirm removal. Check the file and Recycle Bin.');
           return { ok: true, confirmation: 'Moved the file to Recycle Bin.', recoveryId: id };
         });
-      if (this.fullAccess() || this.filePermissions.isInstallation(target.scope)) return execute();
       return approvals.propose({
         title: 'Move this file to Recycle Bin?',
         detail:
