@@ -8,21 +8,32 @@ if (-not (Test-Path $dst)) {
 
 New-Item -ItemType Directory -Force -Path (Join-Path $dst 'integrations\mobile_gateway') | Out-Null
 Copy-Item "$src\integrations\mobile_gateway\*" "$dst\integrations\mobile_gateway\" -Recurse -Force
-Copy-Item "$src\apps\desktop\main\agent-remote-server.mjs" "$dst\apps\desktop\main\agent-remote-server.mjs" -Force
 
-# Patch main.mjs safely for sequential startup without overwriting newer installer code
-$mainPath = Join-Path $dst 'apps\desktop\main.mjs'
-$mainText = Get-Content $mainPath -Raw -Encoding UTF8
-$patchedMain = $mainText -replace 'sequential:\s*responseTiming\.sequentialModels', 'sequential: true'
-if ($patchedMain -ne $mainText) {
-    Set-Content -Path $mainPath -Value $patchedMain -Encoding UTF8 -NoNewline
+$files = @(
+    'apps\desktop\main.mjs',
+    'apps\desktop\chat-service.mjs',
+    'apps\desktop\preload.cjs',
+    'apps\desktop\main\agent-remote-server.mjs',
+    'apps\desktop\main\settings-channels.mjs',
+    'apps\desktop\renderer\app.js',
+    'apps\desktop\renderer\cyberpunk.css',
+    'apps\desktop\renderer\index.html',
+    'apps\desktop\renderer\settings-app.mjs',
+    'apps\desktop\renderer\settings-registry.mjs',
+    'apps\desktop\renderer\settings.html',
+    'apps\desktop\renderer\skill-toolbar.mjs',
+    'packages\runtime\src\client.mjs',
+    'packages\runtime\src\config\settings.mjs',
+    'packages\runtime\src\index.mjs',
+    'packages\runtime\src\providers\chat-router.mjs',
+    'packages\skills\src\settings-catalog.mjs'
+)
+
+foreach ($rel in $files) {
+    $from = Join-Path $src $rel
+    $to = Join-Path $dst $rel
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $to) | Out-Null
+    Copy-Item $from $to -Force
 }
 
-# Sync renderer/app.js Blob QR fix
-$appPath = Join-Path $dst 'apps\desktop\renderer\app.js'
-$appText = Get-Content $appPath -Raw -Encoding UTF8
-if ($appText -notmatch 'agentRemoteQrUrl') {
-    Copy-Item "$src\apps\desktop\renderer\app.js" $appPath -Force
-}
-
-Write-Output "Synced mobile_gateway, agent-remote-server.mjs, QR fix, and sequential startup to $dst"
+Write-Output "Synced v1.2.0 + custom Agent Remote, Hermes provider, QR fix, and sequential startup to $dst"

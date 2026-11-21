@@ -32,6 +32,7 @@ export class CompanionActions {
     requestComputerAccess,
     runComputerTask,
     spotify,
+    youtubeMusic,
     applications,
     workflows,
     userTools,
@@ -50,6 +51,7 @@ export class CompanionActions {
       requestComputerAccess,
       runComputerTask,
       spotify,
+      youtubeMusic,
       applications,
       workflows,
       userTools,
@@ -60,6 +62,7 @@ export class CompanionActions {
     this.ownsSkills = !skills;
     registerActionToolSkills(this.skills, {
       spotify,
+      youtubeMusic,
       applications,
       files,
       workflows,
@@ -146,6 +149,8 @@ export class CompanionActions {
       if (!this.computerAgent) throw new Error('Computer task executor is unavailable.');
       return this.computerAgent.run(args.goal, { signal });
     }
+    if (tool === 'youtube_music_control')
+      return invoke(ACTION_SKILLS.youtubeMusic, 'execute', args);
     if (
       this.computerAgent?.running &&
       ['desktop_control', 'filesystem_control', 'application_control'].includes(tool)
@@ -244,6 +249,7 @@ export class CompanionActions {
     if (this.ownsSkills) void this.skills.close();
     void this.files?.close();
     this.spotify?.close();
+    this.youtubeMusic?.close();
     void this.applications?.close();
     void Promise.resolve(this.desktop.close()).catch((error) =>
       console.warn('Desktop journal could not close:', error.message),
