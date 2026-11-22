@@ -10,6 +10,22 @@ A Windows AI desktop companion powered by OpenClaw: bundled local LLMs, Hugging 
 
 The public repository and releases are **CapriChooms/CapriCore**. Downloads and update checks do not require a GitHub account, invitation or token.
 
+## Capri Induk (personal fork)
+
+This repository is the Capri Induk customization of [CapriCore](https://github.com/CapriChooms/CapriCore). The `upstream` remote tracks the original project; develop and publish Capri Induk changes on the `custom/induk` branch.
+
+### Capri Induk changes
+
+- **Smart Router:** routes chat and computer tasks through the configured provider, with local fallback and response handling tailored to Capri Induk.
+- **Agent Remote integration:** connects the desktop and Android app through the managed mobile gateway, including paired-PC chat, voice, screen viewing and remote pointer controls.
+- **Remote screen controls:** adds monitor selection and stream quality settings for the mobile screen remote.
+- **Desktop task handling:** improves intent selection, background computer control, confirmation behavior, and Discord voice task handling.
+- **Fork-aware updates:** prepares and validates upstream updates against Capri Induk-owned files, preserving custom changes and reporting conflicts for review.
+
+### Development and updates
+
+Keep Capri Induk work on `custom/induk` and bring CapriCore changes in from `upstream` deliberately. Build and publish Capri Induk releases from this branch so the fork-aware updater can preserve its custom files. The public CapriCore releases linked above are maintained by upstream and are not Capri Induk releases.
+
 ## What Capri can do
 
 - **Choose your inference.** Use bundled Qwen3.5 models, BETA Gemma/Ministral alternatives, compatible Hugging Face GGUF imports, or saved OpenAI-compatible API connections. Switch from the Local/API control without clearing the conversation.
