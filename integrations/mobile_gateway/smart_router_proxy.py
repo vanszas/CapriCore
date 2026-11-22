@@ -136,8 +136,10 @@ def calculate_prompt_complexity(messages: list[dict[str, Any]], tools: list[Any]
             # multi-part content
             text_parts = []
             for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    text_parts.append(part.get("text", ""))
+                if isinstance(part, dict) and part.get("type") in ("text", "input_text", "output_text"):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        text_parts.append(text)
             content = " ".join(text_parts)
         elif not isinstance(content, str):
             content = str(content)
@@ -337,6 +339,7 @@ class SmartRouterHandler(BaseHTTPRequestHandler):
         upstream = cfg.get("upstream_url", "http://localhost:20128/v1").rstrip("/")
 
         if path in ("/health", "/api/status", "/v1/health"):
+            moa_models = active_moa_models()
             self._send_json(
                 HTTPStatus.OK,
                 {
@@ -347,8 +350,8 @@ class SmartRouterHandler(BaseHTTPRequestHandler):
                     "mode": cfg.get("mode", "auto"),
                     "simple_model": cfg.get("simple_model"),
                     "complex_model": cfg.get("complex_model"),
-                    "active_moa_models": active_moa_models(),
-                    "active_model": (active_moa_models() or [None])[0],
+                    "active_moa_models": moa_models,
+                    "active_model": moa_models[0] if moa_models else None,
                     "history": get_routing_history()[:5],
                 },
             )
@@ -401,8 +404,14 @@ class SmartRouterHandler(BaseHTTPRequestHandler):
         cfg = get_config()
         upstream = cfg.get("upstream_url", "http://localhost:20128/v1").rstrip("/")
 
-        if path not in ("/v1/chat/completions", "/chat/completions"):
+        operation = path.removeprefix("/v1")
+        if operation not in ("/chat/completions", "/responses"):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not supported"})
+            return
+        if os.environ.get("AGENT_REMOTE_MANAGED") == "1" and (
+            self.headers.get("Origin") or self.headers.get("Host") != "127.0.0.1:20130"
+        ):
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "Use the local Smart Router endpoint"})
             return
 
         content_length = int(self.headers.get("Content-Length", 0))
@@ -410,14 +419,19 @@ class SmartRouterHandler(BaseHTTPRequestHandler):
 
         try:
             body = json.loads(body_bytes.decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("Expected a JSON object")
         except Exception as e:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid JSON: {e}"})
             return
 
         requested_model = body.get("model", "")
         messages = body.get("messages", [])
+        if operation == "/responses":
+            input_data = body.get("input", "")
+            messages = input_data if isinstance(input_data, list) else [{"role": "user", "content": input_data}]
         tools = body.get("tools")
-        is_stream = bool(body.get("stream", False))
+        messages = [message for message in messages if isinstance(message, dict)] if isinstance(messages, list) else []
 
         primary_model, candidates, score, reasons = determine_model_candidates(
             requested_model, messages, tools, cfg
@@ -437,7 +451,7 @@ class SmartRouterHandler(BaseHTTPRequestHandler):
             payload_data = json.dumps(attempt_payload, ensure_ascii=False).encode("utf-8")
 
             req = urllib.request.Request(
-                f"{upstream}/chat/completions",
+                f"{upstream}{operation}",
                 data=payload_data,
                 method="POST",
             )
@@ -475,12 +489,13 @@ class SmartRouterHandler(BaseHTTPRequestHandler):
                 self.end_headers()
 
                 try:
-                    while True:
-                        chunk = upstream_resp.read(4096)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
+                    with upstream_resp:
+                        while True:
+                            chunk = upstream_resp.read1(4096)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
                 except (ConnectionResetError, BrokenPipeError):
                     pass
                 return

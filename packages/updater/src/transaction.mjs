@@ -200,6 +200,12 @@ export async function applyUpdate(
   source = path.resolve(source);
   const identity = managedInstallation(root);
   const files = verifyPayload(source, tag);
+  const installedRelease = path.join(root, 'config/release.json');
+  if (existsSync(installedRelease) && readJson(installedRelease).distribution === 'induk') {
+    const incomingRelease = readJson(path.join(source, 'config/release.json'));
+    if (incomingRelease.distribution !== 'induk' || !files.some(({ path }) => path === 'integrations/mobile_gateway/agent_remote_server.py'))
+      throw new Error('Updating Capri Induk requires a Capri Induk build with Agent Remote.');
+  }
   const updateRoot = path.join(root, '.runtime/updates');
   noLinks(updateRoot);
   mkdirSync(updateRoot, { recursive: true });

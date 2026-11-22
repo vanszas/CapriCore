@@ -44,3 +44,4 @@ apps/mobile/local.properties
 /Software/
 /.audit-backup/
 /remote-test-*/
+CapriSession/

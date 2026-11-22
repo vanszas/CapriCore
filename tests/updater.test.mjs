@@ -31,6 +31,7 @@ import {
   managedInstallation,
 } from '../packages/updater/src/transaction.mjs';
 import { UpdateService } from '../apps/desktop/update-service.mjs';
+import { mergeIndukRelease } from '../packages/updater/src/induk-merge.mjs';
 
 const parent = path.join(root, '.runtime/update-unit');
 mkdirSync(parent, { recursive: true });
@@ -97,6 +98,55 @@ function fixture({ modular = false } = {}) {
   writeJsonAtomic(path.join(source, 'SOURCE_MANIFEST.json'), { schemaVersion: 1, files });
   return { root: target, source, tag: 'v0.3.0-preview.14' };
 }
+test('an official source payload cannot replace a managed Capri Induk installation', async () => {
+  const request = fixture();
+  const metadata = path.join(request.root, 'config/release.json');
+  writeJsonAtomic(metadata, { ...json(metadata), distribution: 'induk' });
+  await assert.rejects(applyUpdate(request), /requires a Capri Induk build with Agent Remote/);
+  assert.equal(readFileSync(path.join(request.root, 'apps/desktop/sample.mjs'), 'utf8'), 'old source');
+});
+
+test('Induk merges on the developer base and resumes validated conflict repairs', () => {
+  const { root: target, source, tag } = fixture();
+  const oldTag = 'v0.3.0-preview.13';
+  const stage = path.join(target, '.runtime/updates/staged');
+  const previous = path.join(stage, 'release-base');
+  const names = [
+    'apps/desktop/main.mjs', 'apps/desktop/preload.cjs', 'apps/desktop/renderer/settings.html',
+    'integrations/mobile_gateway/agent_remote_server.py', 'config/induk-update-files.json',
+  ];
+  const main = names[0];
+  const baseline = 'const distance = 1;\n';
+  for (const file of ['package.json', 'package-lock.json', 'config/installer.json', 'packages/installer/windows/register.ps1'])
+    put(previous, file, readFileSync(path.join(source, file)));
+  const meta = { schemaVersion: 1, repository: REPOSITORY, tag: oldTag };
+  put(previous, 'config/release.json', JSON.stringify(meta));
+  put(target, 'config/release.json', JSON.stringify({ ...meta, distribution: 'induk' }));
+  put(target, names[4], JSON.stringify(names));
+  put(previous, main, baseline);
+  put(source, main, 'const distance = 2;\n');
+  put(target, main, 'const distance = 3; // capri:agent-remote-server\n');
+  put(target, names[1], '// capri:agent-remote-server\n');
+  put(target, names[2], '<section id="agent-remote-panel"></section>\n');
+  put(target, names[3], '# Agent Remote\n');
+  for (const folder of [source, previous]) {
+    const files = sourceFiles(folder).map((name) => {
+      const bytes = readFileSync(path.join(folder, name));
+      return { path: name, bytes: bytes.length, sha256: digest(bytes) };
+    });
+    put(folder, 'SOURCE_MANIFEST.json', JSON.stringify({ schemaVersion: 1, files }));
+  }
+  assert.throws(() => mergeIndukRelease({ root: target, source, tag }), /MERGE-REPORT.json/);
+  const reportFolder = path.join(stage, readdirSync(stage).find((name) => name.startsWith('induk-')));
+  assert.equal(json(path.join(reportFolder, 'MERGE-REPORT.json')).failures[0].file, main);
+  const resolved = 'const distance = 2; // capri:agent-remote-server\n';
+  put(reportFolder, 'resolutions/' + main, resolved);
+  const candidate = mergeIndukRelease({ root: target, source, tag });
+  assert.equal(readFileSync(path.join(candidate, main), 'utf8'), resolved);
+  assert.equal(readFileSync(path.join(target, main), 'utf8'), 'const distance = 3; // capri:agent-remote-server\n');
+  assert.equal(json(path.join(candidate, 'config/release.json')).distribution, 'induk');
+});
+
 const release = (tag, prerelease = true, id = 1) => ({
   tag_name: tag,
   prerelease,

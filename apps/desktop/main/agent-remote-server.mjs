@@ -1,4 +1,5 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import { existsSync, readFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -8,12 +9,19 @@ const PNG = Buffer.from('89504e470d0a1a0a', 'hex');
 const DEFAULT_SCRIPT = fileURLToPath(
   new URL('../../../integrations/mobile_gateway/agent_remote_server.py', import.meta.url),
 );
+const SETUP_SCRIPT = fileURLToPath(
+  new URL('../../../tools/setup/setup-mobile-gateway.ps1', import.meta.url),
+);
+const PRIVATE_PYTHON = fileURLToPath(
+  new URL('../../../.runtime/mobile-gateway-venv/Scripts/python.exe', import.meta.url),
+);
+const execFileAsync = promisify(execFile);
 
 // ponytail: one loopback service; add discovery only when multiple hosts are supported.
 export function createAgentRemoteServer({
   file, persist, fetchRemote = fetch, spawnRemote = spawn,
   script = process.env.AGENT_REMOTE_SERVER_SCRIPT || DEFAULT_SCRIPT,
-  python = process.env.AGENT_REMOTE_PYTHON || 'python3',
+  python = process.env.AGENT_REMOTE_PYTHON,
   startupTimeout = 15000,
 } = {}) {
   let mode = 'desktop';
@@ -79,11 +87,26 @@ export function createAgentRemoteServer({
     if (before.running) return before;
     if (child) throw new Error('Agent Remote is still starting or stopping.');
     if (!existsSync(script)) throw new Error('Agent Remote server script not found.');
-    const process = spawnRemote(python, [script], {
-      windowsHide: true, stdio: 'ignore',
-      env: { ...globalThis.process.env, AGENT_REMOTE_MANAGED: '1', AGENT_REMOTE_MODE: mode, AGENT_REMOTE_HOST: '127.0.0.1' },
+    let executable = python || 'python3';
+    if (!python && script === DEFAULT_SCRIPT && globalThis.process.platform === 'win32') {
+      executable = PRIVATE_PYTHON;
+      const options = { windowsHide: true, timeout: 120000 };
+      try {
+        await execFileAsync(executable, ['-c', 'import PIL.ImageGrab, qrcode'], options);
+      } catch {
+        try {
+          await execFileAsync('powershell.exe', ['-NoProfile', '-File', SETUP_SCRIPT], options);
+        } catch {
+          throw new Error('Could not install Agent Remote Python dependencies. Check the connection and retry.');
+        }
+      }
+    }
+    const process = spawnRemote(executable, [script], {
+      windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'],
+      env: { ...globalThis.process.env, AGENT_REMOTE_MANAGED: '1', AGENT_REMOTE_MODE: mode, AGENT_REMOTE_HOST: '127.0.0.1', AGENT_REMOTE_PARENT_PIPE: '1' },
     });
     child = process;
+    process.stdin?.on('error', () => {});
     let failure = null;
     const clear = () => { if (child === process) child = null; };
     process.once('error', () => { failure = new Error('Agent Remote Python could not start. Check AGENT_REMOTE_PYTHON.'); clear(); });

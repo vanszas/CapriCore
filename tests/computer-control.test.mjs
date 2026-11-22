@@ -53,6 +53,79 @@ function fixture() {
   return { state, control };
 }
 
+test('background control binds the observed window and never dispatches shared input or key release', async () => {
+  const { state, control } = fixture();
+  control.backgroundOnly = true;
+  try {
+    await control.begin('Set the fixture draft');
+    assert.equal(state.registered, false);
+    const view = await control.execute({ action: 'observe' });
+    assert.equal(state.calls[0].backgroundOnly, true);
+    assert.equal(state.calls[1].windowId, '123');
+    await assert.rejects(
+      control.execute({ action: 'press_keys', keys: ['ENTER'], observationId: view.observationId }),
+      { code: 'COMPUTER_BACKGROUND_UNAVAILABLE', inputPerformed: false },
+    );
+    await control.execute({ action: 'enter_text', targetId: view.targets.find((item) => item.editable).targetId, text: 'draft' });
+    assert.equal(state.calls.at(-1).action, 'computer_type');
+    assert.equal(state.calls.at(-1).backgroundOnly, true);
+  } finally {
+    await control.stop();
+  }
+  assert.equal(state.calls.some((item) => item.action === 'computer_release'), false);
+});
+
+test('ordinary native clicks start in the background without releasing the physical mouse', async () => {
+  const { state, control } = fixture();
+  const bridge = state.bridge;
+  state.bridge = async (command) => {
+    const result = await bridge(command);
+    if (command.action === 'computer_state') {
+      result.untrustedControls = [{
+        id: 'open',
+        untrustedName: 'Open',
+        type: 'ControlType.Button',
+        clickKind: 'control',
+        x: 12,
+        y: 34,
+      }];
+    }
+    return result;
+  };
+  try {
+    await control.begin('Open the fixture');
+    const view = await control.execute({ action: 'observe', vision: false });
+    await control.execute({ action: 'click', targetId: view.targets[0].targetId });
+    const clicks = state.calls.filter(({ action }) => action === 'computer_click');
+    assert.equal(clicks.length, 1);
+    assert.equal(clicks[0].backgroundOnly, true);
+    assert.equal(state.calls.some(({ action }) => action === 'computer_release'), false);
+  } finally {
+    await control.stop();
+  }
+});
+
+test('background control cannot send a mutation when the owner declines review', async () => {
+  const { state, control } = fixture();
+  control.backgroundOnly = true;
+  control.reviewBackgroundMutation = async ({ text, control: label }) => {
+    assert.equal(text, 'new draft');
+    assert.equal(label, 'Draft');
+    return false;
+  };
+  try {
+    await control.begin('Replace the draft');
+    const view = await control.execute({ action: 'observe' });
+    await assert.rejects(
+      control.execute({ action: 'enter_text', targetId: view.targets.find((item) => item.editable).targetId, text: 'new draft' }),
+      { code: 'COMPUTER_MUTATION_DECLINED', inputPerformed: false },
+    );
+    assert.equal(state.calls.some((call) => call.action === 'computer_type'), false);
+  } finally {
+    await control.stop();
+  }
+});
+
 test('a native input failure consumes the observation and an in-flight action excludes overlapping input', async () => {
   const { state, control } = fixture();
   const bridge = state.bridge;
@@ -291,6 +364,18 @@ test('workflow ownership survives startup supervision without a chat, while revo
     assert.equal(state.visible, false);
     assert.equal(control.session, null);
   }
+});
+
+test('background supervision permits an unregistered global Escape and still stops on revocation', async () => {
+  const { control, state } = fixture();
+  control.backgroundOnly = true;
+  await control.begin('Inspect a background window');
+  const tick = () => control.supervise({ indicatorVisible: true, escapeAvailable: false });
+  assert.equal(tick(), true);
+  state.allowed = false;
+  assert.equal(tick(), false);
+  await control.stopping;
+  assert.equal(control.session, null);
 });
 
 test('owner cancellation during indicator startup is immediate and is not reported as a visibility timeout', async () => {

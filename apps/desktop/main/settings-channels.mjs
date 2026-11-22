@@ -21,6 +21,8 @@ export const SETTINGS_CHANNELS = [
   'computer-access-set',
   'application-access',
   'inference-api-status',
+  'smart-router-status',
+  'smart-router-save',
   'desktop-ai-scan',
   'chatgpt-plan',
   'inference-startup-set',

@@ -275,6 +275,125 @@ def get_screen_bounds(monitor: str = "primary") -> tuple[int, int, int, int]:
     return 0, 0, 1920, 1080
 
 
+_pointer_lock = threading.Lock()
+_android_pointers = {}
+_overlay_started = False
+
+
+def _show_android_pointers():
+    import tkinter as tk
+
+    user = ctypes.windll.user32
+    user.GetParent.restype = ctypes.wintypes.HWND
+    root = tk.Tk()
+    root.withdraw()
+    windows = {}
+    transparent = "#ff00ff"
+
+    def update():
+        with _pointer_lock:
+            now = time.monotonic()
+            for pointer, (_, _, seen) in list(_android_pointers.items()):
+                if now - seen > 30:
+                    del _android_pointers[pointer]
+            positions = _android_pointers.copy()
+        for pointer in windows.keys() - positions.keys():
+            windows.pop(pointer)[0].destroy()
+        for pointer, (x, y, _) in positions.items():
+            if pointer not in windows:
+                win = tk.Toplevel(root)
+                win.withdraw()
+                win.overrideredirect(True)
+                win.attributes("-transparentcolor", transparent)
+                canvas = tk.Canvas(win, width=141, height=31, bg=transparent, highlightthickness=0)
+                canvas.pack()
+                color = ("#58e6ff", "#92f58a", "#ffbe58", "#e6a3ff")[int(pointer[-1], 16) % 4]
+                canvas.create_polygon(0, 0, 5, 21, 9, 13, 17, 10, fill=color, outline="#10242b")
+                canvas.create_rectangle(16, 12, 140, 30, fill="#10242b", outline=color)
+                canvas.create_text(21, 21, text=f"Android · {pointer[-4:]}", anchor="w", fill=color)
+                win.update_idletasks()
+                hwnd = ctypes.wintypes.HWND(user.GetParent(ctypes.wintypes.HWND(win.winfo_id())))
+                style = user.GetWindowLongW(hwnd, -20)
+                user.SetWindowLongW(hwnd, -20, style | 0x080800a0)
+                win.deiconify()
+                windows[pointer] = win, hwnd
+            _, hwnd = windows[pointer]
+            # Keep the layered window click-through and show it without activation.
+            user.SetWindowPos(hwnd, ctypes.wintypes.HWND(-1), x, y, 141, 31, 0x0050)
+        root.after(33, update)
+
+    update()
+    root.mainloop()
+
+
+def _window_pointer(action, x, y, button, delta, monitor, pointer="", key="", text=""):
+    global _overlay_started
+    if not (0 <= x <= 1 and 0 <= y <= 1):
+        raise ValueError("Pointer outside monitor")
+    if pointer and (len(pointer) != 32 or any(c not in "0123456789abcdef" for c in pointer)):
+        raise ValueError("Invalid Android pointer ID")
+    user = ctypes.windll.user32
+    left, top, width, height = get_screen_bounds(monitor)
+    pt = ctypes.wintypes.POINT(left + min(int(x * width), width - 1),
+                              top + min(int(y * height), height - 1))
+    # Each phone supplies its own coordinates. Queue each gesture as one batch.
+    with _pointer_lock:
+        if pointer:
+            if pointer not in _android_pointers and len(_android_pointers) >= 32:
+                raise ValueError("Too many active Android pointers")
+            _android_pointers[pointer] = (pt.x, pt.y, time.monotonic())
+            if not _overlay_started:
+                threading.Thread(target=_show_android_pointers, daemon=True).start()
+                _overlay_started = True
+        if action == "move":
+            return {"status": "ok", "action": action}
+        user.WindowFromPoint.argtypes = [ctypes.wintypes.POINT]
+        user.WindowFromPoint.restype = ctypes.wintypes.HWND
+        hwnd = ctypes.wintypes.HWND(user.WindowFromPoint(pt))
+        if not hwnd:
+            raise ValueError("No window under remote pointer")
+        if action == "hotkey":
+            class_name = ctypes.create_unicode_buffer(128)
+            user.GetClassNameW(hwnd, class_name, len(class_name))
+            if class_name.value.lower() != "edit" and not class_name.value.lower().startswith("richedit"):
+                raise ValueError("This window does not support Android keyboard shortcuts")
+            shortcuts = {"ctrl+a": (0x00b1, 0, -1), "ctrl+c": (0x0301, 0, 0),
+                         "ctrl+v": (0x0302, 0, 0), "ctrl+z": (0x0304, 0, 0)}
+            if key.lower() not in shortcuts:
+                raise ValueError("Shortcut unsupported by Android pointer")
+            events = [shortcuts[key.lower()]]
+        elif action in ("key", "type", "text"):
+            if action == "key":
+                vk = KEY_MAP.get(key.lower())
+                if vk is None:
+                    raise ValueError("Key unsupported by Android pointer")
+                scan = user.MapVirtualKeyW(vk, 0) << 16
+                events = [(0x0100, vk, scan | 1), (0x0101, vk, scan | 0xc0000001)]
+            else:
+                encoded = text[:8000].encode("utf-16-le")
+                events = [(0x0102, encoded[i] | (encoded[i + 1] << 8), 1)
+                          for i in range(0, len(encoded), 2)]
+        elif action == "scroll":
+            events = [(0x020A, ((delta or 120) & 0xffff) << 16)]
+        else:
+            if not user.ScreenToClient(hwnd, ctypes.byref(pt)):
+                raise OSError("Window coordinates unavailable")
+            right = action == "rclick" or button == "right"
+            down, up, mask = (0x0204, 0x0205, 2) if right else (0x0201, 0x0202, 1)
+            if action == "double_click":
+                events = [(down, mask), (up, 0), (0x0206 if right else 0x0203, mask), (up, 0)]
+            elif action in ("click", "rclick"):
+                events = [(down, mask), (up, 0)]
+            else:
+                raise ValueError("Unsupported isolated pointer action")
+        coords = (pt.x & 0xffff) | ((pt.y & 0xffff) << 16)
+        for event in events:
+            message, flags, param = event if len(event) == 3 else (*event, coords)
+            if not user.PostMessageW(hwnd, message, flags, ctypes.c_ssize_t(param)):
+                raise OSError("Window rejected remote pointer")
+    return {"status": "queued", "action": action}
+
+
 def inject_input(
     action: str = "move",
     x: float = 0.0,
@@ -284,47 +403,13 @@ def inject_input(
     key: str = "",
     text: str = "",
     monitor: str = "primary",
+    pointer: str = "",
     **kwargs: object,
 ) -> dict:
     """Injects mouse and keyboard events into Windows."""
-    user32 = ctypes.windll.user32
-    left, top, width, height = get_screen_bounds(monitor)
-
-    target_x = int(left + x * width)
-    target_y = int(top + y * height)
-
-    if action == "move":
-        user32.SetCursorPos(target_x, target_y)
-    elif action == "down":
-        user32.SetCursorPos(target_x, target_y)
-        flag = MOUSEEVENTF_RIGHTDOWN if button == "right" else MOUSEEVENTF_LEFTDOWN
-        user32.mouse_event(flag, 0, 0, 0, 0)
-    elif action == "up":
-        flag = MOUSEEVENTF_RIGHTUP if button == "right" else MOUSEEVENTF_LEFTUP
-        user32.mouse_event(flag, 0, 0, 0, 0)
-    elif action == "click":
-        user32.SetCursorPos(target_x, target_y)
-        flag_down = MOUSEEVENTF_RIGHTDOWN if button == "right" else MOUSEEVENTF_LEFTDOWN
-        flag_up = MOUSEEVENTF_RIGHTUP if button == "right" else MOUSEEVENTF_LEFTUP
-        user32.mouse_event(flag_down, 0, 0, 0, 0)
-        time.sleep(0.01)
-        user32.mouse_event(flag_up, 0, 0, 0, 0)
-    elif action == "rclick":
-        user32.SetCursorPos(target_x, target_y)
-        user32.mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
-        time.sleep(0.01)
-        user32.mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
-    elif action == "double_click":
-        user32.SetCursorPos(target_x, target_y)
-        for _ in range(2):
-            user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-            user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-            time.sleep(0.02)
-    elif action == "scroll":
-        user32.SetCursorPos(target_x, target_y)
-        wheel_delta = delta if delta != 0 else 120
-        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, wheel_delta, 0)
-    elif action in ("key", "type", "text"):
+    if action.startswith("pointer_") or action in ("move", "click", "double_click", "rclick", "scroll", "down", "up"):
+        return _window_pointer(action.removeprefix("pointer_"), x, y, button, delta, monitor, pointer, key, text)
+    if action in ("key", "type", "text"):
         target_key = text if text else key
         _inject_key(target_key)
     elif action in ("hotkey", "shortcut"):
@@ -335,8 +420,7 @@ def inject_input(
     return {
         "status": "ok",
         "action": action,
-        "x": target_x,
-        "y": target_y,
+
     }
 
 

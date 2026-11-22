@@ -32,7 +32,8 @@ export function renderInferenceLabel(value, ui) {
   if (!value) return;
   const label = document.getElementById('inference-label');
   const external = value.remote || value.setupRequired;
-  const mode = external ? (value.authMode === 'chatgpt' ? 'ChatGPT' : 'API') : ui.text('Local');
+  const mode = external ? (value.authMode === 'chatgpt' ? 'ChatGPT' : 'API') :
+    value.smartRouter ? 'Smart Router' : ui.text('Local');
   const detail = value.remote
     ? providerDisplayName(value.providerHost)
     : value.setupRequired

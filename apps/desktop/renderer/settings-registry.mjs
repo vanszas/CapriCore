@@ -39,6 +39,7 @@ export const SETTINGS_GROUPS = Object.freeze([
       ['appearance', 'Appearance and animations', 'companion-settings'],
       ['window', 'Window', 'companion-settings'],
       ['models', 'Language model', 'models-panel'],
+      ['smart-router', 'Smart Router', 'smart-router-panel'],
       ['api', 'API connections', 'inference-panel'],
     ],
   },

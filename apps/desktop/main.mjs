@@ -377,6 +377,7 @@ import { ScreenObservation } from './screen-observation.mjs';
 import { screenObserverModel } from './screen-observer-model.mjs';
 import { createWindowsPlaybackReader } from '../../integrations/perception/windows-playback.mjs';
 import { isClipCommand } from './clip-command.mjs';
+import { SAMPLE_WIDTH, SAMPLE_HEIGHT, SAMPLE_BYTES } from './renderer/screen-change.mjs';
 import { avatarTapsSleeping, isSleepCommand, SleepService } from './sleep-service.mjs';
 import { ScreenshotFiles } from './screenshot-files.mjs';
 import { ScreenClipFrames } from './screen-clip-frames.mjs';
@@ -1253,12 +1254,37 @@ async function initializeDesktop() {
     changed: (changes) => emit({ type: 'coding.changes', changes }),
     review: () => void settingsHost?.open('coding').catch((error) => console.error(error.message)),
   });
+  const currentSmartRouter = () => {
+    if (rt.remote.enabled || rt.remote.setupRequired) return null;
+    const router = inferenceApi.smartRouterSettings();
+    return router.enabled ? router : null;
+  };
+  function canReadScreen() {
+    if (screenVisionAvailable) return true;
+    const router = currentSmartRouter();
+    return Boolean(router && inferenceApi.profile(router.profileId).settings.vision);
+  }
+  function requestScreenVision(url, options, { preferLocal = false } = {}) {
+    const local = () => (inferenceOptions.fetchImpl ?? fetch)(url, options);
+    const router = currentSmartRouter();
+    if (!router || (preferLocal && screenVisionAvailable)) return local();
+    return inferenceApi.smartRouterAuxiliary(router, options, local, {
+      vision: true,
+      localVision: screenVisionAvailable,
+    });
+  }
   const codingAgent = new CodingAgent({
     service: coding,
     applyEdits: (edits, options) => codingRevisions.apply(edits, options),
     url: rt.inferenceUrl,
     model: settings.model,
     ...inferenceOptions,
+    fetchImpl: async (url, options) => {
+      const local = () => (inferenceOptions.fetchImpl ?? fetch)(url, options);
+      const router = currentSmartRouter();
+      if (!router) return local();
+      return inferenceApi.smartRouterAuxiliary(router, options, local);
+    },
     params: auxiliaryRunnerParams,
     emit,
   });
@@ -1314,8 +1340,31 @@ async function initializeDesktop() {
         JSON.stringify({ user: user.text.slice(0, 1200), reply: assistant.text.slice(0, 1800) }),
     });
   }
+  const desktopIntent = !verification || process.env.CAPRI_DESKTOP_VERIFICATION_CLIP_FIXTURE === '1'
+    ? computerIntentClassifier({
+        url: (verification && process.env.CAPRI_DESKTOP_VERIFICATION_OBSERVATION_URL) || rt.inferenceUrl,
+        model: settings.model,
+        modelCapabilities: settings.modelCapabilities,
+        ...inferenceOptions,
+        params: auxiliaryRunnerParams,
+        screenActions: true,
+      })
+    : null;
   const chat = new ChatService({
     skills,
+    smartRouter: () => {
+      const router = currentSmartRouter();
+      if (!router) return null;
+      return {
+        fallback: router.fallback,
+        request: (payload, signal) => inferenceApi.smartRouterRequest(router, '/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+          body: JSON.stringify({ ...payload, stream: true }),
+          signal,
+        }),
+      };
+    },
     codingTask: (goal, { signal } = {}) =>
       callSkill('capri.coding', 'run', goal, { source: 'chat', signal }),
     externalInference: rt.remote.enabled,
@@ -1365,10 +1414,14 @@ async function initializeDesktop() {
         microphone.status === 'listening',
       languages: liveLanguages(),
       microphone: microphone.status === 'listening',
+      callAudio: {
+        outputReady: currentCallAudio.callOutputReady,
+        shareReplies: currentCallAudio.shareReplies,
+      },
       microphoneLanguage: microphone.config.language,
       wakePhrase: microphone.snapshot().wakePhrase,
       screenObservation: skillEnabled('capri.screen') ? media.screen.context() : null,
-      screenVisionAvailable: skillEnabled('capri.screen') && screenVisionAvailable,
+      screenVisionAvailable: skillEnabled('capri.screen') && canReadScreen(),
       modelToolsAvailable: rt.nativeNpu
         ? false
         : rt.remote.enabled
@@ -1405,15 +1458,7 @@ async function initializeDesktop() {
       npuDialogue && !verification
         ? (user, assistant) => rememberDirectDialogue(user, assistant, 'Local NPU conversation')
         : null,
-    computerIntent: verification
-      ? null
-      : computerIntentClassifier({
-          url: rt.inferenceUrl,
-          model: settings.model,
-          modelCapabilities: settings.modelCapabilities,
-          ...inferenceOptions,
-          params: auxiliaryRunnerParams,
-        }),
+    computerIntent: desktopIntent,
     localCalculation: (input, args, signal) =>
       companionActions.execute('application_control', input.id, args, signal),
     localMusic: (input, args, signal) =>
@@ -1830,8 +1875,73 @@ async function initializeDesktop() {
       throw new SubmissionError('backend_unavailable', 'The local core is not ready yet.');
     if (currentChatTask || chat.active)
       throw new SubmissionError('busy', 'A reply is already in progress.');
+    let intent;
+    if (!input.mode && desktopIntent) {
+      const controller = new AbortController();
+      const classificationTurn = { id: input.id, controller, kind: 'intent' };
+      visualTurn = classificationTurn;
+      const recentTurns = store.messages.filter(({ role }) => role === 'user').slice(-4).map(
+        ({ text, origin }) => ({ text: text.slice(0, 500), ...(origin?.kind === 'screen' ? { screenRead: true } : {}) }),
+      );
+      const task = desktopIntent(input.text, {
+        recentTurns,
+        previous: recentTurns.at(-1)?.text,
+        fullComputerAccess: fullComputerAccess.enabled,
+        internetSearch: input.internet === true,
+        signal: controller.signal,
+      }).catch(() => null);
+      currentChatTask = task;
+      try {
+        intent = await task;
+        if (controller.signal.aborted) return { ok: false, message: 'Reply stopped.' };
+      } finally {
+        if (currentChatTask === task) currentChatTask = null;
+        if (visualTurn === classificationTurn) visualTurn = null;
+      }
+    }
+    const screenCommand = { screen_once: 'once', screen_watch: 'watch', screen_stop: 'stop' }[intent?.intent];
+    const ownedScreenFixture =
+      verification && process.env.CAPRI_DESKTOP_VERIFICATION_CLIP_FIXTURE === '1' &&
+      screenCommand === 'once';
+    if (screenCommand && (!verification || ownedScreenFixture)) {
+      if (screenCommand !== 'once') return submitScreenWatchCommand(input, screenCommand);
+      const capture = capturePolicy.capture;
+      if (capture && capture.mode !== 'watch')
+        throw new SubmissionError('busy', 'Finish the existing screenshot capture before reading the display.');
+      {
+        if (!skillEnabled('capri.screen'))
+          throw new SubmissionError('screen_disabled', 'Enable the Screen skill in Settings to read the display.');
+        if (!canReadScreen())
+          throw new SubmissionError('screen_vision_required', SCREEN_VISION_REQUIRED);
+        const display = !ownedScreenFixture && (!capture || capture.native)
+          ? capture?.display ?? requestedDisplay()
+          : null;
+        return submitVisualTurn(input, {
+          visionQuestion: intent.usesPrevious
+            ? 'Describe what is visible in the current screenshot. Answer from this fresh frame.'
+            : input.text,
+          source: {
+            ...(ownedScreenFixture
+              ? { kind: 'window', label: 'Owned verification fixture' }
+              : capture ? selectedScreenSource(capture) : { kind: 'monitor', label: 'Current display' }),
+            capturedAt: Date.now(),
+          },
+          captureFrame: async (signal) => {
+            if (!ownedScreenFixture) {
+              if (!capture || capture.native) return readRequestedDisplay(display, signal);
+              if (!(await capturePolicy.checkActive(capture.id)))
+                throw new Error('The selected screen source is no longer available.');
+              return clipFrames.request(capture, signal);
+            }
+            const ownedWindow = readFileSync(path.join(verificationFolder, 'clip-owned-window.txt'), 'utf8').trim();
+            if (!/^[1-9]\d{0,18}$/u.test(ownedWindow)) throw new Error('Missing owned screen fixture');
+            return (await screenFrames.frame({ ownedWindow, signal })).png;
+          },
+        });
+      }
+    }
     voicePreviewRequest = null;
-    const task = chat.send(input, emitChat);
+    const task = chat.send(input, emitChat, intent);
     currentChatTask = task;
     try {
       await task;
@@ -2546,6 +2656,7 @@ async function initializeDesktop() {
       model: settings.model,
       modelCapabilities: settings.modelCapabilities,
       ...inferenceOptions,
+      fetchImpl: (url, options) => requestScreenVision(url, options, { preferLocal: true }),
       params: { ...auxiliaryRunnerParams, ...settings.generation },
       identifyPortrait,
     }),
@@ -2555,7 +2666,7 @@ async function initializeDesktop() {
       speaking: playbackBusy,
       userSpeech: Date.now() < lastSpeechUntil,
       offline:
-        !screenVisionAvailable ||
+        !canReadScreen() ||
         backendState.phase !== 'ready' ||
         shuttingDown ||
         Boolean(chatgpt.signingIn),
@@ -2569,12 +2680,88 @@ async function initializeDesktop() {
   });
   const screenPreviews = new Map();
   const clipFrames = new ScreenClipFrames({ current: () => capturePolicy.capture, emit });
+  function requestedDisplay() {
+    const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    if (!display)
+      throw new SubmissionError('screen_source_unavailable', 'No screen is available to read.');
+    return display;
+  }
+  async function readRequestedDisplay(display, signal) {
+    const current = screen.getAllDisplays().find(({ id }) => id === display.id);
+    if (!companionPresent() || powerMonitor.getSystemIdleState(1) === 'locked' ||
+        !current || JSON.stringify(current.bounds) !== JSON.stringify(display.bounds))
+      throw new Error('The requested display is no longer available.');
+    const { png } = await screenFrames.frame({
+      region: displayPixels(display), limit: { width: 1280, height: 720 }, signal,
+    });
+    signal.throwIfAborted();
+    if (!companionPresent() || powerMonitor.getSystemIdleState(1) === 'locked')
+      throw new Error('Screen capture was cancelled.');
+    return png;
+  }
+  function submitScreenWatchCommand(input, command) {
+    const id = input.id;
+    const language = languages.value.conversation;
+    let reply;
+    if (command === 'stop') {
+      capturePolicy.clear('cancelled');
+      reply = language === 'id' ? 'Pantauan layar dihentikan.' : uiText('Screen observation stopped.', language);
+    } else {
+      skillSettings.require('capri.screen');
+      if (!canReadScreen()) throw new Error(SCREEN_VISION_REQUIRED);
+      if (capturePolicy.capture?.mode !== 'watch') {
+        if (verification || !companionPresent() || powerMonitor.getSystemIdleState(1) === 'locked')
+          throw new Error('Screen observation is unavailable.');
+        const display = requestedDisplay();
+        capturePolicy.startNativeWatch({
+          display, nativeId: 'screen:' + display.id + ':0', displayId: String(display.id),
+          label: 'Current display', intervalMs: screenPreferences.snapshot().intervalMs,
+        });
+      }
+      reply = language === 'id' ? 'Pantauan layar aktif. Bilang “hentikan pantauan layar” untuk berhenti.' :
+        uiText('Screen observation is active. Say “stop screen observation” to stop.', language);
+    }
+    const createdAt = new Date().toISOString();
+    const user = { id: randomUUID(), turnId: id, role: 'user', text: input.text, status: 'complete', createdAt };
+    const assistant = { id: randomUUID(), turnId: id, role: 'assistant', text: reply, status: 'complete', createdAt };
+    store.put(user);
+    store.put(assistant);
+    emitChat({ type: 'turn.started', turnId: id, user, assistant: { ...assistant, text: '' } });
+    emitChat({ type: 'turn.delta', turnId: id, text: reply });
+    emitChat({ type: 'turn.completed', turnId: id, assistant });
+    return { ok: true };
+  }
+  async function sampleNativeWatch() {
+    const capture = capturePolicy.capture;
+    if (!capture?.native || capture.sampling || !screenObservation.available() ||
+        Date.now() < (capture.nextSample ?? 0)) return;
+    capture.sampling = true;
+    capture.nextSample = Date.now() + capture.intervalMs;
+    try {
+      const png = await readRequestedDisplay(capture.display, capture.controller.signal);
+      if (capturePolicy.capture !== capture || !screenObservation.available()) return;
+      const pixels = nativeImage.createFromBuffer(png).resize({ width: SAMPLE_WIDTH, height: SAMPLE_HEIGHT }).toBitmap();
+      const signature = new Uint8Array(SAMPLE_BYTES);
+      for (let i = 0; i < SAMPLE_BYTES; i++)
+        signature[i] = Math.round((pixels[i * 4] * 0.114 + pixels[i * 4 + 1] * 0.587 + pixels[i * 4 + 2] * 0.299));
+      if (screenObservation.sample({ captureId: capture.id, signature }).analyse)
+        await screenObservation.frame({ captureId: capture.id, sequence: ++capture.sequence, png, signature });
+    } catch {
+      capturePolicy.release(capture.id, 'source-unavailable');
+    } finally {
+      capture.sampling = false;
+    }
+  }
   async function prepareScreenContext(input, { signal }) {
     return prepareScreenObservationContext(
       {
-        enabled: screenVisionAvailable && !chatgpt.signingIn,
+        enabled: canReadScreen() && !chatgpt.signingIn,
         capturePolicy,
-        clipFrames,
+        clipFrames: {
+          request: (capture, abort) => capture.native
+            ? readRequestedDisplay(capture.display, abort)
+            : clipFrames.request(capture, abort),
+        },
         validImage: (png) => !nativeImage.createFromBuffer(png).isEmpty(),
         observer: screenObservation,
       },
@@ -2619,7 +2806,7 @@ async function initializeDesktop() {
         if (capture) {
           if (capture.mode !== 'watch' || !(await capturePolicy.checkActive(capture.id)))
             throw new Error('Selected source is unavailable');
-          png = await clipFrames.request(capture, signal);
+          png = await (capture.native ? readRequestedDisplay(capture.display, signal) : clipFrames.request(capture, signal));
           source = selectedScreenSource(capture);
         } else {
           let ownedWindow;
@@ -2706,6 +2893,7 @@ async function initializeDesktop() {
     model: settings.model,
     modelCapabilities: settings.modelCapabilities,
     ...inferenceOptions,
+    fetchImpl: requestScreenVision,
     params: {
       ...settings.generation,
       ...auxiliaryRunnerParams,
@@ -2718,7 +2906,7 @@ async function initializeDesktop() {
     avatars: catalog.publicSprites(),
   });
   const attachmentDrafts = new AttachmentDrafts({
-    canSee: () => screenVisionAvailable,
+    canSee: canReadScreen,
     validImage: (png) => !nativeImage.createFromBuffer(png).isEmpty(),
   });
   attachmentViewer = new AttachmentViewer({
@@ -2743,7 +2931,7 @@ async function initializeDesktop() {
     }),
   });
   async function submitSnapshot(value) {
-    if (!screenVisionAvailable) throw new Error(SCREEN_VISION_REQUIRED);
+    if (!canReadScreen()) throw new Error(SCREEN_VISION_REQUIRED);
     const input = thinkingInput(value),
       preview = screenPreviews.get(value.previewId);
     if (!preview || Date.now() - preview.source.capturedAt > 60000)
@@ -2756,8 +2944,8 @@ async function initializeDesktop() {
     screenPreviews.delete(value.previewId);
     return submitVisualTurn(input, { png, source: preview.source });
   }
-  async function submitVisualTurn(input, { png, source, attachments }) {
-    if (rt.remote.enabled && (png || attachments?.some((file) => file.png)))
+  async function submitVisualTurn(input, { png, source, attachments, captureFrame, visionQuestion = input.text }) {
+    if (rt.remote.enabled && (png || captureFrame || attachments?.some((file) => file.png)))
       await inferenceApi.assertImageSupport();
     avatarClickReactions?.cancel();
     const kind = attachments ? 'attachment' : 'screen';
@@ -2773,7 +2961,12 @@ async function initializeDesktop() {
         text: input.text,
         status: 'complete',
         createdAt: new Date().toISOString(),
-        origin: { kind, ...source, imageRetained: retained.some((file) => file.preview) },
+        origin: {
+          ...source,
+          ...(source?.kind && { sourceKind: source.kind }),
+          kind,
+          imageRetained: retained.some((file) => file.preview),
+        },
         ...(retained.length ? { attachments: retained } : {}),
       },
       assistant = {
@@ -2794,6 +2987,7 @@ async function initializeDesktop() {
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]);
     const task = (async () => {
       try {
+        if (captureFrame) png = await captureFrame(signal);
         let webContext = '';
         if (input.internet === true) {
           const result = await chat.prepareWebSearch(input, {
@@ -2812,7 +3006,7 @@ async function initializeDesktop() {
         if (kind === 'screen') showObservationCue('screen');
         const result = await visual.generate({
           requestId: input.id,
-          text: input.text,
+          text: visionQuestion,
           png,
           source,
           attachments: attachments?.map(({ metadata, ...file }) => file),
@@ -2843,10 +3037,9 @@ async function initializeDesktop() {
             assistantText: result.text,
             source,
           },
-          { signal },
+          { signal: AbortSignal.any([signal, AbortSignal.timeout(1200)]) },
         );
-        if (attachments) await commit.catch(() => {});
-        else await commit;
+        await commit.catch(() => {});
         signal.throwIfAborted();
         assistant.text = result.text;
         assistant.status = 'complete';
@@ -3291,9 +3484,20 @@ async function initializeDesktop() {
     voiceStartController,
     lastVoiceFailure = null;
   const rendererDiagnostics = [];
+  let voiceIdleSince = null;
+  let nextVoiceMemoryCheck = 0;
+  const voiceIdleBlocked = () => Boolean(
+    shuttingDown || backendState.phase !== 'ready' || voiceStartPromise ||
+    voice.prepareController || voice.generating || playbackBusy || currentChatTask ||
+    chat.active || voicePreviewRequest || currentCallAudio.callOutputReady ||
+    speechInstaller.busy() || voiceTraining.busy() || voiceCatalog.busy() ||
+    externalTts.config.enabled || nativeVoice(voice.language),
+  );
   const mutedVoiceResidency = new MutedVoiceResidency({
     enabled: !verification,
-    needed: () => (voice.enabled && voice.language !== 'off') || Boolean(voicePreviewRequest),
+    needed: (idle) => idle
+      ? voiceIdleBlocked()
+      : (voice.enabled && voice.language !== 'off') || Boolean(voicePreviewRequest),
     resident: () => Boolean(voice.ready || voiceStartPromise || managedProcess('companion-voice')),
     cancel: () => {
       voiceStartController?.abort();
@@ -5788,6 +5992,15 @@ async function initializeDesktop() {
   let controlBorder = null;
   const nativeEscape = process.platform === 'win32' ? new NativeEscapeStop({ root }) : null;
   const computerControl = new ComputerControl({
+    backgroundOnly: true,
+    reviewBackgroundMutation: ({ goal, window: targetTitle, control, action, text, signal }) =>
+      confirmations.request({
+        title: 'Confirm background application change?',
+        detail: [goal, targetTitle, control, action === 'click' ? 'Activate the observed control.' : text].filter(Boolean).join('\n\n'),
+        confirmLabel: 'Allow this change',
+        danger: true,
+        signal,
+      }),
     allowed: () => fullComputerAccess.enabled && applicationAccess.enabled,
     visionAvailable: () => screenVisionAvailable,
     canStart: () =>
@@ -7265,6 +7478,7 @@ async function initializeDesktop() {
       if (
         await confirmations.request({
           title: 'Remove downloaded model?',
+          danger: true,
           detail: 'The selected Hugging Face package will be removed from this PC.',
           confirmLabel: 'Remove',
         })
@@ -7426,6 +7640,7 @@ async function initializeDesktop() {
       const status = await inferenceApi.status();
       return {
         ...status,
+        smartRouter: inferenceApi.smartRouterSettings(),
         localModel: localModelName,
         localResidency: await localResidency.sample({
           model: settings.model,
@@ -7552,6 +7767,27 @@ async function initializeDesktop() {
       throw new Error('Unknown AI connection action.');
     });
     handle('capri:inference-api-status', inferenceStatus);
+    handle('capri:smart-router-status', async (_, { role }) => {
+      if (role !== 'settings') throw new Error('Open Smart Router in Settings.');
+      const { profiles, activeId, setupRequired } = await inferenceApi.status();
+      return {
+        settings: inferenceApi.smartRouterSettings(),
+        profiles: profiles.filter((profile) => profile.canConnect),
+        local: !activeId && !setupRequired && !rt.remote.enabled,
+      };
+    });
+    handle('capri:smart-router-save', async (value, { role }) => {
+      if (role !== 'settings') throw new Error('Open Smart Router in Settings.');
+      assertModelIdle();
+      const next = inferenceApi.validateSmartRouter(value);
+      if (next.enabled && (rt.remote.enabled || rt.remote.setupRequired)) {
+        if (!(await selectInferenceMode('smart-router', next))) return inferenceApi.smartRouterSettings();
+        return next;
+      }
+      const savedRouter = inferenceApi.saveSmartRouter(next);
+      emit({ type: 'inference.mode', smartRouter: savedRouter.enabled });
+      return savedRouter;
+    });
     handle('capri:local-model-load-set', (value, { role }) => {
       if (role !== 'companion') throw new Error('Open the Local menu in Capri.');
       return localModelLoad.set(value);
@@ -7621,9 +7857,13 @@ async function initializeDesktop() {
       if (verification) throw new Error('API testing is disabled in desktop verification.');
       return inferenceApi.testProfile(id);
     });
-    handle('capri:inference-api-use', async (id) => {
+    async function selectInferenceMode(id, draft) {
       if (verification) throw new Error('API switching is disabled in desktop verification.');
       assertModelIdle();
+      const smart = id === 'smart-router';
+      const previousRouter = inferenceApi.smartRouterSettings();
+      const router = inferenceApi.validateSmartRouter({ ...(draft ?? previousRouter), enabled: smart });
+      if (smart) id = null;
       if (id === null && settings.modelSetupRequired) {
         await settingsHost.open('models');
         return false;
@@ -7632,8 +7872,12 @@ async function initializeDesktop() {
         id === inferenceApi.activeProfileId() &&
         (id !== null || (!rt.remote.enabled && !rt.nativeNpu)) &&
         !rt.remote.setupRequired
-      )
-        return false;
+      ) {
+        if (previousRouter.enabled === smart) return false;
+        inferenceApi.saveSmartRouter(router);
+        emit({ type: 'inference.mode', smartRouter: smart });
+        return true;
+      }
       const next = id !== null ? inferenceApi.profile(id).settings : null;
       if (
         !(await confirmations.request({
@@ -7642,7 +7886,9 @@ async function initializeDesktop() {
             ? isLocalApiEndpoint(new URL(next.baseUrl))
               ? 'Capri will send requests to the selected server on this PC and restart.'
               : 'Your conversation, personality, relevant memory and tool results will be sent to this provider. Images are sent only with enabled vision and screen features. Provider charges may apply. Capri will restart.'
-            : 'Capri will restart using your downloaded local language model.',
+            : smart
+              ? 'Capri will restart in Smart Router mode with local inference and your selected API connection.'
+              : 'Capri will restart using your downloaded local language model.',
           confirmLabel: 'Apply and restart',
         }))
       )
@@ -7660,22 +7906,31 @@ async function initializeDesktop() {
           });
         selectionTouched = true;
         await inferenceApi.selectProfile(id);
+        inferenceApi.saveSmartRouter(router);
         queueDesktopRelaunch();
       } catch (error) {
         restoreNpuDevice?.();
-        if (selectionTouched) writeJsonAtomic(inferenceApi.settingsFile, previousApi);
+        if (selectionTouched) {
+          writeJsonAtomic(inferenceApi.settingsFile, previousApi);
+          inferenceApi.saveSmartRouter(previousRouter);
+        }
         shuttingDown = false;
         setBackend('offline', 'Reconnect to try again.');
         throw error;
       }
       app.quit();
       return true;
-    });
+    }
+    handle('capri:inference-api-use', (id) => selectInferenceMode(id));
     handle('capri:inference-api-remove', async (id) => {
+      const router = inferenceApi.smartRouterSettings();
+      if (router.enabled && router.profileId === id)
+        throw new Error('Change the Smart Router connection before removing this profile.');
       inferenceApi.profile(id);
       if (
         await confirmations.request({
           title: 'Remove API connection?',
+          danger: true,
           detail: 'Its saved API key will be removed from this PC.',
           confirmLabel: 'Remove',
         })
@@ -7927,15 +8182,14 @@ async function initializeDesktop() {
       if (value.action === 'open-tool')
         return shell.openPath(await userTools.toolDirectory(value.id));
       if (value.action === 'remove') {
-        const t = (text) => uiText(text, languages.value.interface);
-        const { response } = await dialog.showMessageBox(settingsHost.window, {
-          type: 'warning',
-          message: t('Move this tool to the Recycle Bin?'),
-          buttons: [t('Cancel'), t('Delete')],
-          defaultId: 0,
-          cancelId: 0,
+        const toolFolder = await userTools.toolDirectory(value.id);
+        const confirmed = await confirmations.request({
+          title: 'Move this tool to the Recycle Bin?',
+          detail: toolFolder,
+          confirmLabel: 'Move to Recycle Bin',
+          danger: true,
         });
-        return response === 1
+        return confirmed
           ? userTools.remove(value.id, (folder) => shell.trashItem(folder))
           : userTools.list();
       }
@@ -7994,8 +8248,14 @@ async function initializeDesktop() {
         return callSkill(ACTION_SKILLS.workflows, value.action, undefined, { source: role });
       if (value.action === 'save')
         return callSkill(ACTION_SKILLS.workflows, 'save', value.workflow, { source: role });
-      if (value.action === 'remove')
+      if (value.action === 'remove') {
+        if (!(await confirmations.request({
+          title: 'Delete this workflow?',
+          detail: String(value.id),
+          danger: true,
+        }))) return { ok: false, cancelled: true };
         return callSkill(ACTION_SKILLS.workflows, 'remove', value.id, { source: role });
+      }
       if (value.action === 'run') {
         if (chat.active) throw new Error('Wait for the current reply to finish.');
         return callSkill(
@@ -8324,7 +8584,7 @@ async function initializeDesktop() {
       const resumeMicrophone =
         role === 'companion' && !verification && consumeMicrophoneRestart(state);
       return {
-        attachmentVision: screenVisionAvailable,
+        attachmentVision: canReadScreen(),
         skills: skillSettings.snapshot(),
         thinking: { enabled: callSkill('capri.reasoning', 'mode') },
         coding: { enabled: callSkill('capri.coding', 'enabled') },
@@ -8332,6 +8592,7 @@ async function initializeDesktop() {
         time: companionActions.time.snapshot(),
         inference: {
           remote: rt.remote.enabled,
+          smartRouter: Boolean(currentSmartRouter()),
           vision: rt.remote.vision,
           setupRequired: rt.remote.setupRequired,
           model: rt.nativeNpu
@@ -8811,7 +9072,7 @@ async function initializeDesktop() {
     registerScreenIpc(handle, {
       root,
       requireEnabled: () => skillSettings.require('capri.screen'),
-      screenVisionAvailable,
+      canReadScreen,
       capturePolicy,
       screenObservation,
       screenPreviews,
@@ -10043,6 +10304,17 @@ async function initializeDesktop() {
           });
         });
         controlTimer = setInterval(() => {
+          void sampleNativeWatch();
+          if (!verification && voice.enabled && voice.ready && !voiceIdleBlocked()) {
+            const now = performance.now();
+            voiceIdleSince ??= now;
+            if (now - voiceIdleSince >= 300000 && now >= nextVoiceMemoryCheck) {
+              nextVoiceMemoryCheck = now + 30000;
+              if (freemem() < 2.5 * 1024 ** 3 && managedProcess('companion-voice'))
+                void mutedVoiceResidency.release({ idle: true }).catch((error) =>
+                  console.warn('Idle voice release failed:', error.message));
+            }
+          } else voiceIdleSince = null;
           localModelLoad.synchronize(
             !verification &&
               !shuttingDown &&

@@ -10,6 +10,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.capri.mobile.CapriService
 import com.capri.mobile.LmStudio
+import com.capri.mobile.tr
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -158,11 +159,10 @@ object RemoteState {
                     else -> ""
                 }
                 val localUrl = if (scannedTailscale) "" else cleanUrl
-                var finalToken = token.trim()
-                runCatching {
-                    val pairRes = tmpClient.pair("${Build.MANUFACTURER} ${Build.MODEL}".trim())
-                    val issued = pairRes.optString("token", "")
-                    if (issued.isNotBlank()) finalToken = issued
+                val pairRes = tmpClient.pair("${Build.MANUFACTURER} ${Build.MODEL}".trim())
+                val finalToken = pairRes.optString("token")
+                check(pairRes.optString("status") == "approved" && finalToken.isNotBlank()) {
+                    "PC pairing was not approved"
                 }
                 val id = "pc_${(localUrl.ifBlank { tsUrl }).hashCode().toUInt().toString(16)}"
                 val profile = PcProfile(
@@ -245,8 +245,24 @@ object RemoteState {
             for ((isTs, url) in candidates) {
                 try {
                     val probe = RemoteClient(url, token, prefs.deviceId)
-                    stJson = probe.status()
-                    chosenClient = probe
+                    val status = probe.status()
+                    val authorizedClient = try {
+                        probe.workspaces()
+                        probe
+                    } catch (error: RemoteHttpException) {
+                        if (error.code != 401) throw error
+                        val approval = probe.pair("${Build.MANUFACTURER} ${Build.MODEL}".trim())
+                        val approvedToken = approval.optString("token")
+                        check(approval.optString("status") == "approved" && approvedToken.isNotBlank()) {
+                            "Approve this phone on the PC to view its screen."
+                        }
+                        RemoteClient(url, approvedToken, prefs.deviceId).also {
+                            it.workspaces()
+                            prefs.saveProfile(profile, approvedToken)
+                        }
+                    }
+                    stJson = status
+                    chosenClient = authorizedClient
                     chosenIsTailscale = isTs
                     break
                 } catch (e: Exception) {
@@ -322,14 +338,10 @@ object RemoteState {
                     permissionMode = RemotePermissionMode.entries.firstOrNull { it.wire == perm }
                         ?: RemotePermissionMode.WORKSPACE
                     agents = ag
-                    val installed = ag.filter { it.installed }
-                    if (selectedAgentIds.isEmpty() && installed.isNotEmpty()) {
-                        val pref = installed.firstOrNull { it.id == "codex" } ?: installed.first()
-                        selectedAgentIds = setOf(pref.id)
-                    }
+                    selectedAgentIds = selectedAgentIds.intersect(ag.filter { it.installed }.map { it.id }.toSet())
                     if (coordinatorId.isBlank()) coordinatorId = selectedAgentIds.firstOrNull().orEmpty()
                     models = mods
-                    routerModels = rMods.ifEmpty { mods }
+                    routerModels = rMods
                     if (selectedModel.isBlank() && mods.isNotEmpty()) selectedModel = mods.first()
                     skills = sk
                     workspaces = wss
@@ -424,8 +436,12 @@ object RemoteState {
             try {
                 val ws = c.selectWorkspace(path)
                 val wss = runCatching { c.workspaces() }.getOrDefault(workspaces)
-                val sess = runCatching { c.sessions() }.getOrDefault(sessions)
+                val sess = runCatching { c.sessions() }.getOrDefault(emptyList())
                 post {
+                    if (activeWorkspace != ws.path) {
+                        activeSession = null
+                        messages = emptyList()
+                    }
                     activeWorkspace = ws.path
                     workspaces = wss
                     sessions = sess
@@ -446,9 +462,11 @@ object RemoteState {
         val app = ctx.applicationContext
         val c = client(app) ?: run { onError("PC not paired"); return }
         val prefs = RemotePrefs(app)
-        val useAgents = if (executionMode == RemoteExecutionMode.SINGLE) selectedAgentIds.take(1) else selectedAgentIds.toList()
-        if (useAgents.isEmpty()) {
-            onError("Select at least one PC agent first")
+        val mode = executionMode
+        val useAgents = if (mode == RemoteExecutionMode.SINGLE) selectedAgentIds.take(1) else selectedAgentIds.toList()
+        val minimumAgents = if (mode == RemoteExecutionMode.SINGLE) 1 else 2
+        if (useAgents.size < minimumAgents) {
+            onError(tr(if (minimumAgents == 1) "Select one PC agent" else "Select at least two PC agents"))
             return
         }
         val reasoningFocus = prefs.zeroAvatarReasoning &&
@@ -465,25 +483,31 @@ object RemoteState {
 
         io.execute {
             try {
-                val sid = activeSession?.id ?: c.createSession(
+                val workspace = activeWorkspace
+                val previous = activeSession
+                fun newSession() = c.createSession(
                     activeWorkspace.substringAfterLast('\\').ifBlank { "Workspace" },
                     selectedModel.ifBlank { "PC Agent" },
                 ).also { created ->
+                    check(workspace.isBlank() || created.workspace.equals(workspace, ignoreCase = true)) {
+                        "Workspace PC berubah. Sambungkan ulang."
+                    }
                     post { activeSession = created }
                 }.id
+                var sid = previous?.id ?: newSession()
 
                 val optimisticUser = RemoteMessage("local_${System.currentTimeMillis()}", "user", text)
                 post { messages = messages + optimisticUser }
 
                 val buf = StringBuilder()
                 val announced = HashSet<String>()
-                c.streamPrompt(
+                fun send() = c.streamPrompt(
                     sessionId = sid,
                     text = text,
                     attachments = draftAtts,
                     model = selectedModel,
                     agents = useAgents,
-                    mode = executionMode,
+                    mode = mode,
                     concurrency = concurrency,
                     coordinator = coordinatorId.ifBlank { useAgents.first() },
                     permission = permissionMode,
@@ -531,8 +555,18 @@ object RemoteState {
                             post { streamingText = snap }
                         }
                         RemoteStreamEvent.Stopped -> Unit
-                        is RemoteStreamEvent.Completed -> Unit
+                        is RemoteStreamEvent.Completed -> {
+                            if (!ev.ok && ev.error.isNotBlank()) post { onError(tr(ev.error)) }
+                        }
                     }
+                }
+                try {
+                    send()
+                } catch (e: RemoteHttpException) {
+                    if (previous == null || e.code != 404 || e.message != "session not found") throw e
+                    sid = newSession()
+                    post { messages = listOf(optimisticUser) }
+                    send()
                 }
                 val refreshed = runCatching { c.loadSession(sid) }.getOrNull()
                 val refreshedTasks = runCatching { c.tasks() }.getOrDefault(tasks)
@@ -624,6 +658,18 @@ object RemoteState {
             } catch (e: Exception) {
                 if (!stop && prefs.zeroAvatarReasoning) CapriService.setReasoningFocus(app, false)
                 post { onDone(e.message ?: "Debate error") }
+            }
+        }
+    }
+
+    fun refreshAgents(ctx: Context) {
+        val c = client(ctx) ?: return
+        io.execute {
+            runCatching { c.agents() }.onSuccess { found ->
+                post {
+                    agents = found
+                    selectedAgentIds = selectedAgentIds.intersect(found.filter { it.installed }.map { it.id }.toSet())
+                }
             }
         }
     }
@@ -720,10 +766,10 @@ object RemoteState {
                 fetchingModels = false
                 if (merged.isNotEmpty()) {
                     models = merged
-                    routerModels = rMods.ifEmpty { merged }
                     if (selectedModel.isBlank()) selectedModel = merged.first()
                 }
-                onDone(merged.size)
+                routerModels = rMods
+                onDone(rMods.size)
             }
         }
     }

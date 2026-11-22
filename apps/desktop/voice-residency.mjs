@@ -17,8 +17,8 @@ export class MutedVoiceResidency {
       lastError: this.lastError,
     };
   }
-  release() {
-    if (!this.enabled || this.needed()) return Promise.resolve(false);
+  release({ idle = false } = {}) {
+    if (!this.enabled || this.needed(idle)) return Promise.resolve(false);
     if (this.pending) return this.pending;
     if (!this.resident()) return Promise.resolve(false);
     this.cancel();
@@ -28,7 +28,7 @@ export class MutedVoiceResidency {
         // Startup cancellation may reject; a newly enabled/previewed voice still
         // wins before termination begins. New starts await pending termination.
         await starting?.catch(() => {});
-        if (this.needed()) return false;
+        if (this.needed(idle)) return false;
         await this.stop();
         this.lastError = null;
         this.releases++;

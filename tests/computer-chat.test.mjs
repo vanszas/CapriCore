@@ -304,6 +304,52 @@ function fixture(overrides = {}) {
   };
 }
 
+test('Search mode routes owner actions across desktop applications through the shared classifier', async () => {
+  const goals = [
+    'Klik tombol Export di Blender',
+    'Ketik judul laporan di LibreOffice',
+    'https://discord.gg/example join there',
+  ];
+  const classified = [];
+  const f = fixture({
+    chatProvider: 'hermes',
+    computerIntent: async (text, options) => {
+      assert.equal(options.internetSearch, true);
+      classified.push(text);
+      return { intent: 'task', usesPrevious: false };
+    },
+  });
+  const enabling = f.send('Enable full computer access.');
+  f.accept();
+  await enabling;
+  for (const text of goals) await f.send(text, { internet: true });
+  assert.deepEqual(classified, goals);
+  assert.deepEqual(f.goals, goals);
+  assert.equal(f.dialogs.filter((event) => event.type === 'confirmation.request').length, 1);
+});
+
+test('an ambiguous Discord speech request asks for the channel and mode even with Search on', async () => {
+  const f = fixture();
+  await f.send('ok, can u talk inside my discord chanel?. and say hai guys ti them', { internet: true });
+  assert.match(f.events.at(-1).assistant.text, /text message or speech.*server and channel/);
+  assert.deepEqual(f.goals, []);
+});
+
+test('a vague computer test question gets the host status even with Search enabled', async () => {
+  const f = fixture();
+  const goal = 'Hello Cabry, can you control my computer right now, I want to test.';
+  await f.send(goal, { internet: true });
+  assert.match(f.events.at(-1).assistant.text, /Full computer access is off.*Open Notepad/);
+  const enabling = f.send('Enable full computer access.');
+  f.accept();
+  await enabling;
+  await f.send(goal, { internet: true });
+  assert.match(f.events.at(-1).assistant.text, /Full computer access is enabled.*Open Notepad/);
+  await f.send('Can you control my PC?');
+  assert.match(f.events.at(-1).assistant.text, /Full computer access is enabled/);
+  assert.deepEqual(f.goals, []);
+});
+
 test('a status question reports live computer access without a model, action, or confirmation', async () => {
   for (const [language, question, on, off] of [
     [
@@ -387,14 +433,13 @@ test('access complaints use ordinary conversation without desktop classification
       'Why do you keep saying full computer access is off?',
       'I never asked you to enable full computer access.',
       'What does full computer access do?',
-      'Can you control my PC?',
       'Почему ты повторяешь, что полный доступ к компьютеру выключен?',
     ]) {
       await f.send(text);
       assert.equal(f.events.at(-1).type, 'turn.completed');
       assert.equal(f.events.at(-1).assistant.text, 'We can talk normally.');
     }
-    assert.equal(replies, 5);
+    assert.equal(replies, 4);
     assert.deepEqual(f.goals, []);
     assert.deepEqual(f.dialogs, []);
     assert.equal(f.discoveries, 0);
@@ -1088,6 +1133,40 @@ test('direct Discord navigation, voice and message requests use only an existing
     assert.equal(mentionsDiscord(text), true, text);
   for (const text of ['discordant music', 'Привет, Капри', 'discussion'])
     assert.equal(mentionsDiscord(text), false, text);
+});
+
+test('a Discord action after a capability question reaches host control with its original text', async () => {
+  const goal = 'do u can controll my computer?. can u open my discord and say indra baka?';
+  assert.equal(computerModeRequest(goal), null);
+  assert.equal(computerModeRequest('Can you control my computer? Can you explain how to open Discord and send something?', { fullComputerAccess: true }), null);
+  assert.equal(computerModeRequest('Do not open my Discord and send anything.', { fullComputerAccess: true }), null);
+  const f = fixture({ chatProvider: 'hermes' });
+  const enabling = f.send('Enable full computer access.');
+  f.accept();
+  await enabling;
+  await f.send(goal);
+  assert.deepEqual(f.goals, [goal]);
+});
+
+test('a retry recovers a prior tool-unavailable Discord request without replaying a host receipt', async () => {
+  const goal = 'do u can controll my computer?. can u open my discord and say indra baka?';
+  const retry = 'can u do it again?, try again. i already give u access';
+  const f = fixture({ chatProvider: 'hermes' });
+  const enabling = f.send('Enable full computer access.');
+  f.accept();
+  await enabling;
+  f.records.set('owner', { role: 'user', text: goal, turnId: 'old', createdAt: new Date(Date.now() - 21 * 60_000).toISOString() });
+  f.records.set('answer', { role: 'assistant', text: 'Cannot control computer from this chat.', status: 'complete', turnId: 'old' });
+  const owner = f.records.get('owner');
+  const recent = owner.createdAt;
+  owner.createdAt = new Date(Date.now() - 31 * 60_000).toISOString();
+  assert.deepEqual(f.chat.unroutedComputerRetry(), {});
+  owner.createdAt = recent;
+  f.records.set('retry', { role: 'user', text: retry, turnId: 'prior-retry', createdAt: new Date(Date.now() - 7 * 60_000).toISOString() });
+  f.records.set('retry-answer', { role: 'assistant', text: 'Still can’t: this chat has no computer-control tool.', status: 'complete', turnId: 'prior-retry' });
+  await f.send('can u try again?', { internet: true });
+  assert.deepEqual(f.goals, [goal]);
+  assert.equal(f.chat.unroutedComputerRetry(), undefined);
 });
 
 test('Discord semantic intent can recover a CPU social route across languages without classifying ordinary greetings', async () => {

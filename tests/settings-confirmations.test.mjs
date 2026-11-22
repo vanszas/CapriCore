@@ -5,6 +5,30 @@ import { settingsApi } from '../apps/desktop/renderer/settings-api.mjs';
 import { ConfirmationRequests } from '../apps/desktop/renderer/confirmation-requests.mjs';
 import { Confirmations } from '../apps/desktop/main/confirmations.mjs';
 
+test('a danger request requires three separate approvals and cancels on a refusal', async () => {
+  const ids = [];
+  const broker = new Confirmations({
+    show() {},
+    emit: ({ type, id }) => { if (type === 'confirmation.request') ids.push(id); },
+  });
+  const approve = () => broker.respond({ id: ids.at(-1), choice: 'confirm' });
+  const action = broker.request({ title: 'Delete file?', danger: true });
+  assert.equal(approve(), true);
+  await Promise.resolve();
+  assert.equal(broker.respond({ id: ids[0], choice: 'confirm' }), false);
+  assert.equal(approve(), true);
+  await Promise.resolve();
+  assert.equal(new Set(ids).size, 3);
+  assert.equal(approve(), true);
+  assert.equal(await action, true);
+
+  const rejected = broker.request({ title: 'Delete file?', danger: true });
+  assert.equal(approve(), true);
+  await Promise.resolve();
+  broker.cancel();
+  assert.equal(await rejected, false);
+});
+
 test('restart is an explicit current choice and cannot approve an unrelated confirmation', async () => {
   const events = [];
   const broker = new Confirmations({ show() {}, emit: (value) => events.push(value) });

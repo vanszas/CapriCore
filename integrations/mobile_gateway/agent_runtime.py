@@ -146,6 +146,12 @@ def normalize_codex_event(line: str, agent_id: str) -> list[dict]:
     event_type = str(event.get("type") or "")
     item = event.get("item")
     if not isinstance(item, dict):
+        thread_id = event.get("thread_id")
+        if event_type == "thread.started" and isinstance(thread_id, str):
+            try:
+                return [{"type": "native_session", "id": str(uuid.UUID(thread_id))}]
+            except ValueError:
+                return []
         if event_type in {"turn.failed", "error"}:
             return [{
                 "type": "agent_failed",
@@ -217,6 +223,7 @@ class SessionStore:
             }
             for session in self.sessions.values():
                 session.setdefault("activities", [])
+                session.setdefault("nativeSessions", {})
                 if session.get("activeModelName") in {"Hermes PC", "Hermes Agent"}:
                     session["activeModelName"] = "PC Agent"
         except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
@@ -339,6 +346,11 @@ class SessionStore:
             if recovered:
                 self._save()
         return recovered
+
+    def remember_native_session(self, session_id: str, agent_id: str, native_id: str):
+        with self.lock:
+            self.sessions[session_id].setdefault("nativeSessions", {})[agent_id] = native_id
+            self._save()
 
     def append_message(self, session_id: str, role: str, content: str) -> dict:
         with self.lock:
@@ -719,8 +731,13 @@ class AgentRuntime:
             process_group = hidden_process_kwargs(process_group=True) if os.name == "nt" else {
                 "start_new_session": True
             }
+            native_id = self.store.get(session_id).get("nativeSessions", {}).get(agent_id)
+            command = self.command_factory(
+                agent_id, text, model, attachments, permission,
+                **({"native_session": native_id} if native_id else {}),
+            )
             process = subprocess.Popen(
-                self.command_factory(agent_id, text, model, attachments, permission),
+                command,
                 cwd=self.workspace,
                 stdin=subprocess.DEVNULL,
                 text=True,
@@ -769,6 +786,9 @@ class AgentRuntime:
                         "phase": infer_activity_phase(detail),
                     }]
                 for event in normalized:
+                    if event["type"] == "native_session":
+                        self.store.remember_native_session(session_id, agent_id, event["id"])
+                        continue
                     if event["type"] == "delta":
                         output.append(event["text"])
                         self._update_agent_state(
@@ -952,6 +972,13 @@ class AgentRuntime:
                 "completedAt": None,
             })
         with self.lock:
+            if session_id in self.session_runs:
+                events.put({
+                    "type": "completed", "ok": False, "run_id": run_id,
+                    "error": "This agent session already has a running task.",
+                })
+                events.put({"type": "runtime_done", "run_id": run_id})
+                return
             self.session_runs[session_id] = run_id
             self.tasks[run_id] = {
                 "id": run_id,

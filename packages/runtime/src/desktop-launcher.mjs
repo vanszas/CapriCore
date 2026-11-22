@@ -2,7 +2,7 @@ import { existsSync, writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { root, paths } from './host/paths.mjs';
 import { initialize } from './context.mjs';
-import { launch, managedProcess } from './host/processes.mjs';
+import { launch, managedProcess, stopProcess } from './host/processes.mjs';
 import { ensureDesktopIdentity } from './host/desktop-identity.mjs';
 import { runtime } from './context.mjs';
 import { electronBundleReady } from './host/electron-bundle.mjs';
@@ -45,6 +45,8 @@ export async function startDesktop({ wait = false } = {}) {
   const previous = process.env.ELECTRON_RUN_AS_NODE;
   delete process.env.ELECTRON_RUN_AS_NODE;
   try {
+    const services = ['companion-voice', rt.logPrefix, 'llama', 'ollama', 'llama-chat', 'llama-embedding'];
+    const runningBefore = new Set(wait ? services.filter((name) => managedProcess(name)) : []);
     let ended;
     const exit = new Promise((resolve) => {
       ended = resolve;
@@ -56,7 +58,17 @@ export async function startDesktop({ wait = false } = {}) {
       rt,
       wait ? { onExit: ended } : {},
     );
-    if (wait) await exit;
+    if (wait) {
+      const code = await exit;
+      if (code !== 0 && !managedProcess('desktop')) {
+        const owned = services.filter((name) => !runningBefore.has(name))
+          .map((name) => [name, managedProcess(name)])
+          .filter(([, marker]) => marker);
+        const stop = (group) => Promise.allSettled(group.map(([name, expected]) => stopProcess(name, { expected })));
+        await stop(owned.filter(([name]) => name === 'companion-voice' || name === rt.logPrefix));
+        await stop(owned.filter(([name]) => name !== 'companion-voice' && name !== rt.logPrefix));
+      }
+    }
     return marker;
   } finally {
     if (previous !== undefined) process.env.ELECTRON_RUN_AS_NODE = previous;

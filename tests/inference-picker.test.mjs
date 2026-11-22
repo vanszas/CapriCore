@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import test from 'node:test';
 import assert from 'node:assert/strict';
+
+test('Smart Router and single inference never appear active together', () => {
+  const profiles = [{ id: 'api', model: 'vision', canConnect: true }];
+  const smartRouter = { enabled: true, profileId: 'api', model: 'override' };
+  for (const [activeId, expected] of [[null, 'smart-router'], ['api', 'api']]) {
+    const choices = inferenceChoices({ profiles, smartRouter, activeId });
+    assert.deepEqual(choices.filter(({ active }) => active).map(({ id }) => id), [expected]);
+  }
+});
 import {
   inferenceChoices,
   InferencePicker,

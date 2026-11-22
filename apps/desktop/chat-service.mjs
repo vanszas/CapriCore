@@ -1,4 +1,4 @@
-import { conversationInstruction } from './language-context.mjs';
+import { chatReplyLanguage, conversationInstruction } from './language-context.mjs';
 import { freemem } from 'node:os';
 import { startHermesDebate } from '../../packages/runtime/src/client.mjs';
 import { validateChatProvider } from '../../packages/runtime/src/providers/chat-router.mjs';
@@ -10,24 +10,30 @@ import {
 import { standaloneCalculation, toolDomain } from './task-route.mjs';
 import {
   computerAccessStatusQuestion,
+  computerCapabilityQuestion,
   computerModelCandidate,
+  computerIntentCandidate,
   computerModeRequest,
   computerTaskCommand,
   computerTaskFollowUp,
+  computerTaskRetry,
   dedicatedMusicContext,
   dedicatedMusicRequest,
   namedSpotifyPlay,
   ownerAppLaunchFollowUp,
+  rejectsDesktopAction,
   spotifyPlaybackCandidate,
   mentionsDiscord,
+  discordSpeechNeedsDestination,
   windowsMediaPlayerTask,
 } from './computer-mode-request.mjs';
 import { callTaskNeedsOwner, callTaskRequest } from './call-computer-task.mjs';
+import { DISCORD_VOICE_MESSAGE_UNAVAILABLE, discordTaskRequest, discordVoiceMessageReply } from './discord-application.mjs';
 import { COMPUTER_SESSION_TIMEOUT_MS } from './computer-control.mjs';
 import { youtubeHomeDestination } from './browser-search-state.mjs';
 import { cyberpunkSteamLaunch } from './steam-game-launch.mjs';
 import { edgerunnersTeaserRequest } from './edgerunners-teaser.mjs';
-import { factualActionReply, ActionReplyFilter, youtubeMusicReply } from './action-replies.mjs';
+import { factualActionReply, ActionReplyFilter, unsupportedDesktopClaim, youtubeMusicReply } from './action-replies.mjs';
 import { youtubeMusicRequest } from './youtube-music-request.mjs';
 import { CoreFailureStream, ToolProgressGuard, toolLoopError } from './tool-loop.mjs';
 import { desktopTurnContext, whenPromptSkill } from './turn-context.mjs';
@@ -62,6 +68,9 @@ const audioChannelInstruction =
 export const interfaceInstruction = (state) =>
   [
     `CURRENT DESKTOP INTERFACE:`,
+    ...(state.callAudio ? [
+      `Voice calls outputReady=${state.callAudio.outputReady === true}; shareReplies=${state.callAudio.shareReplies === true}. Microphone capture, call output, and the Discord channel are separate. Report Discord connection or delivery only from a verified result. Do not infer a missing Discord connection from this state or append a web disclaimer to local audio status.`,
+    ] : []),
     ...whenPromptSkill(
       state,
       `capri.computer`,
@@ -246,6 +255,51 @@ export async function* sseData(body) {
     throw new Error('Gateway stream ended in the middle of an event');
 }
 
+export async function smartRouterDialogue(remote, local, { fallback, refusalText }) {
+  const response = await remote();
+  if (response.status === 422) {
+    const packet = await response.json();
+    if (packet.error?.code === 'model_refusal') {
+      if (fallback && local) return local();
+      return new Response('data: ' + JSON.stringify({ choices: [{ delta: { content: refusalText } }] }) +
+        '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+    }
+    return Response.json(packet, { status: response.status });
+  }
+  if (!response.ok || !response.body ||
+      !response.headers.get('content-type')?.includes('text/event-stream')) return response;
+  async function* relay() {
+    const encoder = new TextEncoder();
+    const frame = (data) => encoder.encode('data: ' + data + '\n\n');
+    let visible = false;
+    let retry = false;
+    for await (const data of sseData(response.body)) {
+      if (data !== '[DONE]') {
+        const packet = JSON.parse(data);
+        const choice = packet.choices?.[0];
+        const refusal = choice?.delta?.refusal ?? choice?.message?.refusal;
+        if (refusal || choice?.finish_reason === 'content_filter' || packet.error?.code === 'content_filter' ||
+            packet.error?.code === 'content_policy_violation' || packet.error?.code === 'model_refusal') {
+          if (!visible && fallback && local) {
+            retry = true;
+            break;
+          }
+          yield frame(JSON.stringify({ choices: [{ delta: { content: (visible ? '\n\n' : '') + (refusal || refusalText) } }] }));
+          yield frame('[DONE]');
+          return;
+        }
+        visible ||= Boolean(choice?.delta?.content || choice?.delta?.tool_calls?.length);
+      }
+      yield frame(data);
+    }
+    if (!retry) return;
+    const responseLocal = await local();
+    if (!responseLocal.ok || !responseLocal.body) throw new Error('Local model fallback failed.');
+    for await (const data of sseData(responseLocal.body)) yield frame(data);
+  }
+  return new Response(ReadableStream.from(relay()), { headers: { 'content-type': 'text/event-stream' } });
+}
+
 const responseFailureCodes = new Set([
   'CONTEXT_COMPACTION_FAILED',
   'CAPRI_MODEL_NOT_READY',
@@ -382,6 +436,7 @@ export class ChatService {
     computerIntent = null,
     npuDialogue = null,
     directLocalDialogue = null,
+    smartRouter = null,
     commitNpuDialogue = null,
     localCalculation = null,
     localMusic = null,
@@ -440,6 +495,7 @@ export class ChatService {
       computerIntent,
       npuDialogue,
       directLocalDialogue,
+      smartRouter,
       commitNpuDialogue,
       localCalculation,
       localMusic,
@@ -565,8 +621,8 @@ export class ChatService {
     }
   }
 
-  send(value, emit) {
-    return withResponseTiming(value?.id, () => this.sendTurn(value, emit));
+  send(value, emit, intent) {
+    return withResponseTiming(value?.id, () => this.sendTurn(value, emit, intent));
   }
 
   async prepareWebSearch(
@@ -602,7 +658,7 @@ export class ChatService {
     }
   }
 
-  async sendTurn(value, emit) {
+  async sendTurn(value, emit, intent) {
     const input = validateInput(value);
     const fableMode = /^\/fable-mind(?:\s|$)/iu.test(input.text);
     const debateMode = /^\/debate(?:\s|$)/iu.test(input.text);
@@ -641,6 +697,7 @@ export class ChatService {
     const startedAt = Date.now();
     let gatewayStartedAt;
     const state = this.interfaceState();
+    const replyLanguage = chatReplyLanguage(input.text, state.languages?.conversation);
     const mediaPlayerTask = !input.mode && windowsMediaPlayerTask(input.text);
     const musicRequest =
       !input.mode &&
@@ -651,12 +708,16 @@ export class ChatService {
     const smallTalk = !fableMode && !input.mode && input.internet !== true && conversationOnly(input.text);
     const codeReview = !fableMode && !input.mode && input.internet !== true && suppliedCodeReview(input.text);
     const thinking = input.thinking === true && !input.mode;
+    const smartDialogue = !input.mode && !this.externalInference && (
+      thinking || fableMode || codeReview ||
+      /\x60\x60\x60|\b(?:coding|debug|refactor|codebase|stack trace|unit tests?|algorithms?|debugging|source code|kode|skrip|pemrograman|código|programación|programmieren)\b|代码|编程|デバッグ|プログラム|программир|отладк|код\b|برمجة|코딩/iu.test(input.text)
+    ) ? this.smartRouter?.() : null;
     const directSmallTalk = smallTalk && !thinking ? this.directLocalDialogue : null;
     const planningWithThinking = input.thinking === true && input.mode !== 'coding';
     const turnTimeoutMs =
       input.mode === 'coding'
         ? Math.max(this.timeoutMs, 600000)
-        : thinking
+        : thinking || smartDialogue
           ? Math.max(this.timeoutMs, this.thinkingTimeoutMs)
           : this.timeoutMs;
     const localMemory = !input.mode && this.ownerMemory;
@@ -673,8 +734,14 @@ export class ChatService {
       recentOwner && Date.now() - Date.parse(recentOwner.createdAt) <= 10 * 60_000
         ? recentOwner.text.slice(0, 800)
         : undefined;
+    const retry = !input.mode && computerTaskRetry(input.text)
+      ? this.unroutedComputerRetry()
+      : undefined;
+    const retryGoal = state.fullComputerAccess && state.computerSkillEnabled !== false
+      ? retry?.goal
+      : undefined;
     let phase = 'context';
-    let initialTextTimeoutMs = thinking
+    let initialTextTimeoutMs = thinking || smartDialogue
       ? Math.min(turnTimeoutMs, Math.max(this.firstTextTimeoutMs, this.thinkingFirstTextTimeoutMs))
       : this.firstTextTimeoutMs;
     this.active = {
@@ -708,7 +775,32 @@ export class ChatService {
     let checkpoint = Date.now();
     let received = 0;
     let leading = true;
-    const replyFilter = new ActionReplyFilter();
+    const asksWhy = (text) =>
+      /^(?:(?:kenapa|mengapa|kok|why|почему)[?!.\s]*$|(?:kenapa|mengapa|kok|why)\b.{0,100}\b(?:support|didukung|bisa|supported|work|voice|suara)\b)/iu.test(text.trim());
+    const explainedRequest = asksWhy(input.text) && this.store.snapshot().findLast(
+      (entry) => entry.role === 'user' && entry.turnId !== input.id && !asksWhy(entry.text),
+    );
+    const discordVoiceFollowUp = explainedRequest &&
+      discordTaskRequest(explainedRequest.text)?.code === DISCORD_VOICE_MESSAGE_UNAVAILABLE;
+    const mentionsCallAudio = (text) =>
+      /\b(?:mic(?:rophone)?|mikrofon|voice calls|voice channel|virtual audio cable|bicara|speak|your voice|ur voice)\b/iu.test(text);
+    const callAudioFollowUp = !input.mode && input.internet !== true &&
+      (mentionsCallAudio(input.text) || /^(?:udah|sudah|i (?:already )?(?:gave|granted)).{0,60}\b(?:akses|access|permission)\b/iu.test(input.text.trim())) &&
+      (mentionsDiscord(input.text) || this.store.snapshot()
+        .filter((entry) => entry.role === 'user' && entry.turnId !== input.id)
+        .slice(-6)
+        .some((entry) => Date.now() - Date.parse(entry.createdAt) <= 10 * 60_000 &&
+          mentionsDiscord(entry.text) && mentionsCallAudio(entry.text)));
+    const discordContext = mentionsDiscord(input.text) || Boolean(callAudioFollowUp || discordVoiceFollowUp || (previous && mentionsDiscord(previous)));
+    const desktopContext = discordContext || computerIntentCandidate(input.text);
+    const replyFilter = new ActionReplyFilter(desktopContext ? (sentence) => {
+      const current = this.interfaceState();
+      return unsupportedDesktopClaim(sentence, {
+        desktopReady: Boolean(this.computerTask && current.fullComputerAccess && current.computerSkillEnabled !== false),
+        discordContext,
+        internetRequested: input.internet === true,
+      });
+    } : undefined);
     const parser = new AvatarStreamParser(this.avatarSprites);
     const cleanText = new PlainTextStream();
     const visibleAnswer = new VisibleAnswerStream();
@@ -856,7 +948,7 @@ export class ChatService {
     const ownerCall = callTaskRequest(input.text);
     const ownerRequestedCall = Boolean(ownerCall);
     let computerMode =
-      input.mode === 'computer' || previousTask
+      input.mode === 'computer' || previousTask || retryGoal
         ? { enabled: true, run: true }
         : computerModeRequest(input.text, state);
     const appFollowUp =
@@ -888,6 +980,13 @@ export class ChatService {
         webContext = '',
         reasoningInstruction = '';
       const stages = {
+        computerRetryClarification: () => {
+          if (!retry || retryGoal) return;
+          return finishLocalReply(uiText(
+            'Please repeat the computer action and include its destination.',
+            state.languages?.conversation,
+          ));
+        },
         debate: debateMode && (async () => {
           phase = 'debate';
           const result = await startHermesDebate({
@@ -910,7 +1009,7 @@ export class ChatService {
             phase = 'coding';
             if (!this.codingTask) throw Error('Coding mode is unavailable.');
             armDeadline(600000);
-            await this.prepareModel?.({ signal: requestSignal });
+            if (!this.smartRouter?.()) await this.prepareModel?.({ signal: requestSignal });
             const result = await this.codingTask(input.text, { signal: requestSignal });
             requestSignal.throwIfAborted();
             const files = result.files ?? [];
@@ -932,11 +1031,41 @@ export class ChatService {
             return TURN_HANDLED;
           }),
         computerAccessStatus: () => {
-          if (input.mode || !computerAccessStatusQuestion(input.text)) return;
-          const status = this.interfaceState().fullComputerAccess
+          if (input.mode || computerMode) return;
+          const capability = computerCapabilityQuestion(input.text);
+          if (!capability && !computerAccessStatusQuestion(input.text)) return;
+          const current = this.interfaceState();
+          const status = current.fullComputerAccess
             ? 'Full computer access is enabled.'
             : 'Full computer access is off.';
+          if (capability) {
+            const reply = this.computerTask && current.computerSkillEnabled !== false
+              ? status + ' To test desktop control, ask me to open a specific app, for example: Open Notepad using full computer control.'
+              : 'Desktop control is unavailable. Check the Computer skill in Capri Settings.';
+            return finishLocalReply(uiText(reply, state.languages?.conversation));
+          }
           return finishLocalReply(uiText(status, state.languages?.conversation));
+        },
+        discordDestination: () => {
+          if (!input.mode && input.internet !== true && discordVoiceFollowUp)
+            return finishLocalReply(discordVoiceMessageReply(replyLanguage, true));
+          if (callAudioFollowUp && !computerMode && !discordTaskRequest(input.text) &&
+              !discordSpeechNeedsDestination(input.text)) {
+            const { outputReady, shareReplies } = this.interfaceState().callAudio ?? {};
+            if (replyLanguage === 'id') return finishLocalReply(
+              outputReady
+                ? `Output Voice calls Capri siap. ${shareReplies ? 'Bagikan balasan aktif.' : 'Bagikan balasan belum aktif. Tombol Speak di Voice calls bisa mengirim teks yang Anda pilih.'} Capri belum memverifikasi apakah Discord memakai perangkat itu sebagai mikrofon atau apakah voice channel tersambung.`
+                : 'Output Voice calls Capri belum aktif. Pilih output virtual audio cable di Voice calls, lalu pilih ujung pasangannya sebagai mikrofon Discord. Berbagi mikrofon hanya meneruskan suara Anda.',
+            );
+            return finishLocalReply(outputReady
+              ? `Capri Voice calls output is ready. ${shareReplies ? 'Reply sharing is on.' : 'Reply sharing is off. The Voice calls Speak button can route selected text.'} Capri has not verified the Discord microphone device or voice-channel connection.`
+              : 'Capri Voice calls has no active output. Select the virtual audio cable output in Voice calls and its paired input as the Discord microphone. Microphone sharing carries your own voice.');
+          }
+          if (input.mode || computerMode || !discordSpeechNeedsDestination(input.text)) return;
+          return finishLocalReply(uiText(
+            'Do you want a text message or speech in a Discord voice channel? Which server and channel?',
+            state.languages?.conversation,
+          ));
         },
         memory: () => {
           if (!localMemory || computerMode) return;
@@ -1268,38 +1397,39 @@ export class ChatService {
           })();
         },
         computerIntent: () => {
-          if (codeReview) return;
-          // The CPU social route is a latency hint, not the final meaning of an
-          // owner request. Let the multilingual classifier recover Discord tasks
-          // under an existing grant without adding classification to ordinary chat.
+          if (codeReview || rejectsDesktopAction(input.text)) return;
           const intentDomain = toolDomain(input.text, state);
-          const discordIntent = state.fullComputerAccess && mentionsDiscord(input.text);
+          const potentialDesktopTask = state.fullComputerAccess &&
+            (computerIntentCandidate(input.text) || mentionsDiscord(input.text));
           if (
             !(
               !computerMode &&
-              !this.active.webSearchOnly &&
+              (!this.active.webSearchOnly || potentialDesktopTask) &&
               !this.active?.dedicatedMusic &&
               state.computerSkillEnabled !== false &&
               this.computerIntent &&
               (!intentDomain ||
                 intentDomain === 'desktop' ||
-                (intentDomain === 'conversation' && discordIntent))
+                (intentDomain === 'conversation' && potentialDesktopTask))
             )
           )
             return;
           return (async () => {
             phase = 'computer-intent';
             markResponseTiming('intent_start');
-            const match = await this.computerIntent(input.text, {
+            const match = intent === undefined ? await this.computerIntent(input.text, {
               previous,
               fullComputerAccess: state.fullComputerAccess,
               internetSearch: input.internet === true,
               signal: requestSignal,
-            }).catch(() => null);
+            }).catch(() => null) : intent;
             markResponseTiming('intent_ready');
             requestSignal.throwIfAborted();
             classifiedConversation = match?.intent === 'chat';
             classifiedMemory = match?.intent === 'memory';
+            // Search mode never changes grants based on the intent classifier.
+            if (this.active.webSearchOnly && (!state.fullComputerAccess || match?.intent !== 'task'))
+              return;
             if (match?.intent === 'enable' || match?.intent === 'disable') {
               if (!this.computerAccess)
                 throw new Error('Computer access controls are unavailable.');
@@ -1315,6 +1445,7 @@ export class ChatService {
               (match?.intent === 'task' && state.fullComputerAccess)
             ) {
               computerMode = { enabled: true, run: true };
+              this.active.webSearchOnly = false;
               applicationHint = match.application;
               // Short follow-ups can carry a pronoun the classifier overlooked.
               // The executor sees the earlier turn only as a reference, never a goal.
@@ -1331,7 +1462,7 @@ export class ChatService {
             requestSignal.throwIfAborted();
             requestSignal = requestDeadline(COMPUTER_SESSION_TIMEOUT_MS);
             armDeadline(this.toolTimeoutMs);
-            const result = await this.computerTask(appFollowUp ?? input.text, {
+            const result = await this.computerTask(retryGoal ?? appFollowUp ?? input.text, {
               signal: requestSignal,
               previousTask,
               ...(planningWithThinking && {
@@ -1400,6 +1531,8 @@ export class ChatService {
       const preparation = coordinateTurn(
         {
           direct: [
+            ['discordDestination', stages.discordDestination],
+            ['computerRetryClarification', stages.computerRetryClarification],
             ['debate', stages.debate],
             ['coding', stages.coding],
             ['computerAccessStatus', stages.computerAccessStatus],
@@ -1510,7 +1643,14 @@ export class ChatService {
       phase = 'model';
       // Local conversation can generate from bounded chat history without the
       // agent loop. Explicit actions, memory and web search keep their own routes.
-      const directDialogue = fableMode || modelMayChooseComputer
+      const directDialogue = smartDialogue ? (payload, signal) => smartRouterDialogue(
+        () => smartDialogue.request(payload, signal),
+        this.directLocalDialogue || this.npuDialogue
+          ? () => (this.directLocalDialogue ?? this.npuDialogue)(payload, signal)
+          : null,
+        { fallback: smartDialogue.fallback, refusalText: replyLanguage === 'id'
+          ? 'Model API menolak permintaan ini.' : uiText('The selected API model declined this request.', replyLanguage) },
+      ) : fableMode || modelMayChooseComputer
         ? null
         : (this.npuDialogue ??
           directSmallTalk ??
@@ -1553,7 +1693,7 @@ export class ChatService {
               ? [toolInstruction(interfaceState)]
               : []),
             ...(screenIdentity ? [screenIdentity] : []),
-            conversationInstruction(interfaceState.languages, { compact: dialogueOnly }),
+            conversationInstruction(interfaceState.languages, { compact: dialogueOnly, followMessage: true }),
             ...(fableMode ? ['Fable-mind: Ground claims in actual evidence and tool results. Distinguish verified facts from uncertainty. Never claim actions or tests succeeded without observed results.'] : []),
             ...(reasoningConversation ? [reasoningInstruction] : []),
             ...(input.internet === true ? [WEB_SEARCH_INSTRUCTION] : []),
@@ -1571,7 +1711,7 @@ export class ChatService {
           webContext;
       const directPayload = directDialogue
         ? lemonadeDialogue({
-            input: { ...input, thinking: reasoningConversation },
+            input: { ...input, thinking: Boolean(smartDialogue || reasoningConversation) },
             history: directSmallTalk ? [] : this.store.snapshot(),
             persona: this.persona(),
             languages: interfaceState.languages,
@@ -1675,7 +1815,7 @@ export class ChatService {
           });
       markResponseTiming('gateway_headers', { status: response.status });
       if (!response.ok) {
-        if (this.npuDialogue) throw npuFailure();
+        if (this.npuDialogue && !smartDialogue) throw npuFailure();
         throw gatewayFailure(
           'CAPRI_GATEWAY_HTTP_ERROR',
           `Gateway HTTP ${response.status}`,
@@ -1689,7 +1829,7 @@ export class ChatService {
         );
       let complete = false;
       let firstGatewayToken = false;
-      const modelRepeating = !this.externalInference && replyLoopGuard();
+      const modelRepeating = !this.externalInference && !smartDialogue && replyLoopGuard();
       for await (const data of sseData(response.body)) {
         if (modelComputerTask) break;
         if (this.active?.computerTaskResult) {
@@ -1710,7 +1850,7 @@ export class ChatService {
         if (!packet || typeof packet !== 'object' || Array.isArray(packet))
           throw gatewayFailure('CAPRI_GATEWAY_EVENT_INVALID', 'Invalid Gateway event');
         if (packet.error) {
-          if (this.npuDialogue) throw npuFailure();
+          if (this.npuDialogue && !smartDialogue) throw npuFailure();
           const detail = String(packet.error.message ?? '').slice(0, 2000);
           if (
             /OpenClaw stopped this (?:run|turn)|\b\d{1,2} consecutive identical tool failures\b/i.test(
@@ -1747,7 +1887,7 @@ export class ChatService {
           markResponseTiming('gateway_first_token');
         }
         received += delta.length;
-        if (received > (this.npuDialogue && !thinking ? 6144 : MAX_OUTPUT + 2048))
+        if (received > (this.npuDialogue && !thinking && !smartDialogue ? 6144 : MAX_OUTPUT + 2048))
           throw new Error('Response exceeds limit');
         const visible = visibleAnswer.push(delta);
         if (modelRepeating && modelRepeating(visible)) {
@@ -1795,9 +1935,15 @@ export class ChatService {
         );
         assistant.followUp = false;
       } else append(replyFilter.push('', true), true);
+      if (complete && !assistant.text.trim() && replyFilter.rejected) {
+        append(replyLanguage === 'id'
+          ? 'Capri belum punya hasil terverifikasi untuk permintaan ini.'
+          : uiText('Capri has no verified result for this request.', replyLanguage), true);
+        assistant.followUp = false;
+      }
       requestSignal.throwIfAborted();
       if (!complete || !assistant.text.trim()) {
-        if (this.npuDialogue) throw npuFailure();
+        if (this.npuDialogue && !smartDialogue) throw npuFailure();
         throw gatewayFailure(
           complete ? 'CAPRI_GATEWAY_RESPONSE_EMPTY' : 'CAPRI_GATEWAY_STREAM_INCOMPLETE',
           'Gateway returned an incomplete or empty response',
@@ -1822,7 +1968,7 @@ export class ChatService {
       assistant.status = 'complete';
       if (directDialogue && !this.npuDialogue) assistant.localDialogue = true;
       this.store.put(assistant);
-      if (this.npuDialogue && this.commitNpuDialogue)
+      if (!smartDialogue && this.npuDialogue && this.commitNpuDialogue)
         void this.commitNpuDialogue(user, assistant).catch(() => {});
       emit({ type: 'turn.completed', turnId: input.id, assistant, warning: this.store.warning });
     } catch (error) {
@@ -1908,5 +2054,23 @@ export class ChatService {
     )
       return undefined;
     return { goal: owner.text, status: result.computerTask.status };
+  }
+
+  unroutedComputerRetry() {
+    const history = this.store.snapshot();
+    const responses = new Map(history.filter((entry) => entry.role === 'assistant').map((entry) => [entry.turnId, entry]));
+    const recentOwners = history.filter((entry) => entry.role === 'user').slice(-5).reverse();
+    for (const owner of recentOwners) {
+      const age = Date.now() - Date.parse(owner.createdAt);
+      const response = responses.get(owner.turnId);
+      if (
+        !response || response.status !== 'complete' || response.computerTask ||
+        !/\b(?:cannot control computer from this chat|no computer-control tool (?:is available )?in this chat|this chat has no computer-control tool|please repeat the computer action and include its destination)\b/iu.test(response.text)
+      ) return undefined;
+      if (computerTaskRetry(owner.text)) continue;
+      if (!computerModeRequest(owner.text, { fullComputerAccess: true })?.run) return undefined;
+      return Number.isFinite(age) && age >= 0 && age <= 30 * 60_000 ? { goal: owner.text } : {};
+    }
+    return undefined;
   }
 }

@@ -8,7 +8,7 @@ function Get-CapriPythonRuntime {
     Remove-Item -LiteralPath Env:OPENSSL_ia32cap -ErrorAction SilentlyContinue
     $ProjectRoot = [IO.Path]::GetFullPath($ProjectRoot)
     $capriBundledUv = Join-Path $ProjectRoot '.runtime/uv/uv.exe'
-    $capriUvCommand = Get-Command uv.exe -CommandType Application -ErrorAction SilentlyContinue
+    $capriUvCommand = Get-Command uv.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     $capriUvPath = if (Test-Path -LiteralPath $capriBundledUv -PathType Leaf) { $capriBundledUv } elseif ($capriUvCommand) { $capriUvCommand.Source } else { $capriBundledUv }
     if (-not (Test-Path -LiteralPath $capriUvPath -PathType Leaf)) {
         $capriRepairMessage = 'Run Capri Setup to repair this folder, or install Node 24 and retry. The private uv runtime can then be restored automatically.'
@@ -77,7 +77,7 @@ function Get-CapriPythonRuntime {
 }
 
 function Ensure-CapriVirtualEnvironment {
-    param([Parameter(Mandatory=$true)][string]$ProjectRoot,[Parameter(Mandatory=$true)][ValidateSet('asr-venv','router-venv','voice-training-venv','qwen-tts-venv','qwen-tts-cuda-venv','qwen-tts-rocm-venv','npu-openvino')][string]$Name,[Parameter(Mandatory=$true)]$Runtime)
+    param([Parameter(Mandatory=$true)][string]$ProjectRoot,[Parameter(Mandatory=$true)][ValidateSet('asr-venv','router-venv','voice-training-venv','qwen-tts-venv','qwen-tts-cuda-venv','qwen-tts-rocm-venv','npu-openvino','mobile-gateway-venv')][string]$Name,[Parameter(Mandatory=$true)]$Runtime)
     $capriRuntimeRoot=[IO.Path]::GetFullPath((Join-Path $ProjectRoot '.runtime')).TrimEnd('\')
     $capriVenv=[IO.Path]::GetFullPath((Join-Path $capriRuntimeRoot $Name))
     if(-not $capriVenv.StartsWith($capriRuntimeRoot+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Invalid owned Python environment path.'}

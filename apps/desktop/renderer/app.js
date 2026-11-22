@@ -281,7 +281,10 @@ async function refreshAgentRemoteStatus() {
     elements['agent-remote-server-toggle'].setAttribute('aria-pressed', String(status.running));
     elements['agent-remote-server-toggle'].textContent = status.running ? 'Stop server' : 'Start server';
     clearAgentRemoteQr();
-    if (status.running) {
+    if (status.running && status.mode === 'desktop') {
+      elements['agent-remote-server-state'].textContent = 'Select Tailscale (Android) in Settings to pair a phone.';
+    }
+    if (status.running && status.mode !== 'desktop') {
       const qr = await api.agentRemoteServer('qr');
       if (!qr.src?.startsWith('data:image/png;base64,')) throw new Error('Invalid pairing QR.');
       const bytes = Uint8Array.from(atob(qr.src.slice('data:image/png;base64,'.length)), (c) => c.charCodeAt(0));
@@ -2499,6 +2502,10 @@ function renderHistoryMessage(message, refreshLocale = false) {
 
 let interfaceLanguageRevision = 0;
 function onEvent(event) {
+  if (event.type === 'inference.mode' && inference) {
+    inference = { ...inference, smartRouter: event.smartRouter };
+    renderInferenceLabel(inference, ui);
+  }
   if (event.type === 'composer.prefill') {
     if (!['/debate', '/fable-mind'].includes(event.command)) return;
     if (elements.message.value.trim()) {

@@ -145,11 +145,9 @@ export class VisualService {
     const historyRequest = this.rpc.call(
       'chat.history',
       { sessionKey: this.sessionKey, limit: 16 },
-      { signal },
+      { signal: AbortSignal.any([signal, AbortSignal.timeout(1200)]) },
     );
-    const history = await (attachmentTurn
-      ? historyRequest.catch(() => ({ messages: [] }))
-      : historyRequest);
+    const history = await historyRequest.catch(() => ({ messages: [] }));
     signal.throwIfAborted();
     const context = (history.messages ?? [])
       .filter((m) => ['user', 'assistant'].includes(m.role))

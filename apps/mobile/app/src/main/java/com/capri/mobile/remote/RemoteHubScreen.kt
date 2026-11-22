@@ -98,6 +98,8 @@ fun RemoteHubScreen() {
         }
     }
     var showPair by remember { mutableStateOf(false) }
+    var showWorkspacePicker by remember { mutableStateOf(false) }
+    if (showWorkspacePicker) FolderPickerDialog(onDismiss = { showWorkspacePicker = false })
 
     val profile = RemoteState.activeProfile
     if (showPair) {
@@ -151,6 +153,9 @@ fun RemoteHubScreen() {
                     color = MUTED, fontFamily = MONO, fontSize = 11.sp,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
+            }
+            if (RemoteState.connected) {
+                SmallChip(tr("Workspace"), CYAN) { showWorkspacePicker = true }
             }
             if (profile != null && !RemoteState.connected && !RemoteState.connecting) {
                 SmallChip(tr("Retry"), AMBER) { RemoteState.connectActive(ctx) }
@@ -323,7 +328,7 @@ private fun AgentsSubTab() {
         }
 
         // Agent quick chips
-        if (RemoteState.agents.isNotEmpty()) {
+        if (RemoteState.connected) {
             Row(
                 Modifier
                     .fillMaxWidth()
@@ -331,10 +336,11 @@ private fun AgentsSubTab() {
                     .padding(horizontal = 16.dp, vertical = 2.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                for (ag in RemoteState.agents) {
+                SmallChip(tr("Rescan agents"), INK) { RemoteState.refreshAgents(ctx) }
+                for (ag in RemoteState.agents.filter { it.detected }) {
                     val sel = ag.id in RemoteState.selectedAgentIds
                     SmallChip(
-                        label = if (ag.installed) ag.name else "${ag.name} (N/A)",
+                        label = if (ag.installed) ag.name else "${ag.name} · ${tr("Unsupported")}",
                         accent = if (ag.installed) GREEN else MUTED,
                         selected = sel,
                     ) {

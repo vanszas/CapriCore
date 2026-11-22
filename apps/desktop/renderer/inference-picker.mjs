@@ -8,9 +8,19 @@ export function inferenceChoices(value = {}) {
       id: null,
       label: 'Local',
       model: value.localModel || '',
-      active: !value.activeId && !value.setupRequired,
+      active: !value.activeId && !value.setupRequired && !value.smartRouter?.enabled,
       available: true,
     },
+    ...(value.smartRouter ? [{
+      id: 'smart-router',
+      label: 'Smart Router',
+      model: value.smartRouter.model,
+      active: value.smartRouter.enabled === true && !value.activeId && !value.setupRequired,
+      available: true,
+      configure: !value.smartRouter.model ||
+        !(value.profiles ?? []).some((profile) =>
+          profile.id === value.smartRouter.profileId && profile.canConnect),
+    }] : []),
     ...(value.profiles ?? []).map((profile) => ({
       id: profile.id,
       label: profile.name || URL.parse(profile.baseUrl)?.hostname || 'API',
@@ -133,7 +143,7 @@ export class InferencePicker {
       button.className = 'inference-picker-choice';
       button.setAttribute('role', 'menuitemradio');
       button.setAttribute('aria-checked', String(choice.active));
-      button.dataset.source = choice.id === null ? 'local' : 'api';
+      button.dataset.source = choice.id === null ? 'local' : choice.id === 'smart-router' ? 'smart-router' : 'api';
       button.dataset.available = String(choice.available);
       button.disabled = !choice.available || this.selecting || busy;
       const title = document.createElement('strong');
@@ -200,7 +210,13 @@ export class InferencePicker {
     this.menu.setAttribute('aria-busy', 'true');
     for (const item of this.items()) item.disabled = true;
     try {
-      if (choice.id === null) {
+      if (choice.configure) {
+        acting = true;
+        this.close();
+        await this.api.openSettings('smart-router');
+        return;
+      }
+      if (choice.id === null || choice.id === 'smart-router') {
         let models = await this.api.modelStatus();
         if (request !== this.request || this.menu.hidden) return;
         if (!models.profiles?.length || models.inventoryUnavailable)

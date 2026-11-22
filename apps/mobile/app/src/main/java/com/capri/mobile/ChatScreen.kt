@@ -1,8 +1,12 @@
 package com.capri.mobile
 
+import android.app.Activity
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.provider.Settings
+import android.speech.RecognizerIntent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -33,6 +37,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,8 +51,14 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.capri.mobile.remote.RemoteState
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
+import org.json.JSONObject
 
 private fun history(prefs: Prefs): List<Pair<String, String>> {
     val a = runCatching { JSONArray(prefs.chat) }.getOrDefault(JSONArray())
@@ -65,8 +76,67 @@ fun ChatTab(go: (Tab) -> Unit) {
     var status by remember { mutableStateOf(CapriService.brainStatus) }
     var running by remember { mutableStateOf(CapriService.running) }
     var text by remember { mutableStateOf("") }
+    var askingPc by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+    val remoteProfile = RemoteState.activeProfile
+    val remote = remember(remoteProfile) { RemoteState.client(ctx) }
+    var speaker by remember { mutableStateOf<Speaker?>(null) }
     val list = rememberLazyListState()
 
+    DisposableEffect(Unit) {
+        onDispose { speaker?.release() }
+    }
+    fun send(line: String, spoken: Boolean) {
+        if (line.isBlank() || askingPc) return
+        if (line.length > 4000) {
+            error = tr("Keep your message under 4,000 characters.")
+            return
+        }
+        error = ""
+        pending = line
+        CapriService.chatLine = ""
+        if (remote == null) {
+            ctx.startService(Intent(ctx, CapriService::class.java).setAction(CapriService.ACTION_ASK)
+                .putExtra("text", line).putExtra("chatOnly", true).putExtra("speakReply", spoken))
+            return
+        }
+        askingPc = true
+        scope.launch {
+            try {
+                val turns = JSONArray()
+                msgs.takeLast(6).forEach { (u, a) -> turns.put(JSONObject().put("u", u).put("a", a)) }
+                val reply = withContext(Dispatchers.IO) { remote.capriChat(line, turns) }
+                val saved = JSONArray()
+                (msgs + (line to reply)).takeLast(8).forEach { (u, a) ->
+                    saved.put(JSONObject().put("u", u).put("a", a))
+                }
+                prefs.chat = saved.toString()
+                msgs = history(prefs)
+                if (spoken || prefs.voice) {
+                    val output = speaker ?: Speaker(ctx) {
+                        error = tr("Voice playback failed. Check Android text-to-speech settings.")
+                    }.also { speaker = it }
+                    output.speak(reply)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                error = failure.message ?: tr("Capri could not reply. Try again.")
+                if (text.isBlank()) text = line
+            } finally {
+                askingPc = false
+                pending = ""
+            }
+        }
+    }
+    val voice = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val line = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                ?.firstOrNull()?.trim().orEmpty()
+            if (line.isEmpty()) error = tr("Didn't catch that, choom.") else send(line, spoken = true)
+        }
+    }
     val owner = LocalLifecycleOwner.current
     DisposableEffect(owner) {  // while you're here her replies land in the chat, not in her bubble on top of it
         val obs = LifecycleEventObserver { _, e ->
@@ -102,7 +172,7 @@ fun ChatTab(go: (Tab) -> Unit) {
         val n = list.layoutInfo.totalItemsCount
         if (n > 0) list.scrollToItem(n - 1)
     }
-    val online = running && CapriService.brainOnline
+    val online = remote != null || (running && CapriService.brainOnline)
 
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -110,7 +180,7 @@ fun ChatTab(go: (Tab) -> Unit) {
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text("Capri", color = INK, fontFamily = SANS, fontWeight = FontWeight.ExtraBold, fontSize = 18.sp)
-                Text(if (running) status else tr("offline"), color = MUTED, fontFamily = SANS, fontSize = 12.sp, maxLines = 1)
+                Text(if (remote != null) tr("Paired PC") else if (running) status else tr("offline"), color = MUTED, fontFamily = SANS, fontSize = 12.sp, maxLines = 1)
             }
             if (msgs.isNotEmpty()) Text(tr("Clear"), color = PINK, fontFamily = SANS, fontWeight = FontWeight.SemiBold, fontSize = 13.sp,
                 modifier = Modifier.clickable { prefs.chat = "[]"; CapriService.chatLine = ""; pending = "" }.padding(8.dp))
@@ -134,8 +204,9 @@ fun ChatTab(go: (Tab) -> Unit) {
             if (pending.isNotEmpty()) item { You(pending) }
             if (pending.isNotEmpty() || writing) item { if (writing) Her(live) else Thinking(live == "*looking*") }
         }
+        if (error.isNotEmpty()) Text(error, color = PINK, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
         when {
-            !running -> Banner(tr("She's offline."), if (Settings.canDrawOverlays(ctx)) tr("Summon") else tr("Go to Home")) {
+            !online && !running -> Banner(tr("She's offline."), if (Settings.canDrawOverlays(ctx)) tr("Summon") else tr("Go to Home")) {
                 if (Settings.canDrawOverlays(ctx)) summon(ctx) else go(Tab.HOME)
             }
             !online && CapriService.brainState == "none" -> Banner(tr("She has no brain yet."), tr("Pick one")) { go(Tab.BRAIN) }
@@ -145,17 +216,30 @@ fun ChatTab(go: (Tab) -> Unit) {
                 OutlinedTextField(text, { text = it }, placeholder = { Text(tr("Say something..."), color = MUTED) }, maxLines = 4,
                     colors = capriField(), shape = chamfer(9.dp), modifier = Modifier.weight(1f))
                 Spacer(Modifier.width(8.dp))
-                val send = text.isNotBlank()
-                Box(Modifier.size(52.dp).background(PINK, chamfer(9.dp)).clickable {
-                    if (send) {
+                val hasDraft = text.isNotBlank()
+                Box(Modifier.size(52.dp).background(PINK, chamfer(9.dp)).clickable(enabled = !askingPc) {
+                    if (hasDraft) {
                         val line = text.trim()
+                        if (line.length > 4000) {
+                            error = tr("Keep your message under 4,000 characters.")
+                            return@clickable
+                        }
                         text = ""
-                        pending = line
-                        CapriService.chatLine = ""
-                        ctx.startService(Intent(ctx, CapriService::class.java).setAction(CapriService.ACTION_ASK).putExtra("text", line))
-                    } else ctx.startActivity(Intent(ctx, VoiceActivity::class.java))
+                        send(line, spoken = false)
+                    } else {
+                        speaker?.stop()
+                        error = ""
+                        try {
+                            voice.launch(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                                .putExtra(RecognizerIntent.EXTRA_PROMPT, tr("Talk to Capri"))
+                                .apply { Lang.speech(ctx)?.let { putExtra(RecognizerIntent.EXTRA_LANGUAGE, it) } })
+                        } catch (_: android.content.ActivityNotFoundException) {
+                            error = tr("This phone has no voice typing at all. Type to me instead.")
+                        }
+                    }
                 }, contentAlignment = Alignment.Center) {
-                    LineIcon(if (send) "send" else "mic", ON_NEON, 22.dp)
+                    LineIcon(if (hasDraft) "send" else "mic", ON_NEON, 22.dp)
                 }
             }
         }

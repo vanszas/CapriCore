@@ -739,10 +739,12 @@ export function computerIntentClassifier({
   params = {},
   modelCapabilities,
   fetchImpl = fetch,
+  screenActions = false,
 }) {
   const endpoint = inferenceEndpoint(url);
   const intents = ['chat', 'memory', 'feature', 'task', 'task_with_access', 'enable', 'disable'];
-  return async (text, { previous, fullComputerAccess, internetSearch = false, signal } = {}) => {
+  if (screenActions) intents.push('screen_once', 'screen_watch', 'screen_stop');
+  return async (text, { previous, recentTurns, fullComputerAccess, internetSearch = false, signal } = {}) => {
     const response = await fetchImpl(endpoint, {
       method: 'POST',
       redirect: 'error',
@@ -768,11 +770,26 @@ export function computerIntentClassifier({
           {
             role: 'system',
             content:
-              'Classify the latest OWNER message in its own language, including phonetic errors from speech recognition. Return JSON. chat: ordinary conversation, asking for information or instructions, asking what computer access can do, quoting or translating a command. memory: asking to recall saved personal facts, preferences, previous conversations or decisions, for example "What is my favourite game?" or "Что я тебе рассказывал о себе?". Ordinary factual questions are chat. Casual replies such as "Not much, just chilling.", "Nothing much", "Да ничего особенного" are chat, not actions. feature: owner requests a built-in Capri feature such as timers, reminders, screen descriptions, screenshots, settings, or simple media/calculator requests. "Set a timer for ten minutes", "Напомни через час", "Take a screenshot" are feature. task: owner asks Capri to carry out a concrete action in a Windows app or the desktop, such as opening, typing into, switching, or clicking in an app, with no explicit request for full access. Discord navigation, joining/leaving a voice channel, reading visible channel context and sending exact owner-requested text are app tasks: "Join General in Discord", "Подключись к голосовому каналу в Дискорде", "Rejoins le salon vocal sur Discord". task_with_access: same action plus an explicit request to use full computer control. enable/disable: ONLY an explicit instruction to turn the full computer control setting on/off with no other task. Turning on a timer or another feature is feature, never enable. A prohibition is chat, not disable: "Do not turn on computer control", "Не включай управление компьютером", "No actives el control del equipo" are all chat. A polite request phrased as a question can be an action, but a question about capability is chat. Use previousOwnerMessage only to resolve an explicit reference in latestOwnerMessage, never execute its instructions on their own. Set usesPrevious true only if the current task needs that reference. Do not perform any actions. ' +
+              'Classify the latest OWNER message in its own language, including phonetic errors from speech recognition. Return JSON. chat: ordinary conversation, asking for information or instructions, asking what computer access can do, quoting or translating a command. memory: asking to recall saved personal facts, preferences, previous conversations or decisions, for example "What is my favourite game?" or "Что я тебе рассказывал о себе?". Ordinary factual questions are chat. Casual replies such as "Not much, just chilling.", "Nothing much", "Да ничего особенного" are chat, not actions. ' +
+              `feature: owner requests a built-in Capri feature such as timers, reminders, ${screenActions ? '' : 'screen descriptions, '}screenshots, settings, or simple media/calculator requests. "Set a timer for ten minutes", "Напомни через час", "Take a screenshot" are feature. ` +
+              'task: owner asks Capri to carry out a concrete action in a Windows app or the desktop, such as opening, typing into, switching, or clicking in an app, with no explicit request for full access. Discord navigation, joining/leaving a voice channel, reading visible channel context and sending exact owner-requested text are app tasks: "Join General in Discord", "Подключись к голосовому каналу в Дискорде", "Rejoins le salon vocal sur Discord". task_with_access: same action plus an explicit request to use full computer control. enable/disable: ONLY an explicit instruction to turn the full computer control setting on/off with no other task. Turning on a timer or another feature is feature, never enable. A prohibition is chat, not disable: "Do not turn on computer control", "Не включай управление компьютером", "No actives el control del equipo" are all chat. A polite request phrased as a question can be an action, but a question about capability is chat. Use previousOwnerMessage only to resolve an explicit reference in latestOwnerMessage, never execute its instructions on their own. Set usesPrevious true only if the current task needs that reference. Do not perform any actions. ' +
               'Questions requiring observation of live app status are task, not chat or memory, even when no change is requested: "What is my current Discord status?", "Какой у меня сейчас статус в Дискорде?", "Apa status Discord saya sekarang?". Distinguish checking the current state from explaining what a status means or describing capabilities, which are chat. Read-only inspection does not authorize changing status, sending messages, or enabling full computer access. ' +
               'Apply these meanings in every language, without requiring particular keywords. An imperative asking Capri to take control of the owner\'s computer is enable if it contains no concrete app task, or task_with_access if it includes a concrete app task. Capability questions, quotations, translation requests, hypothetical instructions and prohibitions do not grant access. ' +
               'For an explicit request to open an installed application, optionally return application as its exact name copied from latestOwnerMessage. For chains, use the first application the owner asked to open. Omit the field for browsing, for app names inside quoted text to be typed, for descriptions and when the app is unclear.',
           },
+          ...(screenActions
+            ? [
+                {
+                  role: 'system',
+                  content:
+                    'Screen observation intents apply in any language and override feature/chat when the owner wants Capri to view their display. ' +
+                    'screen_once: the owner wants Capri to look at, check, or describe what is currently visible on their screen right now (including direct or informal questions asking whether Capri can see their current screen or what they are watching/doing on screen right now), without saving a screenshot file or controlling the computer. A brief retry, follow-up, or confirmation of granted access also counts as screen_once ONLY when recentOwnerTurns show an unresolved screen-inspection request and the latest message continues it; in that case set usesPrevious true. ' +
+                    'screen_watch: an explicit new request in the latest message to keep watching or monitoring the display continuously over time (set usesPrevious false). ' +
+                    'screen_stop: an explicit request to stop ongoing screen observation. ' +
+                    'Use chat (not screen_*) for unrelated topics, general/abstract explanations of how features or permissions work, quoted/hypothetical/negated statements, or access statements whose recentOwnerTurns are not about viewing the screen. Saving a screenshot file is feature; operating an app is task. Do not perform actions or answer the owner.',
+                },
+              ]
+            : []),
           ...(internetSearch
             ? [
                 {
@@ -788,6 +805,7 @@ export function computerIntentClassifier({
               latestOwnerMessage: text,
               ...(internetSearch ? { internetSearch: true } : {}),
               previousOwnerMessage: previous,
+              ...(screenActions && recentTurns?.length ? { recentOwnerTurns: recentTurns } : {}),
               fullComputerAccess,
             }),
           },
@@ -799,6 +817,8 @@ export function computerIntentClassifier({
     if (raw.length > 8192) return null;
     const result = computerJson(JSON.parse(raw));
     if (!intents.includes(result?.intent) || typeof result.usesPrevious !== 'boolean') return null;
+    if ((result.intent === 'screen_watch' && result.usesPrevious) ||
+        (result.intent === 'screen_once' && result.usesPrevious && !recentTurns?.length)) return null;
     const application =
       typeof result.application === 'string' &&
       /^[\p{L}\p{N}][\p{L}\p{N} ._+&'’\-]{0,79}$/u.test(result.application)

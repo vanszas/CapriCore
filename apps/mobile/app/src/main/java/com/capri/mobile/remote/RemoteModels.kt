@@ -180,6 +180,7 @@ data class RemoteAgentInfo(
     val supportsStreaming: Boolean,
     val installed: Boolean,
     val command: String,
+    val detected: Boolean = installed,
 )
 
 data class RemoteAttachmentDraft(

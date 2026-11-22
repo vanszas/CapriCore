@@ -19,13 +19,22 @@ const delivery = {
 
 export function conversationInstruction(
   { conversation, customConversation } = LANGUAGE_DEFAULTS,
-  { compact = false } = {},
+  { compact = false, followMessage = false } = {},
 ) {
   const name = conversation === 'custom' ? customConversation : languageName(conversation);
+  if (followMessage)
+    return `CURRENT CONVERSATION LANGUAGE: ${JSON.stringify(name)} (fallback). Reply in the language of the latest user message, or the language the user explicitly requests. Ignore quoted text and application data when deciding the reply language. Use the fallback only if the message and conversation give no language signal. Keep tool results factual and use plain text.`;
   const native = LANGUAGE_PACKS.find((p) => p.id === conversation)?.label ?? name;
   if (compact)
     return `CURRENT CONVERSATION LANGUAGE: ${JSON.stringify(name)}. ${delivery[conversation] ?? `Reply only in ${name}.`} Use plain text and punctuation. Keep proper names and requested quotations in their original language.`;
   return `CURRENT CONVERSATION LANGUAGE: ${JSON.stringify(name)} (${native}, ${conversation}). Write your user-facing reply in this language, even when the input, older conversation, screen text or tool data uses another language. Any microphone language describes input transcription only. Keep Capri's personality, shared memories, warmth and wit; adapt slang naturally. A tool's confirmation is factual data: translate it into this language in one short sentence without adding claims. Proper names, song titles, file paths, code and text explicitly requested in another language may keep their original spelling. Use plain text and punctuation only, with no emoji, asterisks or Markdown. This conversation preference overrides older language instructions. ${delivery[conversation] ?? `Respond only in ${name}.`}`;
+}
+
+export function chatReplyLanguage(text, fallback = 'en') {
+  const words = text.replace(/"[^"]*"|“[^”]*”/gu, '');
+  if (/\b(?:kenapa|mengapa|kok|belum|tolong|pakai|kirim|gimana|banget|nggak|udah|sudah|beri|bicara)\b/iu.test(words)) return 'id';
+  if (/\b(?:why|what|please|send|how|can you|your voice|ur voice|does|the)\b/iu.test(words)) return 'en';
+  return fallback;
 }
 
 export const VOICE_PREVIEWS = Object.freeze({

@@ -33,6 +33,7 @@ export class UpdatesPanel {
           <div class="settings-actions"><button type="button" id="updates-install" class="update-install" hidden>Restart and update</button></div>
           <p class="settings-help" id="updates-preserve">Your history, memory, models and personal settings are kept. Capri restarts only when you choose to install.</p>
           <p class="settings-help" id="updates-source" hidden>This is a development checkout. The downloaded installer creates or updates a separate managed installation.</p>
+          <p class="settings-help" id="updates-restriction" hidden></p>
           <p class="settings-help" id="updates-full" hidden>The full installer will open; select your current installation folder to keep your data.</p>
           <p class="settings-help">Updates come from CapriChooms/CapriCore on GitHub and are checked with SHA-256 before installation.</p>
         </section>
@@ -224,18 +225,20 @@ export class UpdatesPanel {
     if (value.needsAccess) this.get('access-details').open = true;
     this.get('check').disabled = busy;
     this.get('download').hidden =
-      !currentChannel || !value.release || busy || value.phase === 'ready';
+      Boolean(value.updateRestriction) || !currentChannel || !value.release || busy || value.phase === 'ready';
     this.get('download').disabled = busy;
     this.get('cancel').hidden = !['checking', 'downloading'].includes(value.phase);
     this.get('cancel').disabled = false;
-    this.get('install').hidden = !currentChannel || value.phase !== 'ready';
+    this.get('install').hidden = Boolean(value.updateRestriction) || !currentChannel || value.phase !== 'ready';
     this.get('install').disabled = busy;
     this.get('install').textContent = this.ui.text(
       value.mode === 'managed' && !value.installerRequired
         ? 'Restart and update'
         : 'Open installer',
     );
-    this.get('source').hidden = value.mode !== 'installer';
+    this.get('source').hidden = value.mode !== 'installer' || Boolean(value.updateRestriction);
+    this.get('restriction').hidden = !value.updateRestriction;
+    this.get('restriction').textContent = value.updateRestriction ? this.ui.text(value.updateRestriction) : '';
     this.get('full').hidden = value.mode !== 'managed' || !value.installerRequired;
     this.get('preserve').hidden = value.mode !== 'managed';
     const progress = this.get('progress');

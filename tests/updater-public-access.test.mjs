@@ -42,6 +42,28 @@ const gitlab = 'https://gitlab.com/api/v4/projects/capricore1%2FCapriCore';
 const mirrorInstaller = `${gitlab}/packages/generic/capri/1.1.0/${asset.name}`;
 const mirrorFolder = temporaryFolders('capri-gitlab-updater-', path.join(root, '.runtime'));
 
+test('Capri Induk can read public releases without offering to install them', async () => {
+  const installRoot = folder();
+  mkdirSync(path.join(installRoot, 'config'));
+  writeFileSync(path.join(installRoot, 'config/release.json'), '{"tag":"v1.0.0","distribution":"induk"}');
+  const service = new UpdateService({
+    root: installRoot,
+    state: path.join(installRoot, 'state'),
+    node: process.execPath,
+    credential: async () => null,
+    releases: async () => [release],
+    download: async () => assert.fail('Public release should never download on Induk'),
+  });
+  const state = await service.checkOnStartup();
+  assert.equal(state.release.tag, release.tag_name);
+  assert.equal(state.notification, null);
+  assert.match(state.updateRestriction, /Agent Remote/);
+  const { releases: history } = await service.history();
+  assert.equal(history[0].update, false);
+  await assert.rejects(service.prepare(), /Capri Induk/);
+  await assert.rejects(service.install({}), /Capri Induk/);
+});
+
 test('an unavailable GitHub release feed falls back to GitLab for checking, history and downloading', async () => {
   const installRoot = mirrorFolder();
   mkdirSync(path.join(installRoot, 'config'));

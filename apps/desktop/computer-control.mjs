@@ -108,6 +108,8 @@ export class ComputerControl {
     indicatorTimeoutMs = 5000,
     cleanupTimeoutMs = 2000,
     pointerDuration = () => 220,
+    backgroundOnly = false,
+    reviewBackgroundMutation,
     applicationAdapter,
   }) {
     Object.assign(this, {
@@ -130,6 +132,8 @@ export class ComputerControl {
       indicatorTimeoutMs,
       cleanupTimeoutMs,
       pointerDuration,
+      backgroundOnly,
+      reviewBackgroundMutation,
       applicationAdapter,
     });
     this.session = null;
@@ -153,7 +157,7 @@ export class ComputerControl {
       !this.allowed() ||
       !this.canStart() ||
       session.turn !== this.currentTurn() ||
-      (session.ready && !escapeAvailable)
+      (session.ready && !this.backgroundOnly && !escapeAvailable)
     ) {
       void this.stop();
       return false;
@@ -217,7 +221,7 @@ export class ComputerControl {
     if (signal?.aborted) cancelOwner();
     try {
       try {
-        if (!(await this.registerEscape(() => void this.stop()))) throw new Error();
+        if (!this.backgroundOnly && !(await this.registerEscape(() => void this.stop()))) throw new Error();
       } catch (cause) {
         throw Object.assign(
           new Error('Escape emergency stop is unavailable. Computer control did not start.', {
@@ -392,9 +396,19 @@ export class ComputerControl {
     }
     if (args.action === 'observe') {
       session.target = null;
-      const before = await this.bridge({ action: 'computer_state' }, { signal: combined });
+      const observation = {
+        action: 'computer_state',
+        ...(this.backgroundOnly && { backgroundOnly: true, ...session.backgroundWindow }),
+      };
+      const before = await this.bridge(observation, { signal: combined });
       combined.throwIfAborted();
-      const nativeOnly = session.nativeOnlyApplications?.includes(before.applicationKind) === true;
+      if (this.backgroundOnly && !session.backgroundWindow) {
+        const { windowId, processId, startedAtTicks } = before;
+        session.backgroundWindow = { windowId, processId, startedAtTicks };
+        Object.assign(observation, session.backgroundWindow);
+      }
+      const nativeOnly =
+        this.backgroundOnly || session.nativeOnlyApplications?.includes(before.applicationKind) === true;
       const steamClient = isSteamClient(before.executable);
       const launcherClient = isCyberpunkLauncherWindow(before);
       const game =
@@ -452,7 +466,10 @@ export class ComputerControl {
         combined.throwIfAborted();
         image = null;
       }
-      const after = await this.bridge({ action: 'computer_state' }, { signal: combined });
+      const after =
+        !this.backgroundOnly && args.vision === false
+          ? before
+          : await this.bridge(observation, { signal: combined });
       combined.throwIfAborted();
       if (
         before.windowId !== after.windowId ||
@@ -479,7 +496,7 @@ export class ComputerControl {
       if (this.requireSession() !== session) throw new Error('Computer control session changed.');
       const application = await this.applicationAdapter?.observe(after, combined);
       if (application) {
-        const live = await this.bridge({ action: 'computer_state' }, { signal: combined });
+        const live = await this.bridge(observation, { signal: combined });
         if (live.windowId !== after.windowId || live.startedAtTicks !== after.startedAtTicks)
           throw Object.assign(Error('The foreground changed during application observation.'), {
             code: 'COMPUTER_OBSERVATION_CHANGED',
@@ -840,6 +857,12 @@ export class ComputerControl {
       processId: target.processId,
       startedAtTicks: target.startedAtTicks,
     };
+    if (this.backgroundOnly && !['click', 'enter_text'].includes(args.action)) {
+      throw Object.assign(new Error('This action requires shared desktop input. Background control left your input untouched.'), {
+        code: 'COMPUTER_BACKGROUND_UNAVAILABLE',
+        inputPerformed: false,
+      });
+    }
     if (args.action === 'press_keys') {
       if (
         !Array.isArray(args.keys) ||
@@ -1023,7 +1046,8 @@ export class ComputerControl {
     this.publish();
     const needsRelease =
       command.keys || ['computer_click', 'computer_drag', 'computer_type'].includes(command.action);
-    const input = needsRelease
+    if (this.backgroundOnly) command.backgroundOnly = true;
+    const input = needsRelease && !this.backgroundOnly
       ? {
           started: false,
           command: {
@@ -1039,19 +1063,58 @@ export class ComputerControl {
         }
       : null;
     if (input) session.inputs.add(input);
-    const task = Promise.resolve().then(() => {
+    const task = Promise.resolve().then(async () => {
+      if (this.backgroundOnly && this.reviewBackgroundMutation) {
+        const approved = await this.reviewBackgroundMutation({
+          goal: session.goal,
+          window: target.untrustedTitle,
+          control: target.targets.get(args.targetId)?.label,
+          action: args.action,
+          text: args.action === 'enter_text' ? args.text : undefined,
+          signal: combined,
+        });
+        if (!approved) {
+          throw Object.assign(new Error('The owner did not approve the background action.'), {
+            code: 'COMPUTER_MUTATION_DECLINED',
+            inputPerformed: false,
+          });
+        }
+      }
       combined.throwIfAborted();
+      const bridgeOptions = {
+        signal: combined,
+        stillAllowed: () =>
+          this.session === session &&
+          this.allowed() &&
+          this.canStart() &&
+          session.turn === this.currentTurn(),
+      };
+      if (
+        !this.backgroundOnly &&
+        !recordedClick &&
+        command.action === 'computer_click' &&
+        command.controlId &&
+        !command.captionControlId &&
+        !command.surface &&
+        command.button === 'left' &&
+        command.clickCount === 1
+      ) {
+        const control = target.untrustedControls?.find((item) => item.id === command.controlId);
+        try {
+          return await this.bridge({ ...command, backgroundOnly: true }, bridgeOptions);
+        } catch (error) {
+          if (
+            error.code !== 'COMPUTER_BACKGROUND_UNAVAILABLE' ||
+            error.inputPerformed !== false ||
+            control?.type !== 'ControlType.TabItem'
+          ) throw error;
+          combined.throwIfAborted();
+        }
+      }
       if (input) input.started = true;
       return command.action === 'resolve_assemble'
         ? this.applicationAdapter.execute(target, args, target.application, combined)
-        : this.bridge(command, {
-            signal: combined,
-            stillAllowed: () =>
-              this.session === session &&
-              this.allowed() &&
-              this.canStart() &&
-              session.turn === this.currentTurn(),
-          });
+        : this.bridge(command, bridgeOptions);
     });
     session.pending = task;
     try {

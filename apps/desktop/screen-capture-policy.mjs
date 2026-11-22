@@ -252,6 +252,19 @@ export class ScreenCapturePolicy {
       ...(selected.allMonitors && { allMonitors: true }),
     };
   }
+  startNativeWatch({ nativeId, displayId, label, intervalMs, display }) {
+    if (this.capture) throw new Error('Screen capture is already active');
+    const capture = this.capture = {
+      id: randomUUID(), nativeId, displayId, label, intervalMs,
+      native: true, mode: 'watch', phase: 'capturing', display,
+      controller: new AbortController(), sequence: 0, checkedAt: this.now(),
+      frame: this.ownerFrame(), expiresAt: this.now() + 7200000,
+    };
+    this.expiryTimer = setTimeout(() => this.release(capture.id, 'expired'), 7200000);
+    this.expiryTimer.unref?.();
+    this.publish();
+    return capture;
+  }
   matchingSource(sources, capture) {
     return sources.find(
       (source) =>
@@ -417,6 +430,7 @@ export class ScreenCapturePolicy {
       this.stop('frame-changed');
       return false;
     }
+    if (capture.native) return true;
     if (!capture.allMonitors && this.now() - capture.checkedAt < 4000) return true;
     try {
       const sources = await this.enumerate([
@@ -442,7 +456,7 @@ export class ScreenCapturePolicy {
     for (const [token, source] of this.catalog) {
       if (source.allMonitors) this.catalog.delete(token);
     }
-    if (this.capture?.allMonitors) this.stop('source-unavailable');
+    if (this.capture?.allMonitors || this.capture?.native) this.stop('source-unavailable');
   }
   stop(reason = 'cancelled') {
     clearTimeout(this.expiryTimer);

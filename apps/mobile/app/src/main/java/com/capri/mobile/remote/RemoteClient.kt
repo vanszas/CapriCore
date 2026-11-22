@@ -175,6 +175,7 @@ class RemoteClient(
                 supportsStreaming = a.optBoolean("supports_streaming", true),
                 installed = a.optBoolean("installed", false),
                 command = a.optString("command", ""),
+                detected = a.optBoolean("detected", a.optBoolean("installed", false)),
             )
         }.filter { it.id.isNotBlank() }
     }
@@ -266,6 +267,14 @@ class RemoteClient(
         )
         return decodeSession(obj.optJSONObject("session") ?: obj)
     }
+
+    fun capriChat(message: String, history: JSONArray): String =
+        requestJson(
+            "POST",
+            "/api/capri/chat",
+            JSONObject().put("message", message).put("history", history),
+            readTimeoutMs = 35000,
+        ).getString("reply")
 
     fun loadSession(id: String): RemoteSession {
         val obj = requestJson("GET", "/api/sessions/$id")
@@ -405,6 +414,7 @@ class RemoteClient(
         key: String = "",
         text: String = "",
         monitor: String = "primary",
+        pointer: String = "",
     ): JSONObject = requestJson(
         "POST",
         "/api/screen/input",
@@ -416,7 +426,8 @@ class RemoteClient(
             .put("delta", delta)
             .put("key", key)
             .put("text", text)
-            .put("monitor", monitor),
+            .put("monitor", monitor)
+            .put("pointer", pointer),
         readTimeoutMs = 8000,
     )
 

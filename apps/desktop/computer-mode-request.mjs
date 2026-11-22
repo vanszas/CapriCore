@@ -25,6 +25,12 @@ export function computerAccessStatusQuestion(text) {
   return accessStatusQuestions.some((pattern) => pattern.test(request));
 }
 
+export function computerCapabilityQuestion(text) {
+  const request = String(text).normalize('NFKC').trim().replace(prefix, '')
+    .replace(/^(?:hi|hey|hello)\s+\p{L}+[,!]\s+/iu, '');
+  return /^(?:can|could)\s+(?:you|u)\s+(?:control|operate|use)\s+(?:my|this|the)\s+(?:computer|pc|desktop)(?:\s+(?:right\s+now|now))?\s*[?.!,]*(?:\s*i\s+(?:want|would like)\s+to\s+test[?.!]*)?$/iu.test(request);
+}
+
 const polite =
   /^(?:(?:please|пожалуйста)[,\s]+|(?:can|could|would)\s+you\s+(?:please\s+)?|(?:можешь|можете)\s+(?:пожалуйста\s+)?)/iu;
 const enable = new RegExp(
@@ -135,6 +141,15 @@ export function computerModelCandidate(text) {
   );
 }
 
+/** A lightweight gate for semantic classification, without resolving the app name. */
+export function computerIntentCandidate(text) {
+  const command = computerTaskCommand(text);
+  return !rejectsDesktopAction(text) && (
+    computerModelCandidate(text) ||
+    /^(?:open|launch|start|switch to|bring up|focus|click|tap|drag|type|paste|minimi[sz]e|maximi[sz]e|close|buka|jalankan|klik|ketik|tempel|tutup|pindah ke)\s+\S/iu.test(command)
+  );
+}
+
 export function ownerAppLaunch(text) {
   const command = computerTaskCommand(text);
   if (steamGameCommand(command)) return { name: 'Steam', single: false };
@@ -190,6 +205,11 @@ export function ownerAppLaunchFollowUp(text, previous) {
 export const computerTaskFollowUp = (text) =>
   computerAppReference(text) ||
   /^(?:continue(?:\s+(?:the|that|this)\s+task)?[.!?\s]*$|(?:open|load|show)\s+(?:(?:your|my|the|that|this)\s+)?(?:(?:most\s+)?(?:recent|latest)\s+)?project\b|(?:export|render)\s+(?:it|that|this|the project|the video)\b|продолжи(?:ть)?(?:\s+(?:задачу|это))?[.!?\s]*$|(?:открой|загрузи)\s+(?:(?:мой|этот|последний|текущий)\s+)?проект\b)/iu.test(
+    requestText(text),
+  );
+
+export const computerTaskRetry = (text) =>
+  /^(?:(?:can|could|would)\s+(?:you|u)\s+)?(?:do\s+(?:it|that)\s+again|try\s+again|retry|coba\s+lagi)(?:[.,?!\s]+(?:try\s+again|i\s+already\s+(?:gave|give)\s+(?:you|u)\s+access))*[.!?\s]*$/iu.test(
     requestText(text),
   );
 
@@ -383,6 +403,13 @@ export const mentionsDiscord = (text) =>
     String(text).normalize('NFKC'),
   );
 
+export function discordSpeechNeedsDestination(text) {
+  const request = requestText(text)
+    .replace(/^(?:ok|okay)[,\s]+/iu, '')
+    .replace(/^(?:can|could|would)\s+(?:you|u)\s+/iu, '');
+  return /^(?:talk|speak)\s+(?:in|inside)\s+(?:(?:my|the)\s+)?discord\s+chan{1,2}el\s*[?.!,\s]+(?:and\s+)?say\s+\S/iu.test(request);
+}
+
 function authorizedDiscordCommand(text) {
   // A quoted command is data. Questions and less familiar phrasing go through
   // the multilingual intent classifier, including polite action questions.
@@ -390,6 +417,16 @@ function authorizedDiscordCommand(text) {
     .normalize('NFKC')
     .replace(/"[^"\n]*"|“[^”\n]*”|«[^»\n]*»/gu, '');
   const addressed = unquoted.trim().replace(prefix, '');
+  // A capability question can introduce a separate, concrete owner request.
+  const followUp = addressed.replace(
+    /^(?:do\s+(?:you|u)\s+can|can\s+(?:you|u)|do\s+(?:you|u)\s+have\s+access\s+to)\s+(?:(?:control{1,2}|use)\s+)?(?:my|the)\s+(?:computer|pc)\s*[?？]+[.\s]+/iu,
+    '',
+  );
+  const opening = requestText(followUp.replace(/^can\s+u\s+/iu, ''));
+  if (
+    /^(?:open|launch|start)\s+(?:(?:my|the)\s+)?discord\s+(?:and\s+(?:then\s+)?|then\s+)(?:say|send|post|type|write)\b/iu.test(opening)
+  )
+    return true;
   if (
     !mentionsDiscord(unquoted) ||
     /[?？]|^(?:(?:can|could|would)\s+you(?!\p{L})|(?:можешь|можете)(?!\p{L}))/iu.test(addressed)

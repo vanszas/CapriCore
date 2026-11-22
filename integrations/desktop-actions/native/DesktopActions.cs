@@ -337,7 +337,7 @@ class DesktopActions {
             if(!new[]{"computer_click","computer_pointer"}.Contains(Text(q,"action")))throw new InvalidOperationException("Only observed pointer input is supported on the taskbar.");
             var origin=new Dictionary<string,object>(q);origin.Remove("surface");origin["windowId"]=Text(q,"originWindowId");origin["processId"]=Text(q,"originProcessId");origin["startedAtTicks"]=Text(q,"originStartedAtTicks");InputTarget(origin,beforeInput);
             if(!TaskbarWindow(window))throw new InvalidOperationException("The observed taskbar is no longer available.");
-        }else if(GetForegroundWindow()!=window){
+        }else if(!Flag(q,"backgroundOnly")&&GetForegroundWindow()!=window){
             const string message="The foreground window changed. Observe it again before input.";
             if(beforeInput)throw new InputPreflightException("COMPUTER_FOREGROUND_CHANGED",message);
             throw new InvalidOperationException(message);
@@ -347,6 +347,9 @@ class DesktopActions {
         if(!ComputerProcessAllowed(pid,0))throw new InputPreflightException("COMPUTER_APPLICATION_UNAVAILABLE","The target application identity could not be verified for input. Select another application and observe it again. No input was sent.");
         using(var process=Process.GetProcessById((int)pid))if(process.StartTime.ToUniversalTime().Ticks.ToString()!=Text(q,"startedAtTicks"))throw new InvalidOperationException("The target process restarted.");
         return window;
+    }
+    static bool Flag(Dictionary<string,object> q,string key) {
+        object value;return q.TryGetValue(key,out value)&&Object.Equals(value,true);
     }
     static bool TaskbarWindow(IntPtr window){
         var name=new StringBuilder(128);GetClassName(window,name,name.Capacity);
@@ -672,7 +675,21 @@ class DesktopActions {
                 if(button=="left"||button=="right"||button=="middle")try{Inject(new Input{type=0,value=new InputUnion{mouse=new MouseInput{flags=button=="right"?16u:button=="middle"?64u:4u}}});}catch{}
                 return D("ok",true,"released",true);
             }
+            bool background=Flag(q,"backgroundOnly");
+            if(background&&(Text(q,"surface")=="taskbar"||!(action=="computer_click"||action=="computer_type")))
+                throw new InputPreflightException("COMPUTER_BACKGROUND_UNAVAILABLE","This action needs foreground input. No input was sent.");
             var target=InputTarget(q,true);
+            if(background&&action=="computer_click") {
+                if(Text(q,"button")!="left"||Convert.ToInt32(q["clickCount"])!=1||Text(q,"controlId").Length==0)
+                    throw new InputPreflightException("COMPUTER_BACKGROUND_UNAVAILABLE","Background click requires a single left click on a native control. No input was sent.");
+                var element=ObservedElements(target).FirstOrDefault(e=>RuntimeId(e)==Text(q,"controlId"));
+                object invoke;
+                if(element==null||!element.Current.IsEnabled||element.Current.IsOffscreen||
+                    !element.TryGetCurrentPattern(InvokePattern.Pattern,out invoke))
+                    throw new InputPreflightException("COMPUTER_BACKGROUND_UNAVAILABLE","The observed control does not support background activation. No input was sent.");
+                ((InvokePattern)invoke).Invoke();
+                return D("ok",true,"confirmation","Invoked the observed control without moving the cursor. Verify the result.");
+            }
             if(action=="computer_type") {
                 string text=Text(q,"text");if(text.Length<1||text.Length>4000)throw new InvalidOperationException("Invalid input text.");
                 var tree=AutomationElement.FromHandle(target);if(tree==null)throw new InvalidOperationException("The target window closed.");
@@ -687,6 +704,14 @@ class DesktopActions {
                 var pattern=(ValuePattern)field.GetCurrentPattern(ValuePattern.Pattern);
                 string next=Text(q,"mode")=="append"?pattern.Current.Value+text:text;
                 if(next.Length>8000)throw new InvalidOperationException("The resulting text is too long.");
+                if(background) {
+                    if(Text(q,"expectedDiscordPaneId").Length>0||pattern.Current.IsReadOnly||field.Current.HasKeyboardFocus)
+                        throw new InputPreflightException("COMPUTER_BACKGROUND_UNAVAILABLE","The field is protected, read-only or currently has keyboard focus. No input was sent.");
+                    pattern.SetValue(next);
+                    if(pattern.Current.Value.Replace("\r\n","\n")!=next.Replace("\r\n","\n"))
+                        throw new InvalidOperationException("Background text entry could not be verified. Check the field before retrying.");
+                    return D("ok",true,"typed",true,"submitted",false,"windowId",Text(q,"windowId"),"confirmation","Set and verified the observed field without taking keyboard focus.");
+                }
                 field=TypeObservedField(q,target,field,text);pattern=(ValuePattern)field.GetCurrentPattern(ValuePattern.Pattern);
                 var timer=Stopwatch.StartNew();
                 // Long real Unicode input can still be queued by Windows after
@@ -1031,6 +1056,7 @@ class DesktopActions {
         catch(UnauthorizedAccessException){return false;}catch(System.ComponentModel.Win32Exception){return false;}
     }
     static IntPtr ComputerObservationWindow(Dictionary<string,object> q) {
+        if(Flag(q,"backgroundOnly")&&Text(q,"windowId").Length>0)return InputTarget(q,true);
         var foreground=GetForegroundWindow();
         if(foreground==IntPtr.Zero)throw new InvalidOperationException("No foreground window is available.");
         uint ignored,pid;UInt32.TryParse(Text(q,"ignoreProcessId"),out ignored);
@@ -1053,7 +1079,7 @@ class DesktopActions {
             target=window;return false;
         },IntPtr.Zero);
         if(target==IntPtr.Zero)throw new InputPreflightException("COMPUTER_APPLICATION_UNAVAILABLE","Open the application you want Capri to control. No input was sent.");
-        if(!FocusApplication(target))throw new InputPreflightException("COMPUTER_FOREGROUND_CHANGED","The application behind Capri could not take focus. Select it and try again. No input was sent.");
+        if(!Flag(q,"backgroundOnly")&&!FocusApplication(target))throw new InputPreflightException("COMPUTER_FOREGROUND_CHANGED","The application behind Capri could not take focus. Select it and try again. No input was sent.");
         return target;
     }
     delegate bool EnumWindowProc(IntPtr handle,IntPtr state);

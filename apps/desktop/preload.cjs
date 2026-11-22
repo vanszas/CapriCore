@@ -38,6 +38,8 @@ contextBridge.exposeInMainWorld(
     runComputerTask: (text) => ipcRenderer.invoke('capri:computer-task', text),
     setComputerAccess: (enabled) => ipcRenderer.invoke('capri:computer-access-set', enabled),
     inferenceApiStatus: () => ipcRenderer.invoke('capri:inference-api-status'),
+    smartRouterStatus: () => ipcRenderer.invoke('capri:smart-router-status'),
+    saveSmartRouter: (value) => ipcRenderer.invoke('capri:smart-router-save', value),
     setLocalModelLoad: (value) => ipcRenderer.invoke('capri:local-model-load-set', value),
     discoverAiProviders: (refresh = false) => ipcRenderer.invoke('capri:desktop-ai-scan', refresh),
     chatGPTPlan: (value) => ipcRenderer.invoke('capri:chatgpt-plan', value),

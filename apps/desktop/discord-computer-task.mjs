@@ -124,7 +124,6 @@ export async function runDiscordComputerTask({
     } catch (error) {
       checkpoint();
       if (
-        parsed.action !== 'send_current_message' ||
         inputAttempted ||
         !launch ||
         error.code !== 'COMPUTER_APPLICATION_UNAVAILABLE'
@@ -170,13 +169,12 @@ export async function runDiscordComputerTask({
           const launched = await launch('Discord', combined);
           checkpoint();
           if (
-            parsed.action === 'send_current_message' &&
-            (launched?.ok === false || launched?.needsApproval || launched?.needsWindow)
+            launched?.ok === false || launched?.needsApproval || launched?.needsWindow
           )
             return failure('blocked', steps, 'needs_user', {
               reason: 'discord_control_unresolved',
             });
-          if (parsed.action === 'send_current_message') launchReadyUntil = Date.now() + 5000;
+          launchReadyUntil = Date.now() + 5000;
           await delay(180, undefined, { signal: combined });
           current = await observe();
           continue;
@@ -184,10 +182,10 @@ export async function runDiscordComputerTask({
         // A newly opened voice-chat sidebar may not have exposed its native
         // composer yet. Retry reads only, before any potentially delivered input.
         if (
-          parsed.action === 'send_current_message' &&
           !inputAttempted &&
           ((launchAttempted && !discordObservation(current)) ||
-            step.reason === 'discord_current_composer_unavailable') &&
+            (parsed.action === 'send_current_message' &&
+              step.reason === 'discord_current_composer_unavailable')) &&
           (launchAttempted ? Date.now() < launchReadyUntil : composerReads++ < 3)
         ) {
           await delay(

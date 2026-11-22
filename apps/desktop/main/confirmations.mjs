@@ -6,8 +6,16 @@ export class Confirmations {
     Object.assign(this, { emit, show, now });
     this.pending = null;
   }
-  request(options) {
-    return this.choose(options).then((choice) => choice === 'confirm');
+  async request(options) {
+    if (!options.danger) return (await this.choose(options)) === 'confirm';
+    for (let step = 1; step <= 3; step++) {
+      const choice = await this.choose({
+        ...options,
+        title: `${options.title} (${step}/3)`,
+      });
+      if (choice !== 'confirm') return false;
+    }
+    return true;
   }
   /** Multi-action dialogs return an explicit choice; binary approvals stay boolean. */
   choose({ signal, ...options }) {

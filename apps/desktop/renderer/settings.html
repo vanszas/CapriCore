@@ -112,6 +112,20 @@
         </div>
         <button id="settings-open" class="sr-only">Settings</button>
         <div id="settings-forms">
+          <section id="smart-router-panel" class="preferences-panel" data-panel-cut="12" aria-label="Smart Router" hidden>
+            <h2>Smart Router</h2>
+            <div class="preferences-content"><div class="settings-card">
+              <label><input id="smart-router-enabled" type="checkbox" role="switch"> Enable Smart Router</label>
+              <p class="settings-help">Chat stays local. Coding and Deep thinking use the selected API. Coding context may include project files.</p>
+              <label for="smart-router-profile">API connection</label>
+              <select id="smart-router-profile"></select>
+              <label for="smart-router-model">API model ID</label>
+              <input id="smart-router-model" type="text" maxlength="128" spellcheck="false" autocomplete="off" data-untranslated>
+              <label><input id="smart-router-fallback" type="checkbox" role="switch"> Fall back to local when the API refuses</label>
+              <p id="smart-router-status" role="status"></p>
+              <button id="smart-router-save" type="button">Save Smart Router</button>
+            </div></div>
+          </section>
           <section id="agent-remote-panel" class="preferences-panel" data-panel-cut="12" aria-label="Agent Remote" hidden>
             <h2>Agent Remote</h2>
             <div class="preferences-content">

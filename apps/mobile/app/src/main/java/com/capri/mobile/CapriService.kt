@@ -355,7 +355,10 @@ class CapriService : Service(), SensorEventListener, CapriAccess.Listener {
                 else miniAt = 0f
             }
             ACTION_BYE -> stopSelf()
-            ACTION_ASK -> intent.getStringExtra("text")?.let { think(it) }
+            ACTION_ASK -> intent.getStringExtra("text")?.let {
+                think(it, chatOnly = intent.getBooleanExtra("chatOnly", false),
+                    speakReply = intent.getBooleanExtra("speakReply", false))
+            }
             ACTION_TYPE -> { wake(); openBox() }
             ACTION_BRAIN -> loadBrain(quiet = false)
             ACTION_MIC -> startForegroundNow()  // same notification, now also allowed to use the mic
@@ -1218,10 +1221,10 @@ class CapriService : Service(), SensorEventListener, CapriAccess.Listener {
         return true
     }
 
-    private fun think(text: String) {
+    private fun think(text: String, chatOnly: Boolean = false, speakReply: Boolean = false) {
         lastTouch = now
-        if (own(text)) return
-        if (rx("\\b(go to sleep|take a nap|nap time|go nap)\\b|vete a dormir|toma una siesta|vai dormir|" +
+        if (!chatOnly && own(text)) return
+        if (!chatOnly && rx("\\b(go to sleep|take a nap|nap time|go nap)\\b|vete a dormir|toma una siesta|vai dormir|" +
             "va dormir|va faire une sieste|vai a dormire|fai un pisolino|geh schlafen|mach ein nickerchen|id[zź] spa[cć]|" +
             "иди спать|ложись спать", RegexOption.IGNORE_CASE).containsMatchIn(text)) {
             say(tr("Fine. Wake me when it's fun.")); handler.postDelayed({ nap() }, 1500); return
@@ -1231,18 +1234,21 @@ class CapriService : Service(), SensorEventListener, CapriAccess.Listener {
             say(if (brain.loading) tr("Still booting my brain, choom. Give me a sec.") else tr("I've got no brain yet. Grab one in my app."))
             return
         }
-        if (brain.busy) return
-        if (LOOK.containsMatchIn(text)) { look(text); return }
+        if (brain.busy) {
+            if (chatOnly) say(tr("Capri is still answering. Try again in a moment."), you = text)
+            return
+        }
+        if (!chatOnly && LOOK.containsMatchIn(text)) { look(text); return }
         say("...", you = text, hold = true)
-        val access = CapriAccess.instance
+        val access = if (chatOnly) null else CapriAccess.instance
         val prompt = if (access != null && PhoneControl.looksLikePhoneTask(text)) {
             PhoneControl.buildPhoneContextPrompt(text, access)
         } else text
         brain.ask(prompt, live = { say(it, you = text, hold = true, live = true) }) { rawReply ->
             handler.post {
-                val reply = if (rawReply.isNotBlank()) PhoneControl.executeAndStripActions(this, rawReply) else ""
+                val reply = if (chatOnly) rawReply else PhoneControl.executeAndStripActions(this, rawReply)
                 lastReply = reply
-                say(reply.ifEmpty { failed(tr("My brain fizzled. Say that again?")) }, you = text)
+                say(reply.ifEmpty { failed(tr("My brain fizzled. Say that again?")) }, you = text, speakReply = speakReply)
             }
         }
     }
@@ -1644,11 +1650,11 @@ class CapriService : Service(), SensorEventListener, CapriAccess.Listener {
      * Her bubble. [you]: your line above hers (when she's answering you). [hold]: stays up until replaced (listening,
      * thinking). [live]: the same reply grown longer, so the letters already typed stay typed.
      */
-    private fun say(text: String, you: String = "", hold: Boolean = false, live: Boolean = false) {
+    private fun say(text: String, you: String = "", hold: Boolean = false, live: Boolean = false, speakReply: Boolean = false) {
         if (silent) return
         val asked = hold || you.isNotEmpty() || now - lastTouch < 3f  // answers to you show even with Talk off
         if (!prefs.talk && !asked) return
-        if (!hold && !live && prefs.voice && text.isNotBlank() && text != "...") {
+        if (!hold && !live && (prefs.voice || speakReply) && text.isNotBlank() && text != "...") {
             (speaker ?: Speaker(this).also { speaker = it }).speak(text)
         }
         if (chatOpen && you.isNotEmpty()) { chatLine = text; return }  // you're talking to her in the app

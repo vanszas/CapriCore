@@ -638,6 +638,81 @@ test('opening Chrome cannot hide a later failed typing step behind an opening re
   assert.equal(events.at(-1).assistant.text, 'Chrome is open, but no text was entered.');
 });
 
+test('bare Discord voice follow-ups use the current message language without calling the model', async () => {
+  const transcript = store();
+  const id = randomUUID();
+  transcript.put({
+    id,
+    turnId: id,
+    role: 'user',
+    status: 'complete',
+    createdAt: new Date().toISOString(),
+    text: 'Send "Hai, guys!" in Discord #general on server "Monokotil Studio". USER YOUR VOICE',
+  });
+  let language = 'en';
+  const service = client({
+    store: transcript,
+    interfaceState: () => ({ fullComputerAccess: true, languages: { conversation: language } }),
+    fetchImpl: () => assert.fail('Capability explanation should bypass the model'),
+  });
+  for (const [question, fallback, expected] of [
+    ['kenapa', 'en', /virtual audio cable yang dipilih/u],
+    ['Why?', 'id', /virtual audio cable selected/u],
+  ]) {
+    language = fallback;
+    const events = [];
+    await service.send({ id: randomUUID(), text: question }, (e) => events.push(e));
+    assert.equal(events.at(-1).type, 'turn.completed');
+    assert.match(events.at(-1).assistant.text, expected);
+  }
+});
+
+test('Discord microphone follow-ups report live call output separately from Discord connection', async () => {
+  const transcript = store();
+  for (const text of [
+    'Send "Hai, guys!" in Discord #general on server "Monokotil Studio". USER YOUR VOICE',
+    'kan bisa pakai ini',
+    'ya kan tinggal ambil alih mic saya terus bicara',
+  ]) {
+    const id = randomUUID();
+    transcript.put({ id, turnId: id, role: 'user', status: 'complete', text, createdAt: new Date().toISOString() });
+  }
+  let outputReady = false;
+  const service = client({
+    store: transcript,
+    interfaceState: () => ({ microphone: true, callAudio: { outputReady, shareReplies: outputReady } }),
+    fetchImpl: () => assert.fail('The call audio status should bypass the model'),
+  });
+  for (const [ready, expected] of [[false, /Output Voice calls Capri belum aktif/u], [true, /Bagikan balasan aktif/u]]) {
+    outputReady = ready;
+    const events = [];
+    await service.send({ id: randomUUID(), text: 'UDAH TAK BERI AKSES LHOOO' }, (event) => events.push(event));
+    assert.equal(events.at(-1).type, 'turn.completed');
+    assert.match(events.at(-1).assistant.text, expected);
+    assert.doesNotMatch(events.at(-1).assistant.text, /belum bisa diverifikasi online|tidak punya koneksi/u);
+  }
+});
+
+test('unverified Discord claims never reach the streamed reply', async () => {
+  const events = [];
+  const service = client({
+    interfaceState: () => ({ fullComputerAccess: true, languages: { conversation: 'id' } }),
+    computerTask: () => assert.fail('A description of Discord must not run a computer task'),
+    fetchImpl: async () => new Response(
+      packet('Chat ini tidak punya alat untuk mengendalikan Dis') +
+      packet('cord. Discord belum terhubung sebagai tujuan suara. Info terbaru belum bisa kuverifikasi online. Saya sudah mengirim pesan. ') +
+      'data: [DONE]\n\n',
+      { headers: { 'content-type': 'text/event-stream' } },
+    ),
+  });
+  await service.send({ id: randomUUID(), text: 'Discord adalah aplikasi apa?' }, (e) => events.push(e));
+  assert.equal(events.at(-1).type, 'turn.completed');
+  assert.equal(events.at(-1).assistant.text, 'Capri belum punya hasil terverifikasi untuk permintaan ini.');
+  assert.deepEqual(events.filter((e) => e.type === 'turn.delta').map((e) => e.text), [
+    'Capri belum punya hasil terverifikasi untuk permintaan ini.',
+  ]);
+});
+
 test('an incomplete computer task reports the executor result instead of asking for access again', async () => {
   const events = [];
   const service = client({
@@ -1781,6 +1856,34 @@ test('reviewing supplied code uses text only, while a request to edit a file kee
   ])
     await service.send({ id: randomUUID(), text }, () => {});
   assert.deepEqual(scopes, ['dialogue', 'dialogue', undefined]);
+});
+
+test('Smart Router keeps ordinary chat local and sends multilingual coding and Deep thinking to its API', async () => {
+  const calls = [];
+  let enabled = true;
+  const service = client({
+    smartRouter: () => enabled ? {
+      fallback: false,
+      request: async (payload) => {
+        calls.push(['api', payload.messages.at(-1).content]);
+        return response('API reply.');
+      },
+    } : null,
+    directLocalDialogue: async (payload) => {
+      calls.push(['local', payload.messages.at(-1).content]);
+      return response('Local reply.');
+    },
+    fetchImpl: async () => {
+      calls.push(['local gateway']);
+      return response('Gateway reply.');
+    },
+  });
+  for (const text of ['Hello!', 'Tolong debug kode ini.', '修复这段代码。'])
+    await service.send({ id: randomUUID(), text }, () => {});
+  await service.send({ id: randomUUID(), text: 'Compare these options.', thinking: true }, () => {});
+  enabled = false;
+  await service.send({ id: randomUUID(), text: 'Please debug this.' }, () => {});
+  assert.deepEqual(calls.map(([route]) => route), ['local', 'api', 'api', 'api', 'local gateway']);
 });
 
 test('standalone greetings bypass stale agent context and complete despite a presentation error', async () => {

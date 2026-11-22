@@ -29,6 +29,10 @@ const DEFAULT = {
 };
 const LEGACY_PROFILE = 'legacy';
 const MAX_PROFILES = 20;
+const policyCodes = new Set(['content_filter', 'content_policy_violation', 'safety_violation', 'model_refusal']);
+const policyRefusal = () => Object.assign(new Error('The selected API model declined this request.'), {
+  code: 'model_refusal', providerStatus: 422,
+});
 const OPENROUTER_ORIGIN = 'https://openrouter.ai';
 const GROQ_ORIGIN = 'https://api.groq.com';
 const ANTHROPIC_ORIGIN = 'https://api.anthropic.com';
@@ -630,7 +634,8 @@ function completionEvent(packet) {
       toolIndexes.add(toolIndex);
       return { ...call, index: toolIndex };
     });
-    if (!message.content?.trim() && !tools?.length && !message.refusal?.trim())
+    if (!message.content?.trim() && !tools?.length && !message.refusal?.trim() &&
+        choice.finish_reason !== 'content_filter')
       throw invalidCompletion();
     const { message: _, ...rest } = choice;
     return {
@@ -762,6 +767,7 @@ export class InferenceApi {
     this.file = path.join(root, 'data/secrets/inference-api.json');
     this.profilesFile = path.join(root, 'data/secrets/inference-api-profiles.json');
     this.settingsFile = path.join(root, 'data/desktop/inference-api.json');
+    this.smartRouterFile = path.join(root, 'data/desktop/smart-router.json');
     this.proxyToken = randomBytes(32).toString('hex');
     this.controllers = new Set();
     this.lastFailure = null;
@@ -919,6 +925,85 @@ export class InferenceApi {
             : Boolean(credential) || !requiresKey(settings),
       })),
     };
+  }
+  smartRouterSettings() {
+    const saved = readRecord(this.smartRouterFile, 8192);
+    return saved ?? { enabled: false, profileId: '', model: '', fallback: false };
+  }
+  validateSmartRouter(value) {
+    if (typeof value?.enabled !== 'boolean' || typeof value.fallback !== 'boolean' ||
+        typeof value.profileId !== 'string' || value.profileId.length > 36 ||
+        typeof value.model !== 'string' || value.model.length > 128)
+      throw new Error('Invalid Smart Router settings.');
+    const next = { enabled: value.enabled, profileId: value.profileId, model: value.model.trim(), fallback: value.fallback };
+    if (next.enabled) {
+      const profile = this.profile(next.profileId);
+      if (!next.model) throw new Error('Enter an API model ID.');
+      apiSettings({ ...profile.settings, model: next.model });
+      if (profile.settings.authMode !== 'chatgpt' && requiresKey(profile.settings) && !profile.credential)
+        throw new Error('Save an API key for this connection first.');
+    }
+    return next;
+  }
+  saveSmartRouter(value) {
+    const next = this.validateSmartRouter(value);
+    noLinks(this.smartRouterFile);
+    writeJsonAtomic(this.smartRouterFile, next);
+    return next;
+  }
+  async smartRouterAuxiliary(router, options, local, { vision = false, localVision = false } = {}) {
+    if (vision && !this.profile(router.profileId).settings.vision) return local();
+    const recoverVision = vision && localVision && router.fallback;
+    let response;
+    try {
+      response = await this.smartRouterRequest(router, '/api/chat', options);
+    } catch (error) {
+      options.signal?.throwIfAborted();
+      if (recoverVision) return local();
+      throw error;
+    }
+    if (recoverVision && (response.status === 429 || response.status >= 500)) {
+      await response.body?.cancel();
+      return local();
+    }
+    if (response.status !== 422 && !(vision && [400, 404, 415].includes(response.status))) return response;
+    const packet = await response.json();
+    const code = packet.error?.code;
+    if (router.fallback && (!vision || localVision) &&
+        (code === 'model_refusal' || (vision && code === 'model_images_unsupported')))
+      return local();
+    if (!vision && code === 'model_refusal')
+      throw new Error('The selected API model declined this request.');
+    return Response.json(packet, { status: response.status });
+  }
+  async smartRouterRequest(router, route, options) {
+    const { settings, credential } = this.profile(router.profileId);
+    const config = apiSettings({ ...settings, model: router.model });
+    const identity = JSON.stringify([config, credential]);
+    if (this.smartProxy?.identity !== identity) {
+      this.closeSmartRouter();
+      const proxy = new InferenceApi({
+        root: this.root, storage: this.storage, fetchImpl: this.fetchImpl,
+        proxySession: this.proxySession, chatgpt: this.chatgpt, config,
+      });
+      proxy.activeCredential = credential;
+      proxy.activeCredentialError = false;
+      proxy.detectPolicyRefusal = true;
+      const ready = proxy.start(0);
+      this.smartProxy = { identity, proxy, ready };
+      void ready.catch(() => {
+        if (this.smartProxy?.proxy === proxy) this.smartProxy = null;
+      });
+    }
+    const { proxy, ready } = this.smartProxy;
+    await ready;
+    options.signal?.throwIfAborted();
+    return proxy.localFetch(proxy.url + route, options);
+  }
+  closeSmartRouter() {
+    const active = this.smartProxy;
+    this.smartProxy = null;
+    if (active) void active.ready.then(() => active.proxy.close(), () => {});
   }
   async saveProfile({ id, settings, name = '', key }, beforeCommit = () => {}) {
     const previousSave = this.pendingProfileSave;
@@ -1222,14 +1307,24 @@ export class InferenceApi {
       throw failure;
     }
     if (!response.ok || !response.body) {
+      if (this.detectPolicyRefusal && [400, 403, 422, 451].includes(response.status) && response.body) {
+        const error = await providerErrorText(response.clone().body, signal)
+          .then((body) => JSON.parse(body).error).catch(() => null);
+        signal.throwIfAborted();
+        if (policyCodes.has(error?.code) || policyCodes.has(error?.type)) {
+          await response.body.cancel();
+          throw policyRefusal();
+        }
+      }
       if (
         hasImageInput(payload) &&
         [400, 404, 415, 422].includes(response.status) &&
         response.body &&
+        !response.bodyUsed &&
         (await providerRejectsImages(response, signal))
       )
         throw imagesUnsupported();
-      await response.body?.cancel();
+      if (!response.bodyUsed) await response.body?.cancel();
       const failure = Object.assign(
         new Error(
           PROVIDER_ERRORS[response.status] ??
@@ -1416,6 +1511,8 @@ export class InferenceApi {
           const raw = key ? serialized.replaceAll(key, '[REDACTED]') : serialized;
           const result = JSON.parse(raw);
           if (ollama) {
+            if (this.detectPolicyRefusal && Array.isArray(result.choices) && result.choices.some((choice) =>
+              choice?.message?.refusal || policyCodes.has(choice?.finish_reason))) throw policyRefusal();
             const message = result.choices?.[0]?.message;
             if (!message || message.tool_calls?.length)
               throw new Error('API model returned an invalid tool-free response.');
@@ -1492,7 +1589,7 @@ export class InferenceApi {
               error: {
                 message,
                 ...(unsupportedImages ? { code: 'model_images_unsupported' } : {}),
-                ...(!unsupportedImages ? { code: this.lastFailure.code } : {}),
+                ...(!unsupportedImages ? { code: error.code === 'model_refusal' ? error.code : this.lastFailure.code } : {}),
               },
             }),
           );
@@ -1510,6 +1607,7 @@ export class InferenceApi {
     this.url = 'http://127.0.0.1:' + server.address().port;
   }
   close() {
+    this.closeSmartRouter();
     for (const controller of this.controllers) controller.abort();
     this.server?.closeAllConnections();
     this.server?.close();

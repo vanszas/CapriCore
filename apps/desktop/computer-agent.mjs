@@ -20,7 +20,8 @@ import {
   ownerRequestsWeb,
   taskbarApplication,
 } from './computer-task-scope.mjs';
-import { discordTaskRequest } from './discord-application.mjs';
+import { DISCORD_VOICE_MESSAGE_UNAVAILABLE, discordTaskRequest, discordVoiceMessageReply } from './discord-application.mjs';
+import { chatReplyLanguage } from './language-context.mjs';
 import {
   discordLaunchBeforeBrowser,
   discordRequestProblem,
@@ -444,6 +445,13 @@ export class ComputerAgent {
     return null;
   }
   async applicationStep(step, goal, view, signal, { requireUnique = false } = {}) {
+    if (this.control.backgroundOnly) {
+      return {
+        ok: false,
+        inputPerformed: false,
+        instruction: 'Open the target app yourself and start a new task. Background control cannot launch or activate a window or use browser keyboard shortcuts.',
+      };
+    }
     // A model-generated title is not a window selection by the owner. In particular,
     // "Google Chrome" is an app name, not the title of its currently open tab.
     const ownerTitle =
@@ -761,6 +769,19 @@ export class ComputerAgent {
     const callTask = callTaskRequest(goal);
     const discordAllowed = mentionsDiscord(goal);
     const discordRequest = discordTaskRequest(goal);
+    if (discordRequest?.code === DISCORD_VOICE_MESSAGE_UNAVAILABLE)
+      return { ok: false, status: 'needs_user', steps: 0,
+        summary: discordVoiceMessageReply(chatReplyLanguage(goal, this.language())) };
+    if (this.control.backgroundOnly && discordRequest?.action === 'clarify')
+      return { ok: false, status: 'needs_user', steps: 0, summary: discordRequest.reason };
+    if (this.control.backgroundOnly && ['send_message', 'send_current_message'].includes(discordRequest?.action)) {
+      return {
+        ok: false,
+        status: 'needs_user',
+        steps: 0,
+        summary: 'Discord message sending currently needs keyboard input. Background control left your keyboard and Discord message untouched.',
+      };
+    }
     if (callTask && (!ownerRequestedCall || callTask.action === 'clarify'))
       return callTaskNeedsOwner(this.language());
     this.running = true;
@@ -897,6 +918,8 @@ export class ComputerAgent {
         };
       }
       const runCyberpunkSteam = async (playAlreadyRequested = false) => {
+        if (this.control.backgroundOnly)
+          return terminal({ ok: false, status: 'needs_user', steps, summary: 'Open the game yourself. Background control leaves the foreground untouched.' });
         this.activeAction = 'steam_launch';
         this.progress(playAlreadyRequested ? 'verifying' : 'acting', steps);
         let launcherFocusAttempts = 0;
@@ -1087,7 +1110,7 @@ export class ComputerAgent {
             !steamRequest.installIfMissing))
       )
         return await runCyberpunkSteam();
-      if (steamRequest && this.steamGameTask) {
+      if (steamRequest && this.steamGameTask && !this.control.backgroundOnly) {
         this.activeAction = 'steam_game';
         const result = await this.steamGameTask(steamRequest, {
           signal: combined,
@@ -2847,6 +2870,12 @@ export class ComputerAgent {
         return terminal(
           { ok: false, status: 'incomplete', steps, summary: this.message(reasonAtStartup) },
           reasonAtStartup,
+        );
+      }
+      if (this.control.backgroundOnly && !signal?.aborted && session?.controller.signal.aborted) {
+        return terminal(
+          { ok: false, status: 'cancelled', steps, summary: 'Background computer control stopped before it could verify the result.' },
+          'cancelled',
         );
       }
       if (

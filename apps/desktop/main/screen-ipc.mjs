@@ -17,6 +17,7 @@ export function registerScreenIpc(
     root,
     requireEnabled = () => {},
     screenVisionAvailable = true,
+    canReadScreen = () => screenVisionAvailable,
     capturePolicy,
     screenObservation,
     screenPreviews,
@@ -81,19 +82,19 @@ export function registerScreenIpc(
   });
   handle('capri:screen-watch-prepare', (value) => {
     requireEnabled();
-    if (!screenVisionAvailable) throw new Error(SCREEN_VISION_REQUIRED);
+    if (!canReadScreen()) throw new Error(SCREEN_VISION_REQUIRED);
     const options = observationOptions(value);
     screenPreviews.clear();
     return capturePolicy.prepare(value.sourceId, { mode: 'watch', ...options });
   });
   handle('capri:screen-watch-sample', async (value) => {
-    if (!screenVisionAvailable) return { active: false, analyse: false };
+    if (!canReadScreen()) return { active: false, analyse: false };
     if (!(await capturePolicy.checkActive(value?.captureId)))
       return { active: false, analyse: false };
     return { ...screenObservation.sample(value), active: true };
   });
   handle('capri:screen-watch-frame', (value) => {
-    if (!screenVisionAvailable) return { accepted: false };
+    if (!canReadScreen()) return { accepted: false };
     const capture = capturePolicy.capture;
     if (
       !capture ||
@@ -113,7 +114,7 @@ export function registerScreenIpc(
   });
   handle('capri:screen-watch-ask', (value) => {
     requireEnabled();
-    if (!screenVisionAvailable) throw new Error(SCREEN_VISION_REQUIRED);
+    if (!canReadScreen()) throw new Error(SCREEN_VISION_REQUIRED);
     const capture = capturePolicy.capture;
     if (
       !capture ||

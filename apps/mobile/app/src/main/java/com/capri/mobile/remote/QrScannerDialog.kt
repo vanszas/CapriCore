@@ -225,7 +225,7 @@ fun PairPcDialog(
                     modifier = Modifier.fillMaxWidth(),
                 )
                 CapriButton(
-                    label = if (busy) tr("Connecting...") else tr("Connect"),
+                    label = if (busy) tr("Connecting… check the PC for approval") else tr("Connect"),
                     modifier = Modifier.fillMaxWidth(),
                     color = GREEN,
                     enabled = !busy && endpoint.isNotBlank() && token.isNotBlank(),

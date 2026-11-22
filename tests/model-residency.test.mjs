@@ -5,6 +5,26 @@ import { createServer } from 'node:http';
 import { ensureLanguageModelReady } from '../packages/runtime/src/providers/model-residency.mjs';
 import { MutedVoiceResidency } from '../apps/desktop/voice-residency.mjs';
 
+test('idle release leaves enabled voice alone once new work arrives', async () => {
+  let busy = false;
+  let stops = 0;
+  const residency = new MutedVoiceResidency({
+    enabled: true,
+    needed: (idle) => !idle || busy,
+    resident: () => true,
+    cancel: () => {},
+    starting: () => null,
+    stop: async () => { stops++; },
+  });
+  assert.equal(await residency.release(), false);
+  const release = residency.release({ idle: true });
+  busy = true;
+  assert.equal(await release, false);
+  busy = false;
+  assert.equal(await residency.release({ idle: true }), true);
+  assert.equal(stops, 1);
+});
+
 test('CPU preparation never warms Qwen on the GPU or mistakes a GPU runner for a CPU runner', async () => {
   let prepared;
   await ensureLanguageModelReady(

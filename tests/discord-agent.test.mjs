@@ -82,6 +82,16 @@ function fixture(initial, mutate, plan = async () => assert.fail('No model requi
   return { agent, control, state };
 }
 
+test('background Discord send reports its limitation before starting a desktop session', async () => {
+  const { agent, control, state } = fixture();
+  control.backgroundOnly = true;
+  control.begin = () => assert.fail('Unsupported Discord send must not start desktop control');
+  const result = await agent.run('Send "Hai, guys!" in Discord #general on server "Monokotil Studio".');
+  assert.equal(result.status, 'needs_user');
+  assert.match(result.summary, /needs keyboard input/);
+  assert.deepEqual(state.input, []);
+});
+
 test('exact Discord voice command uses native proof, journals one input and cleans up the granted session', async () => {
   const f = fixture(
     view([

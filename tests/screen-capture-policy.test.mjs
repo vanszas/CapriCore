@@ -41,6 +41,23 @@ function fixture() {
   };
 }
 
+test('native observation is frame bound and revoked on display changes', async () => {
+  const { policy, replaceFrame } = fixture();
+  const start = () => policy.startNativeWatch({
+    nativeId: 'screen:0:0', displayId: '0', label: 'Display', intervalMs: 30000,
+  });
+  const first = start();
+  assert.equal(await policy.checkActive(first.id), true);
+  assert.equal(policy.snapshot().audio, false);
+  policy.displayTopologyChanged();
+  assert.equal(first.controller.signal.aborted, true);
+  assert.equal(policy.snapshot().active, false);
+  const second = start();
+  replaceFrame();
+  assert.equal(await policy.checkActive(second.id), false);
+  assert.equal(second.controller.signal.aborted, true);
+});
+
 test('refresh retains the explicitly selected live source and an old stop cannot cancel its replacement', async () => {
   const f = fixture();
   const first = await f.policy.discover();

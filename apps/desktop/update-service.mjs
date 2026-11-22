@@ -34,6 +34,7 @@ import {
 } from '../../packages/updater/src/releases.mjs';
 import { downloadUpdate } from '../../packages/updater/src/download.mjs';
 import { stageUpdate } from '../../packages/updater/src/stage.mjs';
+import { prepareIndukRelease } from '../../packages/updater/src/induk-merge.mjs';
 import { fileHash } from '../../packages/installer/src/download.mjs';
 import { prepareUpdateHost } from '../../packages/updater/src/launcher.mjs';
 
@@ -49,6 +50,8 @@ function isExperimentalRelease(release) {
 const privateAccessMessage =
   'GitHub access is unavailable for this private repository. Connect GitHub in Updates and check your Capri invitation and token approval.';
 const automaticCheckInterval = 30 * 60_000;
+const indukUpdateMessage =
+  'This is Capri Induk with Agent Remote. Public updates are listed for reference. Update this installation with a Capri Induk build.';
 
 export function validateUpdateSettings(value, automaticDefault = true) {
   if (
@@ -93,6 +96,7 @@ export class UpdateService {
       validateUpdateSettings,
     );
     const metadata = JSON.parse(readFileSync(path.join(root, 'config/release.json'), 'utf8'));
+    this.induk = metadata.distribution === 'induk';
     parseVersion(metadata.tag);
     this.current = installedUpdateVersion(root, metadata.tag);
     this.mode = 'installer';
@@ -102,12 +106,16 @@ export class UpdateService {
     } catch {
       /* A source checkout is never overwritten by the updater. */
     }
+    this.updateRestriction = this.induk && (
+      this.mode !== 'managed' || !existsSync(path.join(root, 'config/induk-update-files.json'))
+    ) ? indukUpdateMessage : null;
     this.value = {
       phase: 'idle',
       current: this.current,
       mode: this.mode,
       ...this.preferences.snapshot(),
       notification: null,
+      updateRestriction: this.updateRestriction,
     };
     this.selected = null;
     this.prepared = null;
@@ -269,7 +277,9 @@ export class UpdateService {
         installerReason: null,
         needsAccess: false,
         checkedExperimental: experimental,
-        notification: this.deferredTags.has(selected.tag_name) ? null : { tag: selected.tag_name },
+        notification: this.updateRestriction || this.deferredTags.has(selected.tag_name)
+          ? null
+          : { tag: selected.tag_name },
       });
     };
     this.automaticOperation = Promise.race([probe(), cancelled])
@@ -319,6 +329,7 @@ export class UpdateService {
               experimental: prerelease,
               notes: typeof release.body === 'string' ? release.body.slice(0, 12000) : '',
               update:
+                !this.updateRestriction &&
                 compareVersions(releaseVersion(release, repository), this.current) > 0 &&
                 Boolean(releaseAsset(release, this.mode === 'managed' ? 'source' : 'installer')),
             },
@@ -451,6 +462,7 @@ export class UpdateService {
     }
   }
   async prepare() {
+    if (this.updateRestriction) throw new Error(this.updateRestriction);
     this.cancelAutomaticCheck();
     if (this.busy()) return this.snapshot();
     if (!this.selected) throw new Error('Check for updates first.');
@@ -498,6 +510,9 @@ export class UpdateService {
         }
         this.controller.signal.throwIfAborted();
         if (installerReason || runtimeUpgradeRequired(this.root, source)) {
+          if (this.induk) {
+            throw new Error('This update changes the runtime or installer layout. A compatible Capri Induk package is required.');
+          }
           installerReason ??= 'runtimes';
           const installer = releaseAsset(this.selected, 'installer');
           if (!installer)
@@ -512,7 +527,16 @@ export class UpdateService {
           copyFileSync(archive, executable);
           this.prepared = { executable, asset: installer, archive };
           this.publish({ installerReason });
-        } else this.prepared = { source, tag: this.selected.tag_name, asset, archive };
+        } else {
+          const tag = this.selected.tag_name;
+          if (this.induk) {
+            source = await prepareIndukRelease({
+              root: this.root, source, tag, node: this.node, signal: this.controller.signal,
+            });
+          }
+          this.controller.signal.throwIfAborted();
+          this.prepared = { source, tag, asset, archive };
+        }
       } else {
         const executable = path.join(path.dirname(archive), asset.sha256 + '.exe');
         noLinks(executable);
@@ -541,6 +565,7 @@ export class UpdateService {
     return this.snapshot();
   }
   async install({ parentPid, language, shutdown }) {
+    if (this.updateRestriction) throw new Error(this.updateRestriction);
     this.cancelAutomaticCheck();
     if (this.busy() || this.installOperation) return false;
     if (!this.prepared || this.value.phase !== 'ready')

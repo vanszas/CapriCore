@@ -230,6 +230,12 @@ test('one optional launch/focus attempt is verified from the actual foreground o
     targets: [],
   });
   let launches = 0;
+  const execute = f.control.execute;
+  f.control.execute = async (...args) => {
+    if (args[0].action === 'observe' && launches && f.state.observations >= 2)
+      f.state.view = discord();
+    return execute(...args);
+  };
   const result = await runDiscordComputerTask({
     request: request(),
     control: f.control,
@@ -237,7 +243,6 @@ test('one optional launch/focus attempt is verified from the actual foreground o
       assert.equal(query, 'Discord');
       assert.equal(signal.aborted, false);
       launches++;
-      f.state.view = discord();
       return { ok: true };
     },
   });

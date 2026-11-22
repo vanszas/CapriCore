@@ -235,6 +235,52 @@ companion = new CompanionPanel({
 const models = new ModelsPanel(shared),
   updates = new UpdatesPanel({ ...shared, deferDrafts: true });
 const inference = new InferencePanel({ api, ui, onError: notice });
+const smartRouterProfile = $('smart-router-profile');
+const smartRouterModel = $('smart-router-model');
+const smartRouterEnabled = $('smart-router-enabled');
+const smartRouterFallback = $('smart-router-fallback');
+const smartRouterStatus = $('smart-router-status');
+const smartRouterSave = $('smart-router-save');
+smartRouterProfile.addEventListener('change', () => {
+  smartRouterModel.value = smartRouterProfile.selectedOptions[0]?.dataset.model ?? '';
+});
+async function openSmartRouter() {
+  smartRouterSave.disabled = true;
+  const { settings, profiles, local } = await raw.smartRouterStatus();
+  smartRouterProfile.replaceChildren(new Option(ui.text('Choose an API connection'), ''));
+  for (const profile of profiles) {
+    const option = new Option(profile.name || profile.model, profile.id);
+    option.dataset.model = profile.model;
+    smartRouterProfile.add(option);
+  }
+  smartRouterProfile.value = settings.profileId;
+  smartRouterModel.value = settings.model;
+  smartRouterEnabled.checked = settings.enabled;
+  smartRouterEnabled.disabled = !settings.enabled && !profiles.length;
+  smartRouterFallback.checked = settings.fallback;
+  smartRouterStatus.textContent = !local
+    ? ui.text('Enabling Smart Router switches from API-only mode and restarts Capri.')
+    : !profiles.length ? ui.text('Save an API connection first.') : '';
+  smartRouterSave.disabled = false;
+}
+smartRouterSave.addEventListener('click', async () => {
+  smartRouterSave.disabled = true;
+  try {
+    const value = await raw.saveSmartRouter({
+      enabled: smartRouterEnabled.checked,
+      profileId: smartRouterProfile.value,
+      model: smartRouterModel.value,
+      fallback: smartRouterFallback.checked,
+    });
+    smartRouterEnabled.checked = value.enabled;
+    smartRouterModel.value = value.model;
+    smartRouterStatus.textContent = ui.text('Saved');
+  } catch (error) {
+    smartRouterStatus.textContent = ui.text(error.message);
+  } finally {
+    smartRouterSave.disabled = false;
+  }
+});
 const voiceApi = new ExternalTtsPanel({ api, ui });
 const audioRouting = new AudioRoutingPanel({
   api: raw,
@@ -1801,7 +1847,10 @@ async function refreshAgentRemoteSettings() {
     const toggle = $('agent-remote-settings-server');
     toggle.setAttribute('aria-pressed', String(process.running));
     toggle.textContent = process.running ? 'Stop server' : 'Start server';
-    if (process.running) {
+    if (process.running && process.mode === 'desktop') {
+      state.textContent = 'Server running locally. Stop it and select Tailscale (Android) to pair a phone.';
+    }
+    if (process.running && process.mode !== 'desktop') {
       const image = await raw.agentRemoteServer('qr');
       if (generation !== agentRemoteRefreshGeneration) return;
       if (!image.src?.startsWith('data:image/png;base64,')) throw new Error('Invalid pairing QR.');
@@ -2060,6 +2109,7 @@ async function navigate(id, focus = null, match = null) {
       voiceApi.clear();
     }
     if (id === 'models') await models.open(true);
+    if (id === 'smart-router') await openSmartRouter();
     if (id !== 'api') inference.clear();
     if (id === 'api') await inference.open();
     if (id === 'knowledge') await knowledge.open({ privateMemory: false });

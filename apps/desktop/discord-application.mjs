@@ -144,6 +144,20 @@ const isConnectedStatus = (target) =>
       !/\b(?:not|disconnected|failed)\b/iu.test(target.label)));
 
 /** A deliberately narrow fast path. Unspecified names are clarified, never guessed. */
+export const DISCORD_VOICE_MESSAGE_UNAVAILABLE = 'discord_voice_message_unavailable';
+
+export function discordVoiceMessageReply(language, explain = false) {
+  if (language === 'id') return explain
+    ? 'Capri belum punya jalur untuk mengirim rekaman suara ke chat teks Discord. Untuk bicara langsung di voice channel, fitur Voice calls Capri mengalirkan audio melalui virtual audio cable yang dipilih sebagai mikrofon Discord.'
+    : 'Capri belum bisa mengirim rekaman suara ke chat teks Discord.';
+  if (language === 'ru') return explain
+    ? 'Capri пока не отправляет голосовые сообщения в текстовые каналы Discord. Для разговора в голосовом канале выберите виртуальный аудиокабель Capri в качестве микрофона Discord.'
+    : 'Capri пока не отправляет голосовые сообщения в текстовые каналы Discord.';
+  return explain
+    ? 'Capri does not have a route to post recorded voice messages in Discord text chat. For live speech in a voice channel, Capri Voice calls routes audio through a virtual audio cable selected as the Discord microphone.'
+    : 'Capri cannot post recorded voice messages in Discord text chat yet.';
+}
+
 export function discordTaskRequest(value) {
   if (typeof value !== 'string' || value.length > 8000) return null;
   const goal = value.trim();
@@ -188,6 +202,8 @@ export function discordTaskRequest(value) {
   const send =
     Boolean(current) ||
     /\b(?:send|post|write)\b|(?:^|\s)(?:напиши|отправь|опубликуй)(?=\s)/iu.test(commands);
+  if (send && /\b(?:use(?:r)?\s+(?:your|ur)\s+voice|with\s+(?:your|ur)\s+voice|voice\s+message)\b/iu.test(commands))
+    return { action: 'clarify', code: DISCORD_VOICE_MESSAGE_UNAVAILABLE, reason: discordVoiceMessageReply('en') };
   const leave = /\b(?:leave|disconnect)\b|(?:выйди|отключись|покинь)/iu.test(commands);
   const join = /\bjoin\b|(?:зайди|войди|подключись|присоединись)/iu.test(commands);
   const read = /\b(?:read|summarize)\b|(?:прочитай|перескажи|суммируй)/iu.test(commands);

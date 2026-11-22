@@ -7,7 +7,42 @@ import { root } from '../packages/runtime/src/index.mjs';
 import { isClipCommand } from '../apps/desktop/clip-command.mjs';
 import { ScreenshotFiles, screenshotDimensions } from '../apps/desktop/screenshot-files.mjs';
 import { ScreenClipFrames } from '../apps/desktop/screen-clip-frames.mjs';
+import { computerIntentClassifier } from '../apps/desktop/computer-planner.mjs';
 import { visionImage } from './fixtures/vision-image.mjs';
+
+test('screen routing uses the classifier with original owner context and rejects ungrounded follow-ups', async () => {
+  const recentTurns = [{ text: 'Kannst du den Inhalt meines Bildschirms beschreiben?', screenRead: true }];
+  const text = 'Und jetzt?';
+  let intent = 'screen_once';
+  let received;
+  const classify = computerIntentClassifier({
+    url: 'http://127.0.0.1:1',
+    model: 'fixture',
+    screenActions: true,
+    fetchImpl: async (_url, options) => {
+      const request = JSON.parse(options.body);
+      assert.deepEqual(Object.keys(request.format).sort(), [
+        'additionalProperties',
+        'properties',
+        'required',
+        'type',
+      ]);
+      assert.ok(request.format.properties.intent.enum.includes(intent));
+      const systemMessages = request.messages.filter((m) => m.role === 'system');
+      assert.ok(systemMessages.length >= 2, 'screenActions must inject a system message into messages');
+      assert.ok(systemMessages.some((m) => m.content.includes('screen_once') && m.content.includes('screen_watch')));
+      assert.ok(!systemMessages[0].content.includes('screen descriptions, '));
+      received = JSON.parse(request.messages.at(-1).content);
+      return Response.json({ done: true, message: { content: JSON.stringify({ intent, usesPrevious: true }) } });
+    },
+  });
+  assert.equal((await classify(text, { recentTurns })).intent, 'screen_once');
+  assert.equal(received.latestOwnerMessage, text);
+  assert.deepEqual(received.recentOwnerTurns, recentTurns);
+  assert.equal(await classify(text), null);
+  intent = 'screen_watch';
+  assert.equal(await classify(text, { recentTurns }), null);
+});
 
 test('only deliberate clip/screenshot requests activate the local command', () => {
   for (const text of [

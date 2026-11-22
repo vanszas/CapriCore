@@ -6,13 +6,13 @@ import android.graphics.BitmapFactory
 import android.speech.RecognizerIntent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
@@ -31,7 +31,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
@@ -44,6 +43,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -55,10 +55,12 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -86,17 +88,26 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 
 @Composable
 fun ScreenRemoteSubTab() {
     val ctx = LocalContext.current
     val io = remember { Executors.newCachedThreadPool() }
+    val pointerIo = remember { ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, LinkedBlockingQueue()) }
+    val pointerId = remember { java.util.UUID.randomUUID().toString().replace("-", "") }
+    val pendingMove = remember { arrayOfNulls<Runnable>(1) }
     var playing by remember { mutableStateOf(true) }
     var resolution by remember { mutableStateOf("720p") }
+    val prefs = remember { ctx.getSharedPreferences("remote_screen", 0) }
+    var targetFps by remember { mutableIntStateOf(prefs.getInt("fps", 20)) }
+    var mbps by remember { mutableIntStateOf(prefs.getInt("mbps", 4)) }
     var quality by remember { mutableIntStateOf(70) }
     var monitor by remember { mutableStateOf("primary") }
-    var monitors by remember { mutableStateOf<List<String>>(listOf("primary", "virtual")) }
+    var monitors by remember { mutableStateOf(mapOf("primary" to "Main monitor", "virtual" to "All monitors")) }
     var frameBitmap by remember { mutableStateOf<ImageBitmap?>(null) }
     var aspectRatio by remember { mutableFloatStateOf(16f / 9f) }
     var fps by remember { mutableIntStateOf(0) }
@@ -108,14 +119,17 @@ fun ScreenRemoteSubTab() {
     var showShortcuts by remember { mutableStateOf(false) }
     var showGamepad by remember { mutableStateOf(false) }
     var showFullscreen by remember { mutableStateOf(false) }
+    var showTrackpad by remember { mutableStateOf(false) }
 
     var cursorX by remember { mutableFloatStateOf(0.5f) }
     var cursorY by remember { mutableFloatStateOf(0.5f) }
-    var showCursor by remember { mutableStateOf(false) }
     var statusNote by remember { mutableStateOf("") }
 
     DisposableEffect(Unit) {
-        onDispose { io.shutdownNow() }
+        onDispose {
+            pointerIo.shutdownNow()
+            io.shutdownNow()
+        }
     }
 
     // Fetch monitor metadata once connected
@@ -123,29 +137,41 @@ fun ScreenRemoteSubTab() {
         if (!RemoteState.connected) return@LaunchedEffect
         withContext(Dispatchers.IO) {
             runCatching { RemoteState.client(ctx)?.screenInfo() }.getOrNull()?.let { info ->
-                val list = mutableListOf<String>()
+                val list = linkedMapOf("primary" to "Main monitor")
                 val arr = info.optJSONArray("monitors")
                 if (arr != null) {
                     for (i in 0 until arr.length()) {
                         val m = arr.optJSONObject(i)
                         val id = m?.optString("id") ?: m?.optString("name") ?: arr.optString(i)
-                        if (id.isNotBlank()) list.add(id)
+                        if (id.isNotBlank() && id !in setOf("all", "virtual")) {
+                            list[id] = m?.optString("name", id)?.ifBlank { id } ?: id
+                        }
                     }
                 }
-                if ("primary" !in list) list.add(0, "primary")
-                if ("virtual" !in list) list.add("virtual")
-                monitors = list.distinct()
+                list["virtual"] = "All monitors"
+                monitors = list
+                if (monitor !in list) monitor = "primary"
             }
         }
     }
 
     // Frame streaming loop
-    LaunchedEffect(playing, resolution, quality, monitor, RemoteState.connected) {
+    LaunchedEffect(monitor, RemoteState.connected) {
+        pendingMove[0]?.let(pointerIo::remove)
+        pendingMove[0] = null
+        cursorX = 0.5f
+        cursorY = 0.5f
+        frameBitmap = null
+        fps = 0
+        streamErr = ""
+    }
+    LaunchedEffect(playing, resolution, quality, targetFps, mbps, monitor, RemoteState.connected) {
         if (!playing || !RemoteState.connected) return@LaunchedEffect
         var frames = 0
         var lastTick = System.currentTimeMillis()
         while (playing && RemoteState.connected) {
             val client = RemoteState.client(ctx) ?: break
+            val started = android.os.SystemClock.elapsedRealtime()
             val bytes = withContext(Dispatchers.IO) {
                 runCatching { client.screenFrame(resolution, quality, monitor) }.getOrElse { e ->
                     streamErr = e.message ?: "Frame error"
@@ -168,7 +194,8 @@ fun ScreenRemoteSubTab() {
                         lastTick = now
                     }
                 }
-                delay(45L)
+                val interval = maxOf((1000L + targetFps - 1) / targetFps, (bytes.size * 8L + mbps * 1000 - 1) / (mbps * 1000))
+                delay((interval - (android.os.SystemClock.elapsedRealtime() - started)).coerceAtLeast(0L))
             } else {
                 delay(450L)
             }
@@ -176,24 +203,32 @@ fun ScreenRemoteSubTab() {
     }
 
     fun sendInput(action: String, x: Float = cursorX, y: Float = cursorY, delta: Int = 0, text: String = "", key: String = "") {
-        val nx = x.coerceIn(0f, 1f)
-        val ny = y.coerceIn(0f, 1f)
+        val nx = x.coerceIn(0f, 0.999999f)
+        val ny = y.coerceIn(0f, 0.999999f)
         cursorX = nx
         cursorY = ny
-        showCursor = true
-        io.execute {
+        val selectedMonitor = monitor
+        val pointerInput = Runnable {
             runCatching {
                 RemoteState.client(ctx)?.screenInput(
-                    action = action,
+                    action = "pointer_$action",
                     x = nx.toDouble(),
                     y = ny.toDouble(),
                     delta = delta,
                     key = key,
                     text = text,
-                    monitor = monitor,
+                    monitor = selectedMonitor,
+                    pointer = pointerId,
                 )
+            }.onFailure { error ->
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    statusNote = error.message ?: "Remote pointer unavailable"
+                }
             }
         }
+        pendingMove[0]?.let(pointerIo::remove)
+        pendingMove[0] = if (action == "move") pointerInput else null
+        pointerIo.execute(pointerInput)
     }
 
     fun sendHotkey(key: String) {
@@ -208,7 +243,7 @@ fun ScreenRemoteSubTab() {
             val said = res.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull().orEmpty()
             if (said.isNotBlank()) {
                 statusNote = "Voice → PC: $said"
-                io.execute { runCatching { RemoteState.client(ctx)?.voiceInput(said) } }
+                sendInput("type", text = said)
             }
         }
     }
@@ -230,7 +265,7 @@ fun ScreenRemoteSubTab() {
             onDismiss = { showKeyboard = false },
             onTypeText = { text -> sendInput("type", text = text) },
             onKey = { key -> sendInput("key", key = key) },
-            onHotkey = { hk -> sendHotkey(hk) },
+            onHotkey = { hk -> sendInput("hotkey", key = hk) },
         )
     }
 
@@ -250,12 +285,9 @@ fun ScreenRemoteSubTab() {
                 ScreenCanvas(
                     bitmap = frameBitmap,
                     aspectRatio = aspectRatio,
-                    cursorX = cursorX,
-                    cursorY = cursorY,
-                    showCursor = showCursor,
                     onTap = { x, y -> sendInput("click", x, y) },
                     onDoubleTap = { x, y -> sendInput("double_click", x, y) },
-                    onLongPress = { x, y -> sendInput("right_click", x, y) },
+                    onLongPress = { x, y -> sendInput("rclick", x, y) },
                     modifier = Modifier.fillMaxSize(),
                 )
                 if (showGamepad) {
@@ -268,17 +300,32 @@ fun ScreenRemoteSubTab() {
                         },
                     )
                 }
-                Row(
+                if (showTrackpad) {
+                    MovableRemoteTrackpad(
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp),
+                        aspectRatio = aspectRatio,
+                        onMove = { dx, dy -> sendInput("move", cursorX + dx, cursorY + dy) },
+                        onClick = { sendInput("click") },
+                        onRightClick = { sendInput("rclick") },
+                        onScroll = { sendInput("scroll", delta = it) },
+                        onClose = { showTrackpad = false },
+                    )
+                }
+                Column(
                     Modifier
                         .align(Alignment.TopStart)
                         .padding(12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    SmallChip(tr("Exit"), PINK, selected = true) { showFullscreen = false }
-                    SmallChip(if (showGamepad) "Gamepad ON" else "Gamepad", CYAN, selected = showGamepad) {
-                        showGamepad = !showGamepad
+                    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        SmallChip(tr("Exit"), PINK, selected = true) { showFullscreen = false }
+                        SmallChip(if (showGamepad) "Gamepad ON" else "Gamepad", CYAN, selected = showGamepad) {
+                            showGamepad = !showGamepad
+                        }
+                        SmallChip("Keys", AMBER) { showKeyboard = true }
+                        SmallChip("Trackpad", CYAN, selected = showTrackpad) { showTrackpad = !showTrackpad }
                     }
-                    SmallChip("Keys", AMBER) { showKeyboard = true }
+                    MonitorChips(monitors, monitor) { monitor = it }
                 }
             }
         }
@@ -328,6 +375,7 @@ fun ScreenRemoteSubTab() {
                 showGamepad = !showGamepad
             }
             SmallChip("⌨ Keys", INK) { showKeyboard = true }
+            SmallChip("Trackpad", CYAN, selected = showTrackpad) { showTrackpad = !showTrackpad }
             SmallChip("⚡ Shortcuts", AMBER) { showShortcuts = true }
             SmallChip("🎤 Voice→PC", GREEN) {
                 val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -336,8 +384,20 @@ fun ScreenRemoteSubTab() {
                 }
                 runCatching { voiceLauncher.launch(i) }
             }
-            for (m in monitors) {
-                SmallChip(m, CYAN, selected = monitor == m) { monitor = m }
+            for ((id, name) in monitors) {
+                SmallChip(tr(name), CYAN, selected = monitor == id) { monitor = id }
+            }
+            for (rate in listOf(5, 10, 20, 30)) {
+                SmallChip("$rate FPS", MUTED, selected = targetFps == rate) {
+                    targetFps = rate
+                    prefs.edit().putInt("fps", rate).apply()
+                }
+            }
+            for (rate in listOf(1, 2, 4, 8, 16)) {
+                SmallChip("$rate Mbps", MUTED, selected = mbps == rate) {
+                    mbps = rate
+                    prefs.edit().putInt("mbps", rate).apply()
+                }
             }
             for (r in listOf("540p", "720p", "1080p")) {
                 SmallChip(r, MUTED, selected = resolution == r) {
@@ -359,12 +419,9 @@ fun ScreenRemoteSubTab() {
             ScreenCanvas(
                 bitmap = frameBitmap,
                 aspectRatio = aspectRatio,
-                cursorX = cursorX,
-                cursorY = cursorY,
-                showCursor = showCursor,
                 onTap = { x, y -> sendInput("click", x, y) },
                 onDoubleTap = { x, y -> sendInput("double_click", x, y) },
-                onLongPress = { x, y -> sendInput("right_click", x, y) },
+                onLongPress = { x, y -> sendInput("rclick", x, y) },
                 modifier = Modifier.fillMaxSize(),
             )
             if (frameBitmap == null) {
@@ -384,6 +441,17 @@ fun ScreenRemoteSubTab() {
                     },
                 )
             }
+            if (showTrackpad && !showFullscreen) {
+                MovableRemoteTrackpad(
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp),
+                    aspectRatio = aspectRatio,
+                    onMove = { dx, dy -> sendInput("move", cursorX + dx, cursorY + dy) },
+                    onClick = { sendInput("click") },
+                    onRightClick = { sendInput("rclick") },
+                    onScroll = { sendInput("scroll", delta = it) },
+                    onClose = { showTrackpad = false },
+                )
+            }
         }
 
         // Quick Hotkeys + Scroll + Spotify Media bar
@@ -394,8 +462,6 @@ fun ScreenRemoteSubTab() {
                 .padding(bottom = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            SmallChip("Scroll ↑", CYAN) { sendInput("scroll", delta = 120) }
-            SmallChip("Scroll ↓", CYAN) { sendInput("scroll", delta = -120) }
             SmallChip("Esc", INK) { sendInput("key", key = "Escape") }
             SmallChip("Enter", INK) { sendInput("key", key = "Enter") }
             SmallChip("Alt+Tab", AMBER) { sendHotkey("alt+tab") }
@@ -420,12 +486,102 @@ fun ScreenRemoteSubTab() {
 }
 
 @Composable
+private fun MonitorChips(monitors: Map<String, String>, selected: String, onSelect: (String) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        for ((id, name) in monitors) {
+            SmallChip(tr(name), CYAN, selected = selected == id) { onSelect(id) }
+        }
+    }
+}
+
+@Composable
+private fun MovableRemoteTrackpad(
+    modifier: Modifier,
+    aspectRatio: Float,
+    onMove: (Float, Float) -> Unit,
+    onClick: () -> Unit,
+    onRightClick: () -> Unit,
+    onScroll: (Int) -> Unit,
+    onClose: () -> Unit,
+) {
+    val move by rememberUpdatedState(onMove)
+    val ratio by rememberUpdatedState(aspectRatio)
+    val click by rememberUpdatedState(onClick)
+    val rightClick by rememberUpdatedState(onRightClick)
+    var position by remember { mutableStateOf(Offset.Zero) }
+    var padSize by remember { mutableStateOf(IntSize.Zero) }
+    BoxWithConstraints(modifier.fillMaxSize()) {
+        val travelX = (constraints.maxWidth - padSize.width).coerceAtLeast(0).toFloat()
+        val travelY = (constraints.maxHeight - padSize.height).coerceAtLeast(0).toFloat()
+        Column(
+            Modifier.align(Alignment.BottomEnd)
+                .offset { IntOffset(position.x.coerceIn(-travelX, 0f).roundToInt(), position.y.coerceIn(-travelY, 0f).roundToInt()) }
+                .width(248.dp)
+                .onSizeChanged { padSize = it }
+                .background(Color.Black.copy(alpha = 0.9f)).border(1.dp, CYAN).padding(8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    tr("⠿ Trackpad"),
+                    Modifier.weight(1f).pointerInput(travelX, travelY) {
+                        detectDragGestures { change, drag ->
+                            change.consume()
+                            position = Offset(
+                                (position.x + drag.x).coerceIn(-travelX, 0f),
+                                (position.y + drag.y).coerceIn(-travelY, 0f),
+                            )
+                        }
+                    }.padding(vertical = 8.dp),
+                    color = INK,
+                    fontSize = 12.sp,
+                )
+                SmallChip(tr("Close"), MUTED, onClick = onClose)
+            }
+            Box(
+                Modifier.fillMaxWidth().height(104.dp).background(CYAN.copy(alpha = 0.15f))
+                    .pointerInput(Unit) { detectTapGestures(onTap = { click() }, onLongPress = { rightClick() }) }
+                    .pointerInput(Unit) {
+                        var pending = Offset.Zero
+                        var lastSent = 0L
+                        fun flush() {
+                            if (pending != Offset.Zero) {
+                                val scale = 1.35f / size.width.coerceAtLeast(1)
+                                move(pending.x * scale, pending.y * scale * ratio)
+                                pending = Offset.Zero
+                            }
+                        }
+                        detectDragGestures(
+                            onDragEnd = { flush() },
+                            onDragCancel = { pending = Offset.Zero },
+                        ) { change, delta ->
+                            change.consume()
+                            pending += delta
+                            val now = android.os.SystemClock.uptimeMillis()
+                            if (now - lastSent >= 24) {
+                                flush()
+                                lastSent = now
+                            }
+                        }
+                    },
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                SmallChip(tr("Left"), CYAN, onClick = onClick)
+                SmallChip(tr("Right"), CYAN, onClick = onRightClick)
+                SmallChip(tr("Scroll ↑"), CYAN) { onScroll(120) }
+                SmallChip(tr("Scroll ↓"), CYAN) { onScroll(-120) }
+            }
+        }
+    }
+}
+
+@Composable
 private fun ScreenCanvas(
     bitmap: ImageBitmap?,
     aspectRatio: Float,
-    cursorX: Float,
-    cursorY: Float,
-    showCursor: Boolean,
     onTap: (Float, Float) -> Unit,
     onDoubleTap: (Float, Float) -> Unit,
     onLongPress: (Float, Float) -> Unit,
@@ -433,6 +589,9 @@ private fun ScreenCanvas(
 ) {
     var scale by remember { mutableFloatStateOf(1f) }
     var pan by remember { mutableStateOf(Offset.Zero) }
+    val tap by rememberUpdatedState(onTap)
+    val doubleTap by rememberUpdatedState(onDoubleTap)
+    val longPress by rememberUpdatedState(onLongPress)
 
     Box(
         modifier
@@ -459,19 +618,19 @@ private fun ScreenCanvas(
                 .pointerInput(Unit) {
                     detectTapGestures(
                         onTap = { off ->
-                            onTap(
+                            tap(
                                 (off.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f),
                                 (off.y / size.height.coerceAtLeast(1)).coerceIn(0f, 1f),
                             )
                         },
                         onDoubleTap = { off ->
-                            onDoubleTap(
+                            doubleTap(
                                 (off.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f),
                                 (off.y / size.height.coerceAtLeast(1)).coerceIn(0f, 1f),
                             )
                         },
                         onLongPress = { off ->
-                            onLongPress(
+                            longPress(
                                 (off.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f),
                                 (off.y / size.height.coerceAtLeast(1)).coerceIn(0f, 1f),
                             )
@@ -485,17 +644,6 @@ private fun ScreenCanvas(
                     contentDescription = "PC Screen",
                     contentScale = ContentScale.FillBounds,
                     modifier = Modifier.fillMaxSize(),
-                )
-            }
-            if (showCursor) {
-                val px = (cursorX * constraints.maxWidth).roundToInt()
-                val py = (cursorY * constraints.maxHeight).roundToInt()
-                Box(
-                    Modifier
-                        .offset { IntOffset(px - 7, py - 7) }
-                        .size(14.dp)
-                        .background(Color(0xCCFF9100), CircleShape)
-                        .border(1.5.dp, Color.White, CircleShape),
                 )
             }
         }

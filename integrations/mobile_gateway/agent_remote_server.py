@@ -445,15 +445,17 @@ def log_pairing_event(event_type: str, client_ip: str, device_name: str, device_
         pass
 
 
-def prompt_device_pairing_sync(device_id: str, device_name: str, client_ip: str, timeout: float = 35.0) -> bool:
+def prompt_device_pairing_sync(device_id: str, device_name: str, client_ip: str, timeout: float = 35.0) -> str:
     if not device_id:
-        return False
+        return "rejected"
     if is_device_trusted(device_id):
-        return True
+        return "approved"
 
-    evt = threading.Event()
-    res_box = {"approved": False}
     with PAIRING_LOCK:
+        if device_id in PAIRING_EVENTS:
+            return "pending"
+        evt = threading.Event()
+        res_box = {"status": "timeout"}
         PAIRING_EVENTS[device_id] = (evt, res_box)
 
     log_pairing_event("PAIR REQUEST", client_ip, device_name, device_id, "Menampilkan dialog pop-up konfirmasi di PC")
@@ -465,7 +467,11 @@ def prompt_device_pairing_sync(device_id: str, device_name: str, client_ip: str,
         MB_SETFOREGROUND = 0x00010000
         IDYES = 6
         try:
-            res = ctypes.windll.user32.MessageBoxW(
+            from ctypes import wintypes
+            ask = ctypes.windll.user32.MessageBoxTimeoutW
+            ask.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT, wintypes.WORD, wintypes.DWORD]
+            ask.restype = ctypes.c_int
+            res = ask(
                 0,
                 f"Perangkat baru meminta izin koneksi ke Agent Remote:\n\n"
                 f"IP Address: {client_ip}\n"
@@ -474,21 +480,29 @@ def prompt_device_pairing_sync(device_id: str, device_name: str, client_ip: str,
                 f"Izinkan perangkat ini terhubung?",
                 "Agent Remote - Izin Perangkat Masuk",
                 MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND,
+                0,
+                int(timeout * 1000),
             )
-            approved = (res == IDYES)
-            res_box["approved"] = approved
-            if approved:
+            if res == IDYES:
                 TRUSTED_DEVICES[device_id] = {
                     "name": device_name,
                     "ip": client_ip,
                     "approved_at": time.time(),
                 }
                 save_trusted_devices(TRUSTED_DEVICES)
+                res_box["status"] = "approved"
                 log_pairing_event("PAIR APPROVED", client_ip, device_name, device_id, "Disetujui pengguna di PC")
-            else:
+            elif res == 7:
                 REJECTED_DEVICES[device_id] = time.time()
+                res_box["status"] = "rejected"
                 log_pairing_event("PAIR REJECTED", client_ip, device_name, device_id, "Ditolak pengguna di PC")
+            elif res == 32000:
+                log_pairing_event("PAIR TIMEOUT", client_ip, device_name, device_id)
+            else:
+                res_box["status"] = "unavailable"
+                log_pairing_event("PAIR ERROR", client_ip, device_name, device_id, f"Dialog returned {res}")
         except Exception as ex:
+            res_box["status"] = "unavailable"
             log_pairing_event("PAIR ERROR", client_ip, device_name, device_id, str(ex))
         finally:
             evt.set()
@@ -496,12 +510,8 @@ def prompt_device_pairing_sync(device_id: str, device_name: str, client_ip: str,
                 PAIRING_EVENTS.pop(device_id, None)
 
     threading.Thread(target=_ask_desktop, daemon=True).start()
-    evt.wait(timeout=timeout)
-    return res_box["approved"]
-
-
-def prompt_device_pairing(device_id: str, device_name: str, client_ip: str = "unknown") -> None:
-    prompt_device_pairing_sync(device_id, device_name, client_ip, timeout=0.1)
+    evt.wait(timeout=timeout + 2)
+    return res_box["status"]
 
 
 def save_server_state(workspace: Path, recent: list[str]):
@@ -2285,13 +2295,15 @@ def prompt_command(
 
 
 def codex_command(
-    text: str, model: str, attachments: list[Path], permission: str = "workspace"
+    text: str, model: str, attachments: list[Path], permission: str = "workspace",
+    native_session: str | None = None,
 ) -> list[str]:
     executable = shutil.which("codex.cmd") or shutil.which("codex.exe") or shutil.which("codex")
     if not executable:
         raise ValueError("Codex CLI is not installed")
     attachment_text = "".join(f"\n\nAttached file on PC: {path}" for path in attachments)
     command = [executable]
+    router_url = "http://127.0.0.1:20130/v1" if model == "smart-router" else NINE_ROUTER_BASE_URL
     if nine_router_mobile_key():
         command += [
             '-c',
@@ -2299,7 +2311,7 @@ def codex_command(
             '-c',
             'model_providers.9router.name="9Router"',
             '-c',
-            f'model_providers.9router.base_url={json.dumps(NINE_ROUTER_BASE_URL)}',
+            f'model_providers.9router.base_url={json.dumps(router_url)}',
             '-c',
             f'model_providers.9router.env_key="{MOBILE_KEY_ENV}"',
             '-c',
@@ -2309,27 +2321,46 @@ def codex_command(
         command += ["--ask-for-approval", "untrusted"]
     elif permission == "workspace":
         command += ["--ask-for-approval", "never"]
-    command += [
-        "exec",
-        "--json",
-        "--skip-git-repo-check",
-        "-C",
-        str(WORKSPACE),
-    ]
+    if permission != "full":
+        command += ["--sandbox", "workspace-write"]
+    command += ["-C", str(WORKSPACE)]
     if permission == "full":
         command.append("--dangerously-bypass-approvals-and-sandbox")
-    elif permission == "ask":
-        command += ["--sandbox", "workspace-write"]
-    else:
-        command += ["--sandbox", "workspace-write"]
     if model:
         command += ["-m", model]
+    command += ["exec"]
+    if native_session:
+        command.append("resume")
+    command += ["--json", "--skip-git-repo-check"]
+    if native_session:
+        command.append(native_session)
     command.append(text + attachment_text)
     return command
 
 
 def available_agents() -> list[dict]:
-    return discover_agents(HERMES)
+    agents = discover_agents(HERMES)
+    detected = {_process_agent_id(row) for row in _windows_process_rows()}
+    if os.name == "nt":
+        import winreg
+
+        for executable, agent in PC_AGENT_EXECUTABLES.items():
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(
+                        hive, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{executable}"
+                    ):
+                        detected.add(agent)
+                except OSError:
+                    pass
+    known = {agent["id"] for agent in agents}
+    for agent in agents:
+        agent["detected"] = agent["installed"] or agent["id"] in detected
+    agents.extend({
+        "id": agent, "name": PC_AGENT_DISPLAY_NAMES[agent], "installed": False,
+        "detected": True, "supports_streaming": False, "supports_tools": False,
+    } for agent in sorted(detected - known) if agent in PC_AGENT_DISPLAY_NAMES)
+    return agents
 
 
 def generic_agent_command(agent_id: str, text: str) -> list[str]:
@@ -2351,11 +2382,12 @@ def agent_command(
     model: str,
     attachments: list[Path],
     permission: str = "workspace",
+    native_session: str | None = None,
 ) -> list[str]:
     if agent_id == "hermes":
         return prompt_command(text, model, attachments, permission)
     if agent_id == "codex":
-        return codex_command(text, model, attachments, permission)
+        return codex_command(text, model, attachments, permission, native_session)
     if agent_id in {"claude", "gemini", "opencode"}:
         return generic_agent_command(agent_id, text)
     raise ValueError(f"unknown agent: {agent_id}")
@@ -2363,11 +2395,14 @@ def agent_command(
 
 
 def workspace_store(workspace: Path) -> SessionStore:
-    path = workspace / ".agent-remote" / "sessions.json"
-    legacy = workspace / ".hermes-remote" / "sessions.json"
-    if not path.exists() and legacy.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(legacy, path)
+    path = workspace / "CapriSession" / "sessions.json"
+    if not path.exists():
+        for folder in (".agent-remote", ".hermes-remote"):
+            legacy = workspace / folder / "sessions.json"
+            if legacy.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(legacy, path)
+                break
     return SessionStore(path, workspace.name)
 
 
@@ -2376,26 +2411,32 @@ RUNTIME = AgentRuntime(STORE, agent_command, WORKSPACE, agent_environment)
 
 
 def folder_listing(path_value: str) -> dict:
+    def accessible_directory(entry: Path) -> bool:
+        try:
+            return entry.is_dir()
+        except OSError:
+            return False
+
     if not path_value:
         if os.name == "nt":
             folders = [
                 {"name": f"Disk {letter}:", "path": f"{letter}:\\"}
                 for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                if Path(f"{letter}:\\").is_dir()
+                if accessible_directory(Path(f"{letter}:\\"))
             ]
         else:
             folders = [{"name": "/", "path": "/"}]
         return {"path": "", "parent": None, "folders": folders}
-    folder = Path(path_value).resolve()
-    if not folder.is_dir():
-        raise ValueError("folder not found")
     try:
+        folder = Path(path_value).resolve()
+        if not folder.is_dir():
+            raise ValueError("folder not found")
         folders = [
             {"name": child.name, "path": str(child)}
             for child in sorted(folder.iterdir(), key=lambda item: item.name.lower())
-            if child.is_dir() and not child.name.startswith(".")
+            if not child.name.startswith(".") and accessible_directory(child)
         ][:200]
-    except (OSError, PermissionError) as error:
+    except OSError as error:
         raise ValueError(f"folder cannot be opened: {error}") from error
     parent = folder.parent if folder.parent != folder else None
     return {
@@ -2491,17 +2532,6 @@ class Handler(BaseHTTPRequestHandler):
             )
             return False
 
-        if device_id and self.client_address[0] not in {"127.0.0.1", "::1"}:
-            if not is_device_trusted(device_id):
-                record_security_audit(
-                    self.client_address[0],
-                    False,
-                    self.command,
-                    self.path,
-                    self.headers.get("User-Agent", ""),
-                )
-                return False
-
         is_localhost = self.client_address[0] in {"127.0.0.1", "::1", "localhost"}
         if is_localhost:
             authorized = True
@@ -2511,14 +2541,18 @@ class Handler(BaseHTTPRequestHandler):
             auth = self.headers.get("Authorization", "").strip()
             token_hdr = self.headers.get("X-Agent-Remote-Token", "").strip()
             from urllib.parse import parse_qs, urlparse
-            query_token = parse_qs(urlparse(self.path).query).get("token", [""])[0].strip()
+            parsed_url = urlparse(self.path)
+            query_token = parse_qs(parsed_url.query).get("token", [""])[0].strip()
             expected = TOKEN.strip()
-            authorized = (
+            token_ok = (
                 auth == f"Bearer {expected}"
                 or auth == expected
                 or token_hdr == expected
                 or query_token == expected
             )
+            pairing_handshake = parsed_url.path in {"/api/status", "/api/auth/pair"}
+            device_ok = (not device_id) or is_device_trusted(device_id) or pairing_handshake
+            authorized = token_ok and device_ok
         record_security_audit(
             self.client_address[0],
             authorized,
@@ -2629,7 +2663,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if url.path == "/api/voice/models":
             try:
-                import urllib.request, sqlite3, pathlib
+                import pathlib
                 db_path = pathlib.Path.home() / "AppData/Roaming/9router/db/data.sqlite"
                 api_key = "local-key"
                 if db_path.exists():
@@ -2734,58 +2768,6 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return self._json(HTTPStatus.OK, {"ok": True, "event": ev})
 
-        if self.path.startswith("/api/models"):
-            qs = parse_qs(url.query)
-            target_url = qs.get("url", [""])[0].strip()
-            api_key = qs.get("key", [""])[0].strip()
-            auth_header = f"Bearer {api_key}" if api_key else ""
-            if not auth_header and target_url:
-                auth_header = self.headers.get("Authorization") or ""
-            if not auth_header:
-                nr_key = nine_router_mobile_key()
-                if nr_key:
-                    auth_header = f"Bearer {nr_key}"
-
-            candidates = []
-            if target_url:
-                base = target_url.rstrip("/")
-                if base.endswith("/v1"):
-                    candidates.append(f"{base}/models")
-                else:
-                    candidates.append(f"{base}/v1/models")
-                    candidates.append(f"{base}/models")
-            candidates.extend([
-                "http://127.0.0.1:20128/v1/models",
-                "http://127.0.0.1:20130/v1/models",
-                "http://127.0.0.1:20128/models",
-                "http://127.0.0.1:20130/models"
-            ])
-
-            models = []
-            last_err = ""
-            for u in candidates:
-                try:
-                    req = urllib.request.Request(u, headers={"User-Agent": "AgentRemote"})
-                    if auth_header:
-                        req.add_header("Authorization", auth_header)
-                    with urllib.request.urlopen(req, timeout=2.5) as resp:
-                        if resp.status == 200:
-                            data = json.loads(resp.read().decode())
-                            items = data.get("data") or data.get("models") or []
-                            for it in items:
-                                mid = it.get("id") or it.get("name") if isinstance(it, dict) else str(it)
-                                if mid and mid not in models:
-                                    models.append(mid)
-                            if models:
-                                break
-                except Exception as ex:
-                    last_err = str(ex)
-                    continue
-
-            if not models:
-                return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False, "error": f"Gagal fetch models dari upstream: {last_err}"})
-            return self._json(HTTPStatus.OK, {"ok": True, "models": models, "source": u})
-
         if not self._authorized():
             return self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
         url = urlparse(self.path)
@@ -2845,8 +2827,21 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/projects":
                 limit = int(query.get("limit", ["20"])[0])
                 return self._json(HTTPStatus.OK, {"projects": project_rows(limit)})
-            if url.path == "/api/models":
-                return self._json(HTTPStatus.OK, {"ok": True, "models": ["gemini-3.8-flash-high", "gemini-2.5-flash", "claude-3-7-sonnet", "gpt-4o", "qwen-2.5-72b"]})
+            if url.path in {"/api/models", "/api/router/models"}:
+                key = nine_router_mobile_key()
+                endpoint = f"{NINE_ROUTER_BASE_URL.rstrip('/')}/models"
+                request = urllib.request.Request(
+                    endpoint, headers={"Authorization": f"Bearer {key}"} if key else {}
+                )
+                try:
+                    with urllib.request.urlopen(request, timeout=4) as response:
+                        data = json.load(response)
+                    models = [item["id"] for item in data.get("data", []) if isinstance(item, dict) and item.get("id")]
+                    if url.path == "/api/models" and key and router_running() and "smart-router" not in models:
+                        models.insert(0, "smart-router")
+                    return self._json(HTTPStatus.OK, {"ok": True, "models": models})
+                except (OSError, ValueError, AttributeError):
+                    return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "9Router model catalog unavailable on PC"})
             if url.path == "/api/agents":
                 return self._json(HTTPStatus.OK, {"agents": available_agents()})
             if url.path == "/api/tasks":
@@ -2894,7 +2889,10 @@ class Handler(BaseHTTPRequestHandler):
                 qual = int(query.get("quality", ["70"])[0])
                 mon = query.get("monitor", ["primary"])[0]
                 prof = query.get("profile", [None])[0]
-                frame = STREAMER.grab_jpeg(resolution=res, quality=qual, monitor=mon, profile=prof)
+                try:
+                    frame = STREAMER.grab_jpeg(resolution=res, quality=qual, monitor=mon, profile=prof)
+                except (OSError, RuntimeError) as error:
+                    return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": f"PC screen capture failed: {error}"})
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("Content-Length", str(len(frame)))
@@ -2959,7 +2957,6 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as ex:
                     return self._json(HTTPStatus.OK, {"models": ["QODER", "ag/gemini-3.7-flash-high", "ag/claude-sonnet-4-6"]})
             if url.path == "/api/debate/config":
-                from pathlib import Path
                 cfg_file = Path.home() / ".hermes" / "hdo" / "config.json"
                 if cfg_file.exists():
                     try:
@@ -2974,23 +2971,6 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(HTTPStatus.OK, {"running": True, "data": data, "url": "http://127.0.0.1:8787"})
                 except Exception:
                     return self._json(HTTPStatus.OK, {"running": False, "url": None})
-            if url.path == "/api/router/models":
-                key = nine_router_mobile_key()
-                req = urllib.request.Request(
-                    "http://127.0.0.1:20128/v1/models",
-                    headers={"Authorization": f"Bearer {key}"} if key else {}
-                )
-                try:
-                    with urllib.request.urlopen(req, timeout=4) as resp:
-                        data = json.loads(resp.read().decode("utf-8"))
-                        model_ids = [m["id"] for m in data.get("data", [])]
-                        return self._json(HTTPStatus.OK, {"models": model_ids})
-                except Exception:
-                    return self._json(HTTPStatus.OK, {"models": [
-                        "ag/gemini-3.8-flash-high", "ag/gemini-3.7-flash-high",
-                        "ag/claude-opus-4-6-thinking", "ag/claude-sonnet-4-6",
-                        "cx/gpt-5.6-luna", "free-model", "unreal-engine", "china-model"
-                    ]})
             if url.path == "/api/router/config":
                 cfg_path = STATE_ROOT / "router_config.json"
                 default_cfg = {
@@ -3022,8 +3002,6 @@ class Handler(BaseHTTPRequestHandler):
                     {"name": "claude-code", "command": "/claude-code", "description": "Delegasikan coding task ke Claude Code CLI"},
                 ]
                 try:
-                    import os
-                    from pathlib import Path
                     dirs = [
                         Path.home() / ".hermes" / "skills",
                         Path.home() / "AppData" / "Local" / "hermes" / "profiles" / "vans" / "skills",
@@ -3045,9 +3023,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(HTTPStatus.OK, {"skills": skills_list})
             if url.path == "/api/router/status":
                 try:
-                    req = urllib.request.urlopen("http://127.0.0.1:20130/health", timeout=1.5)
-                    data = json.loads(req.read().decode("utf-8"))
-                    return self._json(HTTPStatus.OK, {"running": True, **data})
+                    with urllib.request.urlopen("http://127.0.0.1:20130/health", timeout=4) as response:
+                        data = json.load(response)
+                    return self._json(HTTPStatus.OK, {**data, "running": data.get("service") == "SmartRouterProxy"})
                 except Exception:
                     return self._json(HTTPStatus.OK, {"running": False, "port": 20130})
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -3078,6 +3056,54 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(HTTPStatus.CONFLICT, {'error': str(error)})
         except (ValueError, OSError) as error:
             return self._json(HTTPStatus.BAD_REQUEST, {'error': str(error)})
+
+    def _capri_chat(self, payload):
+        if not isinstance(payload, dict):
+            return self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid Capri chat message"})
+        message = payload.get("message")
+        history = payload.get("history", [])
+        if (not isinstance(message, str) or not 1 <= len(message.strip()) <= 4000 or
+                not isinstance(history, list) or len(history) > 6):
+            return self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid Capri chat message"})
+        messages = [{
+            "role": "system",
+            "content": (
+                "You are Capri, the user's friendly mobile companion. Reply directly and briefly "
+                "in the language of the latest user message unless they request a different language. "
+                "This conversation carries text only. Do not describe a screen, claim to have taken "
+                "actions, or speculate about device access or internet status."
+            ),
+        }]
+        for turn in history:
+            if (not isinstance(turn, dict) or
+                    not isinstance(turn.get("u"), str) or not isinstance(turn.get("a"), str)):
+                return self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid Capri chat history"})
+            messages.extend(({"role": "user", "content": turn["u"][:4000]},
+                             {"role": "assistant", "content": turn["a"][:4000]}))
+        messages.append({"role": "user", "content": message.strip()})
+        key = nine_router_mobile_key() or os.environ.get(MOBILE_KEY_ENV, "")
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        request = urllib.request.Request(
+            f"{NINE_ROUTER_BASE_URL.rstrip('/')}/chat/completions",
+            data=json.dumps({
+                "model": os.environ.get("AGENT_REMOTE_VOICE_MODEL", "").strip() or "free-model",
+                "messages": messages,
+                "max_tokens": 220,
+                "temperature": 0.6,
+            }).encode("utf-8"),
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                reply = json.load(response)["choices"][0]["message"]["content"]
+            if not isinstance(reply, str) or not reply.strip():
+                raise ValueError("Empty model reply")
+        except (OSError, ValueError, TypeError, KeyError, IndexError):
+            logger.warning("Capri mobile chat provider did not return text")
+            return self._json(HTTPStatus.BAD_GATEWAY, {"error": "Capri's PC model could not reply"})
+        return self._json(HTTPStatus.OK, {"ok": True, "reply": reply.strip(), "mode": "chat", "tts_preset": "normal"})
 
     def do_POST(self):
         import time
@@ -3523,6 +3549,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(HTTPStatus.OK, {"ok": True, "active": False})
 
         if self.path == "/api/voice/chat":
+            if not self._authorized():
+                return self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             try:
                 import re
                 import urllib.request
@@ -3536,6 +3564,23 @@ class Handler(BaseHTTPRequestHandler):
                 
                 mode = str(body.get("mode") or "").strip().lower()
                 msg_lower = msg.lower()
+                explicit_context = (
+                    body.get("screen_context") is True or bool(body.get("image")) or
+                    mode in {"debate", "fable-mind"} or
+                    msg_lower.startswith(("/debate", "/fable-mind"))
+                )
+                if not explicit_context:
+                    turns = []
+                    user_text = None
+                    for entry in history:
+                        if not isinstance(entry, dict) or not isinstance(entry.get("content"), str):
+                            continue
+                        if entry.get("role") == "user":
+                            user_text = entry["content"]
+                        elif entry.get("role") == "assistant" and user_text is not None:
+                            turns.append({"u": user_text, "a": entry["content"]})
+                            user_text = None
+                    return self._capri_chat({"message": msg, "history": turns})
                 if not mode:
                     if msg_lower.startswith("/debate") or "/debate " in msg_lower:
                         mode = "debate"
@@ -4166,6 +4211,8 @@ class Handler(BaseHTTPRequestHandler):
             res = _ask_dir()
             return self._json(HTTPStatus.OK, {"path": res})
         if self.path == "/api/auth/pair":
+            if not self._authorized():
+                return self._json(HTTPStatus.UNAUTHORIZED, {"error": "Invalid pairing token"})
             client_ip = self.client_address[0] if self.client_address else "127.0.0.1"
             payload = self._payload()
             device_id = str(payload.get("device_id") or "").strip()
@@ -4189,12 +4236,19 @@ class Handler(BaseHTTPRequestHandler):
                     "status": "approved",
                     "token": TOKEN,
                 })
-            approved = prompt_device_pairing_sync(device_id, device_name, client_ip, timeout=35.0)
-            if approved:
+            outcome = prompt_device_pairing_sync(device_id, device_name, client_ip)
+            if outcome == "approved":
                 return self._json(HTTPStatus.OK, {
                     "status": "approved",
                     "token": TOKEN,
                 })
+            if outcome != "rejected":
+                status, message = {
+                    "pending": (HTTPStatus.CONFLICT, "Konfirmasi pairing masih terbuka di PC."),
+                    "timeout": (HTTPStatus.GATEWAY_TIMEOUT, "Konfirmasi pairing di PC tidak dijawab. Buka desktop PC dan coba lagi."),
+                    "unavailable": (HTTPStatus.SERVICE_UNAVAILABLE, "Dialog pairing tidak bisa dibuka di PC."),
+                }[outcome]
+                return self._json(status, {"status": outcome, "error": message})
             return self._json(HTTPStatus.FORBIDDEN, {
                 "status": "rejected",
                 "error": "Koneksi ditolak oleh pengguna di PC",
@@ -4203,6 +4257,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
         try:
+            if self.path == "/api/capri/chat":
+                return self._capri_chat(self._payload())
             if self.path == "/api/devices":
                 return self._json(HTTPStatus.OK, {
                     "trusted": list(TRUSTED_DEVICES.values()),
@@ -4354,6 +4410,7 @@ class Handler(BaseHTTPRequestHandler):
                         key=key,
                         text=text,
                         monitor=str(inp.get("monitor") or "primary"),
+                        pointer=str(inp.get("pointer") or ""),
                     )
                     if isinstance(res, dict):
                         res["ok"] = True
@@ -4642,27 +4699,6 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("text is required")
 
             session = STORE.get(session_id)
-            history_msgs = session.get("messages", []) if isinstance(session, dict) else getattr(session, "messages", [])
-
-            # --- AUTO SPAWN REAL MULTI-AGENT DEBATE (CONTEXT-AWARE RESOLUTION) ---
-            try:
-                import sys
-                from pathlib import Path
-                plugins_dir = Path.home() / "AppData" / "Local" / "hermes" / "profiles" / "vans" / "plugins"
-                if str(plugins_dir) not in sys.path:
-                    sys.path.insert(0, str(plugins_dir))
-                import importlib
-                hdo_resolver = importlib.import_module("hermes-debate-orchestrator.context_resolver")
-                resolved_task = hdo_resolver.resolve_debate_task(text, history_msgs)
-                
-                if resolved_task:
-                    hdo_module = importlib.import_module("hermes-debate-orchestrator")
-                    srv = hdo_module.DashboardServer.get_instance()
-                    srv.start()
-                    hdo_module.MANAGER.create_and_spawn_run(resolved_task, event_bus=srv.event_bus)
-            except Exception as ex:
-                print(f"[HDO Auto-Spawn Error] {ex}")
-
             attachments = save_attachments(
                 WORKSPACE,
                 payload.get("attachments", []),
@@ -4682,6 +4718,10 @@ class Handler(BaseHTTPRequestHandler):
             mode = str(payload.get("mode") or "single")
             if mode not in {"single", "parallel", "coordinator"}:
                 raise ValueError("invalid execution mode")
+            if mode == "single" and len(agent_ids) != 1:
+                raise ValueError("select exactly one available agent")
+            if mode != "single" and len(agent_ids) < 2:
+                raise ValueError("select at least two available agents")
             concurrency = 1 if mode == "single" else max(
                 1,
                 min(
@@ -4897,8 +4937,15 @@ def main():
     global PET_PROCESS
     pet_process = None
     servers = []
+    router_server = None
     try:
         managed = os.environ.get("AGENT_REMOTE_MANAGED") == "1"
+        if managed and os.environ.get("AGENT_REMOTE_PARENT_PIPE") == "1":
+            def stop_on_parent_exit():
+                sys.stdin.buffer.read()
+                os._exit(0)
+
+            threading.Thread(target=stop_on_parent_exit, daemon=True).start()
         if managed:
             mode = os.environ.get("AGENT_REMOTE_MODE", "desktop")
             hosts = remote_server_hosts(mode, get_local_ip() if mode == "tailscale" else None)
@@ -4911,10 +4958,24 @@ def main():
             servers.append(ThreadingHTTPServer((host, PORT), Handler))
         for server in servers[1:]:
             threading.Thread(target=server.serve_forever, daemon=True).start()
+        if managed and NINE_ROUTER_BASE_URL == "http://127.0.0.1:20128/v1":
+            from nine_router_guard import is_nine_router_alive, nine_router_executable, spawn_nine_router
+            if not is_nine_router_alive() and nine_router_executable():
+                spawn_nine_router()
+        if managed and not router_running():
+            from smart_router_proxy import SmartRouterHandler
+            try:
+                router_server = ThreadingHTTPServer(("127.0.0.1", 20130), SmartRouterHandler)
+                threading.Thread(target=router_server.serve_forever, daemon=True).start()
+            except OSError as error:
+                logger.warning("Smart Router could not bind: %s", error)
         pet_process = None if managed else start_pet()
         PET_PROCESS = pet_process
         servers[0].serve_forever()
     finally:
+        if router_server is not None:
+            router_server.shutdown()
+            router_server.server_close()
         for server in servers[1:]:
             server.shutdown()
         for server in servers:

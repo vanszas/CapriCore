@@ -23,6 +23,7 @@ import { spotifyPlanner } from '../apps/desktop/spotify-planner.mjs';
 import { createGatewayConfiguration } from '../packages/runtime/src/context.mjs';
 import { settings } from '../packages/runtime/src/config/settings.mjs';
 import { buildOpenAICompletionsParams } from '@openclaw/ai/transports';
+import { smartRouterDialogue } from '../apps/desktop/chat-service.mjs';
 
 const key = 'sk-test-secret-1234567890';
 const storage = {
@@ -48,6 +49,80 @@ async function fixture(t, fetchImpl, provider = config) {
   t.after(() => api.close());
   return { root, api, id };
 }
+
+test('Smart Router uses its saved model override, preserves Local mode and retries a structured refusal once', async (t) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'capri-smart-router-'));
+  let local = 0;
+  let calls = 0;
+  const options = {
+    root,
+    storage,
+    fetchImpl: async (_url, { body }) => {
+      calls++;
+      assert.equal(JSON.parse(body).model, 'router/custom');
+      return Response.json({ error: { code: 'content_policy_violation' } }, { status: 400 });
+    },
+  };
+  const original = new InferenceApi(options);
+  const profileId = await original.saveProfile({ settings: config, key });
+  original.saveSmartRouter({ enabled: true, profileId, model: 'router/custom', fallback: true });
+  const api = new InferenceApi(options);
+  t.after(() => api.close());
+  assert.equal(api.activeProfileId(), null);
+  const saved = api.smartRouterSettings();
+  const remote = () => api.smartRouterRequest(saved, '/v1/chat/completions', {
+    method: 'POST',
+    body: JSON.stringify({ stream: true, messages: [{ role: 'user', content: 'Debug this.' }] }),
+  });
+  const fallback = () => {
+    local++;
+    return new Response('local');
+  };
+  assert.equal(await (await smartRouterDialogue(remote, fallback, saved)).text(), 'local');
+  const declined = await smartRouterDialogue(remote, fallback, { fallback: false, refusalText: 'Declined' });
+  assert.match(await declined.text(), /Declined/u);
+  assert.equal(calls, 2);
+  assert.equal(local, 1);
+});
+
+test('Smart Router does not replay a stream after visible text', async () => {
+  const response = await smartRouterDialogue(
+    () => new Response(
+      'data: {"choices":[{"delta":{"content":"Visible"}}]}\n\n' +
+      'data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}\n\n',
+      { headers: { 'content-type': 'text/event-stream' } },
+    ),
+    () => assert.fail('must not replay a started reply'),
+    { fallback: true, refusalText: 'Declined' },
+  );
+  assert.match(await response.text(), /Visible[\s\S]*Declined/u);
+});
+
+test('Smart Router vision uses local when the API lacks images or rejects supported image input with fallback on', async () => {
+  const api = new InferenceApi({ root: '.', storage, config });
+  let vision = false;
+  let remote = 0, local = 0;
+  api.profile = () => ({ settings: { vision } });
+  api.smartRouterRequest = async () => {
+    remote++;
+    return Response.json({ error: { code: 'model_images_unsupported' } }, { status: 422 });
+  };
+  const run = (fallback) => api.smartRouterAuxiliary({ fallback }, {}, () => {
+    local++;
+    return new Response('local');
+  }, { vision: true, localVision: true });
+  assert.equal((await run(false)).status, 200);
+  assert.equal(remote, 0);
+  vision = true;
+  assert.equal((await run(false)).status, 422);
+  assert.equal((await run(true)).status, 200);
+  assert.equal(remote, 2);
+  assert.equal(local, 2);
+  api.smartRouterRequest = async () => Response.json({error: {}}, {status: 502});
+  assert.equal((await run(false)).status, 502);
+  assert.equal((await run(true)).status, 200);
+  assert.equal(local, 3);
+});
 
 test('Groq applies documented reasoning controls to probes, chat and explicit thinking', async (t) => {
   for (const [model, normal, field, value] of [
