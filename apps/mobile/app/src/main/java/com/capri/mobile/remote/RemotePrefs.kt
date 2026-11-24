@@ -37,6 +37,10 @@ class RemotePrefs(context: Context) {
         get() = sp.getString("notif_sound_uri", "") ?: ""
         set(v) = sp.edit().putString("notif_sound_uri", v).apply()
 
+    var notificationSoundLabel: String
+        get() = sp.getString("notif_sound_label", "") ?: ""
+        set(v) = sp.edit().putString("notif_sound_label", v).apply()
+
     fun profiles(): List<PcProfile> {
         val raw = sp.getString("profiles", "[]") ?: "[]"
         return runCatching {
@@ -82,7 +86,7 @@ class RemotePrefs(context: Context) {
         val arr = JSONArray()
         list.forEach { arr.put(it.toJson()) }
         sp.edit().putString("profiles", arr.toString()).apply()
-        secrets.edit().remove("tok_$id").apply()
+        secrets.edit().remove("tok_$id").remove("audio_tok_$id").remove("screen_chat_$id").apply()
         if (activeProfileId == id) {
             activeProfileId = list.firstOrNull()?.id.orEmpty()
         }
@@ -90,6 +94,32 @@ class RemotePrefs(context: Context) {
 
     fun tokenFor(profileId: String): String =
         secrets.getString("tok_$profileId", "") ?: ""
+
+    fun hostAudioToken(profileId: String): String =
+        secrets.getString("audio_tok_$profileId", "").orEmpty()
+
+    fun screenChat(profileId: String): List<Pair<String, String>> = runCatching {
+        val data = JSONArray(secrets.getString("screen_chat_$profileId", "[]"))
+        (0 until data.length()).map { index ->
+            val turn = data.getJSONObject(index)
+            turn.getString("u") to turn.getString("a")
+        }
+    }.getOrDefault(emptyList())
+
+    fun saveScreenChat(profileId: String, messages: List<Pair<String, String>>) {
+        val data = JSONArray()
+        messages.takeLast(40).forEach { (user, reply) ->
+            data.put(JSONObject().put("u", user).put("a", reply))
+        }
+        secrets.edit().putString("screen_chat_$profileId", data.toString()).apply()
+    }
+
+    fun saveHostAudioToken(profileId: String, token: String) {
+        val edit = secrets.edit()
+        if (token.isEmpty()) edit.remove("audio_tok_$profileId")
+        else edit.putString("audio_tok_$profileId", token)
+        edit.apply()
+    }
 
     fun activeToken(): String {
         val p = activeProfile() ?: return ""

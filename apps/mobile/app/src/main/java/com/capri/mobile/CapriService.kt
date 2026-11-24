@@ -356,8 +356,13 @@ class CapriService : Service(), SensorEventListener, CapriAccess.Listener {
             }
             ACTION_BYE -> stopSelf()
             ACTION_ASK -> intent.getStringExtra("text")?.let {
-                think(it, chatOnly = intent.getBooleanExtra("chatOnly", false),
-                    speakReply = intent.getBooleanExtra("speakReply", false))
+                if (intent.getBooleanExtra("lookAtPhone", false)) {
+                    if (brain.loaded == null || brain.busy) say("Capri belum siap melihat layar.", you = it)
+                    else look(it)
+                } else {
+                    think(it, chatOnly = intent.getBooleanExtra("chatOnly", false),
+                        speakReply = intent.getBooleanExtra("speakReply", false))
+                }
             }
             ACTION_TYPE -> { wake(); openBox() }
             ACTION_BRAIN -> loadBrain(quiet = false)
@@ -982,7 +987,7 @@ class CapriService : Service(), SensorEventListener, CapriAccess.Listener {
     private fun openBox() {
         if (box != null) return
         hush()
-        val b = TypeBox(this, dp, send = { think(it) }, close = ::closeBox)
+        val b = TypeBox(this, dp, send = { text -> handler.postDelayed({ think(text) }, 320) }, close = ::closeBox)
         val lp = overlayParams((right - left - 24 * dp).toInt(), WindowManager.LayoutParams.WRAP_CONTENT, touchable = true).apply {
             flags = (flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()) or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
@@ -1132,9 +1137,29 @@ class CapriService : Service(), SensorEventListener, CapriAccess.Listener {
      * "Look at this": with eyes she takes a screenshot and really looks (her bubble steps aside for the shot);
      * without them she reads the words on screen; without accessibility she says she can't see.
      */
-    private fun look(text: String) {
+    private fun look(text: String, waitedForKeyboard: Boolean = false) {
         val access = CapriAccess.instance
         if (access == null) { say(tr("I can't see your screen yet: switch me on in Accessibility (Setup tab)."), you = text); return }
+        if (access.refreshKeyboard()) {
+            if (!waitedForKeyboard) {
+                handler.postDelayed({ look(text, waitedForKeyboard = true) }, 450)
+                return
+            }
+            val words = access.screenText(700)
+            if (words.isNotBlank()) {
+                say("...", you = text, hold = true)
+                brain.ask(
+                    "$text\n[The words on my screen right now: \"$words\"]",
+                    live = { say(it, you = text, hold = true, live = true) },
+                ) { reply ->
+                    lastReply = reply
+                    say(reply.ifEmpty { tr("Can't make it out, choom.") }, you = text)
+                }
+                return
+            }
+            say("Tutup keyboard dulu supaya layar bisa terlihat.", you = text)
+            return
+        }
         if (!brain.canSee || Build.VERSION.SDK_INT < 30) {  // no eyes: read the screen's words instead
             val words = access.screenText(700)
             say("...", you = text, hold = true)

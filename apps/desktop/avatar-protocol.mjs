@@ -44,9 +44,12 @@ Then write the reply on the next line. Keep one choice per reply. The marker is 
 export class AvatarStreamParser {
   constructor(sprites) {
     this.options = new Map();
-    for (const sprite of sprites)
+    this.bareIds = new Set();
+    for (const sprite of sprites) {
       if (!this.options.has(`${sprite.pose}/${sprite.expression}`))
         this.options.set(`${sprite.pose}/${sprite.expression}`, sprite);
+      this.bareIds.add(sprite.id.toLowerCase());
+    }
     for (const sprite of sprites) this.options.set(sprite.id, sprite);
     this.buffer = '';
     this.discarding = false;
@@ -97,17 +100,48 @@ export class AvatarStreamParser {
         this.discarding = false;
         continue;
       }
-      // Models sometimes invent XML-like closing tags. They are reserved
-      // control text too, but cannot select an expression or open the mic.
+      // Models sometimes invent XML-like closing tags or bare [id] feeling tags.
       const marker = /\[(?:(\/)(?:avatar|аватар)(?::|(?=\]))|(?:avatar|аватар):)/iu.exec(
         this.buffer,
       );
+      const bareMatch =
+        !this.hasText && this.controlsSeen === 0
+          ? /\[([a-z][a-z0-9_-]{0,39})(;listen)?\]/iu.exec(this.buffer)
+          : null;
+      const bareValid = bareMatch && this.bareIds.has(bareMatch[1].toLowerCase()) ? bareMatch : null;
+      if (bareValid && (!marker || bareValid.index < marker.index)) {
+        if (bareValid.index > 0) emitText(this.buffer.slice(0, bareValid.index));
+        const id = bareValid[1].toLowerCase();
+        const listening = Boolean(bareValid[2]);
+        this.buffer = this.buffer.slice(bareValid.index + bareValid[0].length).replace(/^\r?\n/, '');
+        this.controlsSeen++;
+        const choice = this.options.get(id);
+        if (choice && !this.selected) {
+          this.selected = choice;
+          events.push({
+            type: 'avatar',
+            ...(listening ? { followUp: true } : {}),
+            avatar: { id: choice.id, pose: choice.pose, expression: choice.expression },
+          });
+        }
+        continue;
+      }
       const start = marker?.index ?? -1;
       if (start < 0) {
         const lower = this.buffer.toLowerCase();
         let held = 0;
         for (let length = 1; length < MAX_START && length <= this.buffer.length; length++) {
           if (STARTS.some((marker) => lower.endsWith(marker.slice(0, length)))) held = length;
+        }
+        if (!this.hasText && this.controlsSeen === 0) {
+          const open = this.buffer.lastIndexOf('[');
+          if (
+            open >= 0 &&
+            this.buffer.length - open <= MAX_CONTROL &&
+            /^\[[a-z0-9_-]*(?:;(?:l(?:i(?:s(?:t(?:e(?:n)?)?)?)?)?)?)?$/i.test(this.buffer.slice(open))
+          ) {
+            held = Math.max(held, this.buffer.length - open);
+          }
         }
         emitText(this.buffer.slice(0, this.buffer.length - held));
         this.buffer = held ? this.buffer.slice(-held) : '';

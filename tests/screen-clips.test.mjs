@@ -29,8 +29,8 @@ test('screen routing uses the classifier with original owner context and rejects
       ]);
       assert.ok(request.format.properties.intent.enum.includes(intent));
       const systemMessages = request.messages.filter((m) => m.role === 'system');
-      assert.ok(systemMessages.length >= 2, 'screenActions must inject a system message into messages');
-      assert.ok(systemMessages.some((m) => m.content.includes('screen_once') && m.content.includes('screen_watch')));
+      assert.equal(systemMessages.length, 1, 'llama.cpp Qwen template allows only one system message');
+      assert.ok(systemMessages[0].content.includes('screen_once') && systemMessages[0].content.includes('screen_watch'));
       assert.ok(!systemMessages[0].content.includes('screen descriptions, '));
       received = JSON.parse(request.messages.at(-1).content);
       return Response.json({ done: true, message: { content: JSON.stringify({ intent, usesPrevious: true }) } });

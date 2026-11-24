@@ -1287,7 +1287,7 @@ export class ComputerAgent {
             application: apps[0],
             summary: '',
           };
-        else if (!scope.web)
+        else if (!scope.web && (apps.length > 1 || !this.control?.execute))
           return terminal(
             {
               ok: false,

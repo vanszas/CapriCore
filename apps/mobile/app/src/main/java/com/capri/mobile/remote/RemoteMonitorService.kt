@@ -7,6 +7,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.MediaPlayer
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
@@ -33,6 +35,53 @@ class RemoteMonitorService : Service() {
         @Volatile
         var running = false
             private set
+
+        @Volatile
+        private var activePlayer: MediaPlayer? = null
+
+        fun playTone(context: Context, uriString: String) {
+            if (uriString.isBlank()) return
+            val appCtx = context.applicationContext
+            val parsed = runCatching { Uri.parse(uriString) }.getOrNull() ?: return
+            val playedByMedia = runCatching {
+                activePlayer?.let { prev ->
+                    runCatching { prev.stop() }
+                    runCatching { prev.release() }
+                    activePlayer = null
+                }
+                val mp = MediaPlayer()
+                activePlayer = mp
+                mp.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                if (parsed.scheme == "file" && !parsed.path.isNullOrBlank()) {
+                    mp.setDataSource(parsed.path)
+                } else {
+                    mp.setDataSource(appCtx, parsed)
+                }
+                mp.setOnCompletionListener { player ->
+                    if (activePlayer === player) activePlayer = null
+                    runCatching { player.release() }
+                }
+                mp.setOnErrorListener { player, _, _ ->
+                    if (activePlayer === player) activePlayer = null
+                    runCatching { player.release() }
+                    true
+                }
+                mp.prepare()
+                mp.start()
+                true
+            }.getOrDefault(false)
+            if (!playedByMedia) {
+                runCatching {
+                    val rt = RingtoneManager.getRingtone(appCtx, parsed)
+                    rt?.play()
+                }
+            }
+        }
 
         fun sync(ctx: Context) {
             val prefs = RemotePrefs(ctx)
@@ -139,12 +188,7 @@ class RemoteMonitorService : Service() {
     }
 
     private fun playNotificationTone(uriString: String) {
-        if (uriString.isBlank()) return
-        runCatching {
-            val uri = Uri.parse(uriString)
-            val rt = RingtoneManager.getRingtone(applicationContext, uri)
-            rt?.play()
-        }
+        playTone(applicationContext, uriString)
     }
 
     private fun buildNotification(title: String, body: String, stopSessionId: String?): android.app.Notification {

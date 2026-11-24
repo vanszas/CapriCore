@@ -292,6 +292,13 @@ namespace Capri.Audio {
                 if (args.Length == 1 && args[0] == "list") {
                     Console.OutputEncoding = new UTF8Encoding(false);
                     Console.WriteLine(new JavaScriptSerializer().Serialize(List(devices)));
+                } else if (args.Length == 1 && args[0] == "capture-default-output") {
+                    IDevice output;
+                    Check(devices.GetDefaultAudioEndpoint(Render, 1, out output));
+                    string id;
+                    try { Check(output.GetId(out id)); }
+                    finally { Release(output); }
+                    StreamEndpoint(devices, id);
                 } else if (args.Length == 2 && args[0] == "capture") {
                     StreamEndpoint(devices, args[1]);
                 } else {

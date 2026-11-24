@@ -18,6 +18,7 @@ AGENT_DISPLAY_NAMES = {
     "gemini": "Gemini CLI",
     "opencode": "OpenCode",
     "hermes": "Hermes",
+    "antigravity": "Antigravity",
 }
 TERMINAL_AGENT_STATUSES = {"completed", "failed", "stopped"}
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -119,6 +120,31 @@ def available_agents(hermes: Path | None) -> list[dict]:
         "description": "Hermes Agent CLI",
         "command": str(hermes) if hermes_installed else "",
         "installed": hermes_installed,
+        "supports_streaming": False,
+        "supports_tools": True,
+    })
+    agy_commands = ("agy.cmd", "agy.exe", "agy", "antigravity.cmd", "antigravity.exe", "antigravity")
+    agy_cli = next((shutil.which(cmd) for cmd in agy_commands if shutil.which(cmd)), None)
+    local_app = Path(os.environ.get("LOCALAPPDATA", ""))
+    roaming_app = Path(os.environ.get("APPDATA", ""))
+    if not agy_cli and os.name == "nt":
+        for candidate in (
+            roaming_app / "npm" / "agy.cmd",
+            local_app / "Programs" / "antigravity" / "bin" / "agy.cmd",
+            local_app / "Programs" / "antigravity" / "bin" / "antigravity.cmd",
+        ):
+            if candidate.is_file():
+                agy_cli = str(candidate)
+                break
+    agy_desktop = local_app / "Programs" / "antigravity" / "Antigravity.exe"
+    agy_detected = bool(agy_cli) or (os.name == "nt" and agy_desktop.is_file())
+    agents.append({
+        "id": "antigravity",
+        "name": "Antigravity",
+        "description": "Google Antigravity Agent",
+        "command": agy_cli or (str(agy_desktop) if agy_desktop.is_file() else ""),
+        "installed": agy_cli is not None,
+        "detected": agy_detected,
         "supports_streaming": False,
         "supports_tools": True,
     })

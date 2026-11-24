@@ -461,6 +461,12 @@ protocol.registerSchemesAsPrivileged([
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.exit(0);
 else {
+  process.on('uncaughtException', (error) => {
+    console.error('Capri uncaughtException:', error?.stack || error?.message || error);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('Capri unhandledRejection:', reason?.stack || reason?.message || reason);
+  });
   installTrayOnlyWindows(app);
   // Also brand windows opened directly from source, before their first show.
   if (process.platform !== 'darwin')
@@ -833,8 +839,78 @@ async function initializeDesktop() {
   let pendingMemoryDecision, latestMemoryCandidate;
   let memoryWarmup;
   const reminderListeners = new Set();
+  let remoteMicSessionId = null;
   const agentRemoteServer = createAgentRemoteServer({
-    file: path.join(state, 'agent-remote.json'), persist: writeJsonAtomic,
+    file: path.join(state, 'agent-remote.json'),
+    persist: writeJsonAtomic,
+    autoStartCapri: (() => {
+      const loginItemOptions = () => (
+        process.defaultApp && process.argv[1]
+          ? { path: process.execPath, args: [path.resolve(process.argv[1])] }
+          : {}
+      );
+      return {
+        get: () => Boolean(app.getLoginItemSettings(loginItemOptions()).openAtLogin),
+        set: (enabled) => {
+          app.setLoginItemSettings({
+            openAtLogin: Boolean(enabled),
+            ...loginItemOptions(),
+          });
+        },
+      };
+    })(),
+    captureHostAudio: (options) => windowsAudio.captureDefaultOutput(options),
+    async confirmHostAudio({ name, ip }) {
+      const options = {
+        type: 'question',
+        title: 'Capri Remote',
+        message: 'Izinkan suara PC host?',
+        detail: `Perangkat: ${String(name).slice(0, 80)} (${String(ip).slice(0, 45)})`,
+        buttons: ['Tolak', 'Izinkan'],
+        defaultId: 0,
+        cancelId: 0,
+        signal: AbortSignal.timeout(35_000),
+      };
+      const parent = BrowserWindow.getFocusedWindow() ?? window;
+      const { response } = await (parent && !parent.isDestroyed() && parent.isVisible()
+        ? dialog.showMessageBox(parent, options)
+        : dialog.showMessageBox(options));
+      return response === 1;
+    },
+    remoteMic: {
+      async start() {
+        const started = await microphone.start({ remote: true });
+        if (microphone.status === 'arming') microphone.confirm(started.sessionId);
+        microphone.worker
+          .send({ type: 'attention', sessionId: started.sessionId, active: true })
+          .catch(() => {});
+        remoteMicSessionId = started.sessionId;
+        return { sessionId: started.sessionId };
+      },
+      async pcm(buf) {
+        const capture = microphone.capture;
+        if (!capture || capture.id !== remoteMicSessionId || microphone.status !== 'listening' || !buf?.byteLength) return false;
+        const aligned = buf.byteLength - (buf.byteLength % 4);
+        for (let offset = 0; offset < aligned; offset += 12800) {
+          if (microphone.capture !== capture || microphone.status !== 'listening') return false;
+          const end = Math.min(offset + 12800, aligned);
+          const result = await microphone.audio({
+            sessionId: microphone.capture.id,
+            sequence: microphone.capture.sequence,
+            pcm: new Uint8Array(buf.buffer, buf.byteOffset + offset, end - offset),
+          });
+          if (!result.accepted) return false;
+        }
+        return aligned > 0;
+      },
+      stop() {
+        if (remoteMicSessionId) microphone.stop(remoteMicSessionId);
+        remoteMicSessionId = null;
+      },
+      listening() {
+        return microphone.status === 'listening';
+      },
+    },
   });
   let shuttingDown = false;
   let maintenance = false;
@@ -3486,6 +3562,8 @@ async function initializeDesktop() {
   const rendererDiagnostics = [];
   let voiceIdleSince = null;
   let nextVoiceMemoryCheck = 0;
+  let localModelIdleSince = null;
+  let localModelUnloadedForIdle = false;
   const voiceIdleBlocked = () => Boolean(
     shuttingDown || backendState.phase !== 'ready' || voiceStartPromise ||
     voice.prepareController || voice.generating || playbackBusy || currentChatTask ||
@@ -3718,6 +3796,7 @@ async function initializeDesktop() {
   }
 
   function emit(event) {
+    if (event.type === 'voice.audio') agentRemoteServer.observeVoice(event);
     if (event.type === 'updates.status' && event.notification?.tag !== updateNoticeTag) {
       try {
         showUpdateTrayNotice(event.notification?.tag);
@@ -7789,7 +7868,8 @@ async function initializeDesktop() {
       return savedRouter;
     });
     handle('capri:local-model-load-set', (value, { role }) => {
-      if (role !== 'companion') throw new Error('Open the Local menu in Capri.');
+      if (role !== 'companion' && role !== 'settings')
+        throw new Error('Open the Local menu or Settings in Capri.');
       return localModelLoad.set(value);
     });
     handle('capri:inference-startup-set', async (value, { role }) => {
@@ -10102,7 +10182,9 @@ async function initializeDesktop() {
       tray?.destroy();
       void skills.close();
     });
-    app.on('window-all-closed', () => app.quit());
+    app.on('window-all-closed', () => {
+      if (quitting || verification || !tray) app.quit();
+    });
     app
       .whenReady()
       .then(async () => {
@@ -10305,16 +10387,54 @@ async function initializeDesktop() {
         });
         controlTimer = setInterval(() => {
           void sampleNativeWatch();
-          if (!verification && voice.enabled && voice.ready && !voiceIdleBlocked()) {
-            const now = performance.now();
+          const { idleUnloadEnabled, idleUnloadMinutes } = localModelLoad.settings;
+          const idleUnloadMs = (idleUnloadMinutes ?? 10) * 60_000;
+          const now = performance.now();
+          if (
+            !verification &&
+            idleUnloadEnabled &&
+            voice.enabled &&
+            voice.ready &&
+            !voiceIdleBlocked()
+          ) {
             voiceIdleSince ??= now;
-            if (now - voiceIdleSince >= 300000 && now >= nextVoiceMemoryCheck) {
+            if (now - voiceIdleSince >= idleUnloadMs && now >= nextVoiceMemoryCheck) {
               nextVoiceMemoryCheck = now + 30000;
-              if (freemem() < 2.5 * 1024 ** 3 && managedProcess('companion-voice'))
+              if (managedProcess('companion-voice'))
                 void mutedVoiceResidency.release({ idle: true }).catch((error) =>
                   console.warn('Idle voice release failed:', error.message));
             }
           } else voiceIdleSince = null;
+          const localBusy = Boolean(
+            localInferenceTasks ||
+              chat.active ||
+              initiative.active ||
+              avatarClickReactions?.active ||
+              backendState.phase !== 'ready',
+          );
+          if (
+            !verification &&
+            !shuttingDown &&
+            !rt.remote.enabled &&
+            idleUnloadEnabled &&
+            !localBusy
+          ) {
+            localModelIdleSince ??= now;
+            if (!localModelUnloadedForIdle && now - localModelIdleSince >= idleUnloadMs) {
+              localModelUnloadedForIdle = true;
+              if (settings.model && rt.inferenceUrl) {
+                fetch(`${rt.inferenceUrl.replace(/\/+$/, '')}/api/generate`, {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ model: settings.model, keep_alive: 0 }),
+                  signal: AbortSignal.timeout(4000),
+                }).catch(() => {});
+              }
+            }
+          } else {
+            localModelIdleSince = null;
+            localModelUnloadedForIdle = false;
+          }
           localModelLoad.synchronize(
             !verification &&
               !shuttingDown &&
@@ -10352,6 +10472,11 @@ async function initializeDesktop() {
           }
         }, 400);
         controlTimer.unref();
+        if (!verification && agentRemoteServer.shouldAutoStartServer()) {
+          void agentRemoteServer.run('start').catch((error) => {
+            console.warn('Agent Remote auto-start failed:', error.message);
+          });
+        }
         const warmRecognition =
           preload &&
           !verification &&

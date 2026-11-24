@@ -19,8 +19,19 @@ function folder(t) {
   return value;
 }
 
-test('load control defaults to 85%, validates bounds, and persists independently of providers', (t) => {
-  assert.deepEqual(LOCAL_LOAD_DEFAULTS, { enabled: true, percent: 85 });
+test('load control defaults to 85% and 10m idle unload, validates bounds, and persists independently of providers', (t) => {
+  assert.deepEqual(LOCAL_LOAD_DEFAULTS, {
+    enabled: true,
+    percent: 85,
+    idleUnloadEnabled: true,
+    idleUnloadMinutes: 10,
+  });
+  assert.deepEqual(localLoadSettings({ enabled: true, percent: 80 }), {
+    enabled: true,
+    percent: 80,
+    idleUnloadEnabled: true,
+    idleUnloadMinutes: 10,
+  });
   for (const value of [
     null,
     [],
@@ -28,15 +39,22 @@ test('load control defaults to 85%, validates bounds, and persists independently
     { enabled: true, percent: 9 },
     { enabled: true, percent: 101 },
     { enabled: true, percent: NaN },
+    { ...on, idleUnloadEnabled: 'yes' },
+    { ...on, idleUnloadMinutes: 0 },
+    { ...on, idleUnloadMinutes: 121 },
     { ...on, pid: 1 },
   ])
     assert.throws(() => localLoadSettings(value));
   const root = folder(t),
     store = new LocalModelLoad({ root });
   assert.equal(store.snapshot().percent, 85);
-  store.set({ enabled: false, percent: 35 });
+  assert.equal(store.snapshot().idleUnloadEnabled, true);
+  assert.equal(store.snapshot().idleUnloadMinutes, 10);
+  store.set({ enabled: false, percent: 35, idleUnloadEnabled: false, idleUnloadMinutes: 25 });
   assert.equal(new LocalModelLoad({ root }).snapshot().percent, 35);
   assert.equal(new LocalModelLoad({ root }).snapshot().enabled, false);
+  assert.equal(new LocalModelLoad({ root }).snapshot().idleUnloadEnabled, false);
+  assert.equal(new LocalModelLoad({ root }).snapshot().idleUnloadMinutes, 25);
   writeFileSync(store.file, 'invalid');
   assert.match(new LocalModelLoad({ root }).snapshot().warning, /restored/);
   assert.equal(readFileSync(store.file, 'utf8'), 'invalid');

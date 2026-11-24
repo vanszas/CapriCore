@@ -22,8 +22,8 @@ android {
         applicationId = "com.capri.mobile"
         minSdk = 24
         targetSdk = 36
-        versionCode = 21
-        versionName = "0.5.9"
+        versionCode = 39
+        versionName = "0.6.16"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -50,6 +50,11 @@ android {
     // Release signing: the key's location and passwords live in local.properties (never committed). Every release must
     // use the same key, or phones refuse it as an update. Without those lines, release builds use the debug key.
     signingConfigs {
+        getByName("debug") {
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
+        }
         if (keystore != null) create("capri") {
             storeFile = keystore
             storePassword = capriProps.getProperty("capri.storePassword")

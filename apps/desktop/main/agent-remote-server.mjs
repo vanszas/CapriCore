@@ -1,4 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
 import { promisify } from 'node:util';
 import { existsSync, readFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -23,17 +25,175 @@ export function createAgentRemoteServer({
   script = process.env.AGENT_REMOTE_SERVER_SCRIPT || DEFAULT_SCRIPT,
   python = process.env.AGENT_REMOTE_PYTHON,
   startupTimeout = 15000,
+  remoteMic = null,
+  captureHostAudio = null,
+  confirmHostAudio = null,
+  autoStartCapri = null,
 } = {}) {
   let mode = 'desktop';
+  let autoStartServer = false;
   try {
     const saved = JSON.parse(readFileSync(file, 'utf8'));
     if (MODES.has(saved.mode)) mode = saved.mode;
+    if (typeof saved.autoStartServer === 'boolean') autoStartServer = saved.autoStartServer;
   } catch { /* First launch defaults to loopback. */ }
   let child = null;
   let queue = Promise.resolve();
-  async function request(path) {
+  const voiceToken = randomUUID();
+  const voiceClips = [];
+  let voiceSeq = 0;
+  let voiceServer = null;
+  let voiceUrl = '';
+  let voiceListenPromise = null;
+  let systemAudio = null;
+  let systemAudioSeq = 0;
+  let askingForAudio = false;
+
+  function stopSystemAudio() {
+    if (!systemAudio) return;
+    const capture = systemAudio;
+    systemAudio = null;
+    clearTimeout(capture.idle);
+    capture.controller.abort();
+  }
+
+  async function readSystemAudio(after) {
+    if (!captureHostAudio) throw new Error('Host audio is unavailable.');
+    if (!systemAudio) {
+      const capture = { controller: new AbortController(), packets: [], idle: null };
+      systemAudio = capture;
+      capture.ready = Promise.resolve().then(() => captureHostAudio({
+        signal: capture.controller.signal,
+        onPacket(pcm) {
+          if (systemAudio !== capture) return;
+          capture.packets.push({ seq: ++systemAudioSeq, pcmBase64: Buffer.from(pcm).toString('base64') });
+          if (capture.packets.length > 12) capture.packets.shift();
+        },
+        onError(error) {
+          capture.error = error;
+          if (systemAudio === capture) stopSystemAudio();
+        },
+      })).catch((error) => {
+        if (systemAudio === capture) stopSystemAudio();
+        throw error;
+      });
+    }
+    const capture = systemAudio;
+    clearTimeout(capture.idle);
+    capture.idle = setTimeout(stopSystemAudio, 10_000).unref();
+    await capture.ready;
+    if (capture.error) throw capture.error;
+    return {
+      sampleRate: 16000,
+      seq: systemAudioSeq,
+      packets: after > 0 && after <= systemAudioSeq
+        ? capture.packets.filter((packet) => packet.seq > after)
+        : capture.packets.slice(-2),
+    };
+  }
+
+  async function ensureVoiceBridge() {
+    if (voiceUrl) return voiceUrl;
+    if (voiceListenPromise) return voiceListenPromise;
+    voiceListenPromise = new Promise((resolve, reject) => {
+      const server = createServer(async (req, res) => {
+        const respondJson = (code, payload) => {
+          const body = JSON.stringify(payload);
+          res.writeHead(code, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+          res.end(body);
+        };
+        if (req.headers['x-capri-voice-token'] !== voiceToken) {
+          respondJson(401, { ok: false, error: 'unauthorized' });
+          return;
+        }
+        const parsed = new URL(req.url || '/', 'http://127.0.0.1');
+        try {
+          if (req.method === 'POST' && parsed.pathname === '/remote-pc/audio-permission') {
+            if (!confirmHostAudio || askingForAudio) {
+              respondJson(409, { error: 'An audio approval is already pending or unavailable.' });
+              return;
+            }
+            askingForAudio = true;
+            try {
+              let body = '';
+              for await (const chunk of req) {
+                body += chunk.toString('utf8');
+                if (body.length > 2048) throw new Error('Invalid approval request.');
+              }
+              respondJson(200, { approved: await confirmHostAudio(JSON.parse(body)) });
+            } finally {
+              askingForAudio = false;
+            }
+            return;
+          }
+          if (req.method === 'GET' && parsed.pathname === '/remote-pc/audio') {
+            respondJson(200, await readSystemAudio(Number(parsed.searchParams.get('after')) || 0));
+            return;
+          }
+          if (req.method === 'POST' && parsed.pathname === '/remote-mic/start') {
+            if (!remoteMic?.start) {
+              respondJson(503, { ok: false, error: 'Remote mic bridge unavailable' });
+              return;
+            }
+            const started = await remoteMic.start();
+            respondJson(200, { ok: true, sessionId: started?.sessionId || null, seq: voiceSeq });
+            return;
+          }
+          if (req.method === 'POST' && parsed.pathname === '/remote-mic/pcm') {
+            if (!remoteMic?.pcm) {
+              respondJson(503, { ok: false, error: 'Remote mic bridge unavailable' });
+              return;
+            }
+            const chunks = [];
+            let total = 0;
+            for await (const chunk of req) {
+              total += chunk.length;
+              if (total > 262144) {
+                respondJson(413, { ok: false, error: 'PCM payload too large' });
+                return;
+              }
+              chunks.push(chunk);
+            }
+            if (!(await remoteMic.pcm(Buffer.concat(chunks)))) {
+              respondJson(409, { ok: false, error: 'Capri is no longer listening to the remote microphone. Restart the remote mic.' });
+              return;
+            }
+            respondJson(200, { ok: true });
+            return;
+          }
+          if (req.method === 'POST' && parsed.pathname === '/remote-mic/stop') {
+            remoteMic?.stop?.();
+            respondJson(200, { ok: true });
+            return;
+          }
+          if (req.method === 'GET' && parsed.pathname === '/remote-mic/audio') {
+            const after = Number.parseInt(parsed.searchParams.get('after') || '0', 10) || 0;
+            respondJson(200, {
+              ok: true,
+              listening: Boolean(remoteMic?.listening?.()),
+              seq: voiceSeq,
+              clips: voiceClips.filter((clip) => clip.seq > after),
+            });
+            return;
+          }
+          respondJson(404, { ok: false, error: 'not found' });
+        } catch (error) {
+          respondJson(500, { ok: false, error: error?.message || 'Remote mic error' });
+        }
+      });
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address();
+        voiceServer = server;
+        voiceUrl = `http://127.0.0.1:${addr.port}`;
+        resolve(voiceUrl);
+      });
+    });
+    return voiceListenPromise;
+  }
+  async function request(path, options) {
     return fetchRemote(`http://127.0.0.1:9120${path}`, {
-      signal: AbortSignal.timeout(4000), redirect: 'error',
+      ...options, signal: AbortSignal.timeout(4000), redirect: 'error',
     });
   }
   async function status() {
@@ -45,12 +205,20 @@ export function createAgentRemoteServer({
       return {
         running: true, owned: Boolean(child), selectedMode: mode,
         mode: MODES.has(value.network_mode) ? value.network_mode : 'external',
+        tailscaleIp: value.tailscale_ip,
+        autoStartServer,
+        autoStartCapri: Boolean(autoStartCapri?.get?.()),
       };
     } catch {
-      return { running: false, owned: Boolean(child), selectedMode: mode, mode };
+      return {
+        running: false, owned: Boolean(child), selectedMode: mode, mode,
+        autoStartServer,
+        autoStartCapri: Boolean(autoStartCapri?.get?.()),
+      };
     }
   }
   async function stop() {
+    stopSystemAudio();
     if (!child) {
       if ((await status()).running) throw new Error('Server started outside Capri. Stop it from ServerStop first.');
       return status();
@@ -65,10 +233,34 @@ export function createAgentRemoteServer({
   async function execute(value) {
     const action = typeof value === 'string' ? value : value?.action;
     if (action === 'status') return status();
+    if (action === 'pc-pair' || action === 'android-pair') {
+      let current = await status();
+      if (current.running && current.mode === 'external') {
+        throw new Error('Stop the external Agent Remote server before pairing here.');
+      }
+      if (!current.running || current.mode !== 'tailscale') {
+        if (current.running) await stop();
+        await execute({ action: 'mode', mode: 'tailscale' });
+        current = await execute('start');
+      }
+      return current;
+    }
+    if (action === 'auto-start-server') {
+      if (typeof value?.enabled !== 'boolean') throw new Error('Invalid auto-start server setting.');
+      autoStartServer = value.enabled;
+      persist(file, { mode, autoStartServer });
+      return status();
+    }
+    if (action === 'auto-start-capri') {
+      if (typeof value?.enabled !== 'boolean') throw new Error('Invalid auto-start Capri setting.');
+      if (!autoStartCapri?.set) throw new Error('Auto-start Capri is unavailable.');
+      autoStartCapri.set(value.enabled);
+      return status();
+    }
     if (action === 'mode') {
       if (!MODES.has(value?.mode)) throw new Error('Invalid Agent Remote network mode.');
       if ((await status()).running) throw new Error('Stop server before changing network mode.');
-      persist(file, { mode: value.mode });
+      persist(file, { mode: value.mode, autoStartServer });
       mode = value.mode;
       return status();
     }
@@ -101,9 +293,17 @@ export function createAgentRemoteServer({
         }
       }
     }
+    const activeVoiceUrl = await ensureVoiceBridge().catch(() => '');
     const process = spawnRemote(executable, [script], {
       windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'],
-      env: { ...globalThis.process.env, AGENT_REMOTE_MANAGED: '1', AGENT_REMOTE_MODE: mode, AGENT_REMOTE_HOST: '127.0.0.1', AGENT_REMOTE_PARENT_PIPE: '1' },
+      env: {
+        ...globalThis.process.env,
+        AGENT_REMOTE_MANAGED: '1',
+        AGENT_REMOTE_MODE: mode,
+        AGENT_REMOTE_HOST: '127.0.0.1',
+        AGENT_REMOTE_PARENT_PIPE: '1',
+        ...(activeVoiceUrl ? { CAPRI_REMOTE_VOICE_URL: activeVoiceUrl, CAPRI_REMOTE_VOICE_TOKEN: voiceToken } : {}),
+      },
     });
     child = process;
     process.stdin?.on('error', () => {});
@@ -128,6 +328,23 @@ export function createAgentRemoteServer({
       queue = task.catch(() => {});
       return task;
     },
-    close() { child?.kill(); },
+    shouldAutoStartServer() {
+      return autoStartServer;
+    },
+    observeVoice(event) {
+      if (event?.type !== 'voice.audio' || !event.pcm) return;
+      voiceClips.push({
+        seq: ++voiceSeq,
+        text: String(event.text || ''),
+        sampleRate: Number(event.sampleRate) || 24000,
+        pcmBase64: Buffer.from(event.pcm).toString('base64'),
+      });
+      if (voiceClips.length > 16) voiceClips.splice(0, voiceClips.length - 16);
+    },
+    close() {
+      stopSystemAudio();
+      child?.kill();
+      voiceServer?.close();
+    },
   };
 }

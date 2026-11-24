@@ -3,6 +3,7 @@ import { HuggingFacePanel } from './huggingface-panel.mjs';
 import { VoiceModelPanel } from './voice-model-panel.mjs';
 import { ModelDevicePanel } from './model-device-panel.mjs';
 import { NpuPanel } from './npu-panel.mjs';
+import { LocalLoadControls } from './local-load-controls.mjs';
 const states = {
   idle: 'Choose a language model for this PC.',
   checking: 'Checking local models...',
@@ -78,6 +79,11 @@ export class ModelsPanel {
       onError,
       host: this.panel.querySelector('.preferences-content'),
     });
+    this.localLoadHost = document.createElement('div');
+    this.localLoadHost.className = 'settings-card';
+    this.localLoadHost.id = 'models-local-load-card';
+    this.localLoadHost.hidden = true;
+    this.panel.querySelector('.preferences-content').append(this.localLoadHost);
     this.get = (id) => this.panel.querySelector('#models-' + id);
     this.get('close').onclick = () => this.open(false);
     this.get('choice').onchange = () => this.details();
@@ -375,7 +381,17 @@ export class ModelsPanel {
     if (open) {
       if (this.api.inferenceApiStatus) {
         try {
-          this.setupRequired = (await this.api.inferenceApiStatus()).setupRequired === true;
+          const status = await this.api.inferenceApiStatus();
+          this.setupRequired = status?.setupRequired === true;
+          if (status?.localLoad && this.api.setLocalModelLoad) {
+            this.localLoad = new LocalLoadControls({
+              api: this.api,
+              ui: this.ui,
+              value: status.localLoad,
+            });
+            this.localLoadHost.replaceChildren(this.localLoad.element);
+            this.localLoadHost.hidden = false;
+          }
         } catch (error) {
           this.onError(error.message);
         }

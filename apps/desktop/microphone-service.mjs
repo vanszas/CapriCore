@@ -29,7 +29,8 @@ const startupMessages = Object.freeze({
 });
 const workerStopped = 'The local speech recognizer stopped. Restart the microphone.';
 const canAutoSend = (config, capture) =>
-  Boolean(config.autoSend && (!capture?.systemAudioReview || capture.systemAudioWake));
+  Boolean((config.autoSend || capture?.remote === true) &&
+    (!capture?.systemAudioReview || capture.systemAudioWake));
 
 /** AEC is primary. This only rejects obvious transcripts of Capri's own output. */
 export class EchoGuard {
@@ -239,12 +240,14 @@ export class MicrophoneService {
     }
     this.publish();
   }
-  async start() {
+  async start({ remote = false } = {}) {
+    if (remote && this.capture) throw new Error('Capri microphone is already in use.');
     if (this.capture) return { ...this.snapshot(), sessionId: this.capture.id };
     const generation = ++this.generation,
       id = randomUUID();
     const capture = {
       id,
+      remote,
       generation,
       sequence: 0,
       interrupted: new Set(),
@@ -254,12 +257,12 @@ export class MicrophoneService {
       discardedThrough: -1,
       recognitionPhase: 'idle',
       inputGeneration: 0,
-      conversationMode: this.conversationMode,
+      conversationMode: !remote && this.conversationMode,
     };
     capture.wake = new WakePhraseGate(
       {
         ...this.config.wakeWord,
-        ...(capture.conversationMode ? { enabled: false } : {}),
+        ...(capture.conversationMode || remote ? { enabled: false } : {}),
       },
       {
         onWake: (event) => {

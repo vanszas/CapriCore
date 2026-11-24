@@ -5,6 +5,8 @@ import android.content.Intent
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
+import java.io.File
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -68,6 +70,7 @@ fun RemoteSetupSection() {
     var bgMonitor by remember { mutableStateOf(prefs.backgroundMonitor) }
     var zeroAvatar by remember { mutableStateOf(prefs.zeroAvatarReasoning) }
     var soundUri by remember { mutableStateOf(prefs.notificationSoundUri) }
+    var soundLabel by remember { mutableStateOf(prefs.notificationSoundLabel) }
 
     LaunchedEffect(Unit) { RemoteState.ensureInit(ctx) }
 
@@ -80,8 +83,38 @@ fun RemoteSetupSection() {
                 res.data?.getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
             }
             val uriStr = picked?.toString().orEmpty()
+            val label = if (picked != null) {
+                runCatching { RingtoneManager.getRingtone(ctx, picked)?.getTitle(ctx) }.getOrNull().orEmpty()
+            } else ""
             soundUri = uriStr
+            soundLabel = label
             prefs.notificationSoundUri = uriStr
+            prefs.notificationSoundLabel = label
+        }
+    }
+
+    val audioFilePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            runCatching {
+                ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val name = runCatching {
+                ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                    if (c.moveToFirst()) c.getString(0) else null
+                }
+            }.getOrNull()?.takeIf { it.isNotBlank() } ?: "custom-audio"
+            val dest = File(ctx.filesDir, "custom_notification_sound")
+            val copied = runCatching {
+                ctx.contentResolver.openInputStream(uri)?.use { input ->
+                    dest.outputStream().use { output -> input.copyTo(output) }
+                    true
+                } ?: false
+            }.getOrDefault(false)
+            val storedUri = if (copied) Uri.fromFile(dest).toString() else uri.toString()
+            soundUri = storedUri
+            soundLabel = name
+            prefs.notificationSoundUri = storedUri
+            prefs.notificationSoundLabel = name
         }
     }
 
@@ -157,26 +190,37 @@ fun RemoteSetupSection() {
             prefs.zeroAvatarReasoning = enabled
         }
 
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Column(Modifier.weight(1f)) {
                 Text(tr("Notification sound"), color = INK, fontFamily = SANS, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                 Text(
-                    if (soundUri.isBlank()) tr("Silent / default") else soundUri.substringAfterLast('/'),
+                    soundLabel.ifBlank { if (soundUri.isBlank()) tr("Silent / default") else soundUri.substringAfterLast('/') },
                     color = MUTED, fontFamily = MONO, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
             }
-            SmallChip(tr("Pick"), CYAN) {
+            SmallChip(tr("Audio / MP3"), GREEN) {
+                audioFilePicker.launch(arrayOf("audio/*"))
+            }
+            SmallChip(tr("System"), CYAN) {
                 val i = Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
                     putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_NOTIFICATION)
                     putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, true)
-                    if (soundUri.isNotBlank()) putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, Uri.parse(soundUri))
+                    if (soundUri.isNotBlank() && !soundUri.startsWith("file://")) {
+                        putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, Uri.parse(soundUri))
+                    }
                 }
                 soundPicker.launch(i)
             }
             if (soundUri.isNotBlank()) {
+                SmallChip(tr("Test"), CYAN) {
+                    RemoteMonitorService.playTone(ctx, soundUri)
+                }
                 SmallChip(tr("Clear"), MUTED) {
                     soundUri = ""
+                    soundLabel = ""
                     prefs.notificationSoundUri = ""
+                    prefs.notificationSoundLabel = ""
+                    runCatching { File(ctx.filesDir, "custom_notification_sound").delete() }
                 }
             }
         }

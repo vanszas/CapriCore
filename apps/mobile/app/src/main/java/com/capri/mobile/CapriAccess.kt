@@ -65,8 +65,54 @@ class CapriAccess : AccessibilityService() {
 
     private var lastScan = 0L
 
+    private fun isKeyboardPkg(pkg: String?): Boolean {
+        if (pkg.isNullOrBlank()) return false
+        val low = pkg.lowercase()
+        return low.contains("inputmethod") ||
+            low.contains("keyboard") ||
+            low.contains("gboard") ||
+            low.contains("honeyboard") ||
+            low.contains("swiftkey") ||
+            low.contains("latinime") ||
+            low.contains("openboard") ||
+            low.contains("fleksy") ||
+            low.contains("anysoftkeyboard") ||
+            low.endsWith(".ime")
+    }
+
     private fun checkKeyboard() {
-        keyboard = runCatching { windows.any { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD } }.getOrDefault(false)
+        refreshKeyboard()
+    }
+
+    fun refreshKeyboard(): Boolean {
+        val active = runCatching {
+            val r = Rect()
+            windows.any { w ->
+                w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD &&
+                    run { w.getBoundsInScreen(r); r.width() > 100 && r.height() > 100 }
+            }
+        }.getOrDefault(false)
+        keyboard = active
+        return active
+    }
+
+    private fun appWindowRoot(): AccessibilityNodeInfo? {
+        val winList = runCatching { windows }.getOrNull().orEmpty()
+        val candidates = winList.mapNotNull { w ->
+            if (w.type != android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION) return@mapNotNull null
+            val root = runCatching { w.root }.getOrNull() ?: return@mapNotNull null
+            val pkg = root.packageName?.toString()
+            if (pkg in ignore || isKeyboardPkg(pkg)) return@mapNotNull null
+            val bounds = Rect().also { w.getBoundsInScreen(it) }
+            if (bounds.isEmpty) return@mapNotNull null
+            Triple(w, root, bounds)
+        }
+        val preferred = candidates.firstOrNull { (w, _, _) -> w.isActive || w.isFocused }
+            ?: candidates.maxByOrNull { (w, _, _) -> w.layer }
+        if (preferred != null) return preferred.second
+        val fallback = runCatching { rootInActiveWindow }.getOrNull() ?: return null
+        val fallbackPkg = fallback.packageName?.toString()
+        return if (fallbackPkg in ignore || isKeyboardPkg(fallbackPkg)) null else fallback
     }
 
     override fun onAccessibilityEvent(e: AccessibilityEvent) {
@@ -129,7 +175,7 @@ class CapriAccess : AccessibilityService() {
 
     fun screenText(max: Int = 900): String {
         sawPassword = false
-        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return ""
+        val root = appWindowRoot() ?: return ""
         val seen = LinkedHashSet<String>()
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
@@ -137,7 +183,7 @@ class CapriAccess : AccessibilityService() {
         while (queue.isNotEmpty() && n < 600) {
             val node = queue.removeFirst()
             n++
-            if (!node.isVisibleToUser) continue
+            if (!node.isVisibleToUser || isKeyboardPkg(node.packageName?.toString())) continue
             if (node.isPassword) sawPassword = true
             if (node.isPassword || node.isEditable) continue  // never what you type
             for (t in listOf(node.text, node.contentDescription)) {
@@ -156,7 +202,7 @@ class CapriAccess : AccessibilityService() {
     /** The tappable things on screen (app icons, buttons, cards): their tops are places she can sit. */
     private fun scan() {
         lastScan = android.os.SystemClock.uptimeMillis()
-        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return
+        val root = appWindowRoot() ?: return
         val boxes = ArrayList<Rect>()
         val dm = resources.displayMetrics
         val minSide = (28 * dm.density).toInt()
@@ -167,7 +213,7 @@ class CapriAccess : AccessibilityService() {
         while (queue.isNotEmpty() && seen < 500) {
             val n = queue.removeFirst()
             seen++
-            if (!n.isVisibleToUser) continue
+            if (!n.isVisibleToUser || isKeyboardPkg(n.packageName?.toString())) continue
             if (n.isEditable) Rect().also { n.getBoundsInScreen(it); boxes.add(it) }
             if (n.isClickable || n.isLongClickable) {
                 val r = Rect()
@@ -227,7 +273,7 @@ class CapriAccess : AccessibilityService() {
     fun clickText(query: String): Boolean {
         val q = query.trim().lowercase()
         if (q.isEmpty()) return false
-        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return false
+        val root = appWindowRoot() ?: return false
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         var best: AccessibilityNodeInfo? = null
@@ -235,7 +281,7 @@ class CapriAccess : AccessibilityService() {
         while (queue.isNotEmpty() && seen < 500) {
             val n = queue.removeFirst()
             seen++
-            if (!n.isVisibleToUser) continue
+            if (!n.isVisibleToUser || isKeyboardPkg(n.packageName?.toString())) continue
             val text = n.text?.toString()?.trim().orEmpty()
             val desc = n.contentDescription?.toString()?.trim().orEmpty()
             if (text.equals(q, ignoreCase = true) || desc.equals(q, ignoreCase = true)) {
@@ -261,9 +307,9 @@ class CapriAccess : AccessibilityService() {
     }
 
     fun typeText(value: String): Boolean {
-        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return false
+        val root = appWindowRoot() ?: return false
         val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-        if (focused != null && focused.isEditable && !focused.isPassword) {
+        if (focused != null && focused.isEditable && !focused.isPassword && !isKeyboardPkg(focused.packageName?.toString())) {
             val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value) }
             if (focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return true
         }
@@ -273,7 +319,7 @@ class CapriAccess : AccessibilityService() {
         while (queue.isNotEmpty() && seen < 400) {
             val n = queue.removeFirst()
             seen++
-            if (n.isVisibleToUser && n.isEditable && !n.isPassword) {
+            if (n.isVisibleToUser && n.isEditable && !n.isPassword && !isKeyboardPkg(n.packageName?.toString())) {
                 n.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
                 val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value) }
                 if (n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return true
@@ -284,7 +330,7 @@ class CapriAccess : AccessibilityService() {
     }
 
     fun dumpVisibleScreen(maxNodes: Int = 35): String {
-        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return ""
+        val root = appWindowRoot() ?: return ""
         val lines = ArrayList<String>(maxNodes)
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
@@ -292,7 +338,7 @@ class CapriAccess : AccessibilityService() {
         while (queue.isNotEmpty() && seen < 400 && lines.size < maxNodes) {
             val n = queue.removeFirst()
             seen++
-            if (!n.isVisibleToUser || n.isPassword) continue
+            if (!n.isVisibleToUser || n.isPassword || isKeyboardPkg(n.packageName?.toString())) continue
             val label = n.text?.toString()?.trim().orEmpty().ifEmpty { n.contentDescription?.toString()?.trim().orEmpty() }
             if (label.isNotEmpty() && (n.isClickable || n.isEditable || label.length >= 2)) {
                 val tag = when {

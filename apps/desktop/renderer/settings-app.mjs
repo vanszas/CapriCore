@@ -1847,8 +1847,10 @@ async function refreshAgentRemoteSettings() {
     const toggle = $('agent-remote-settings-server');
     toggle.setAttribute('aria-pressed', String(process.running));
     toggle.textContent = process.running ? 'Stop server' : 'Start server';
+    $('agent-remote-autostart-capri').checked = Boolean(process.autoStartCapri);
+    $('agent-remote-autostart-server').checked = Boolean(process.autoStartServer);
     if (process.running && process.mode === 'desktop') {
-      state.textContent = 'Server running locally. Stop it and select Tailscale (Android) to pair a phone.';
+      state.textContent = 'Server running locally. Pair Windows or Android to switch to Tailscale.';
     }
     if (process.running && process.mode !== 'desktop') {
       const image = await raw.agentRemoteServer('qr');
@@ -1903,7 +1905,59 @@ document.getElementById('agent-remote-settings-mode').addEventListener('change',
     currentTarget.disabled = $('agent-remote-settings-server').getAttribute('aria-pressed') === 'true';
   }
 });
+$('agent-remote-android-pair').addEventListener('click', async ({ currentTarget }) => {
+  currentTarget.disabled = true;
+  try {
+    await raw.agentRemoteServer('android-pair');
+    await refreshAgentRemoteSettings();
+  } catch (error) {
+    $('agent-remote-settings-server-state').textContent = error.message;
+  } finally {
+    currentTarget.disabled = false;
+  }
+});
+$('agent-remote-pc-create').addEventListener('click', async ({ currentTarget }) => {
+  const status = $('agent-remote-pc-status');
+  currentTarget.disabled = true;
+  try {
+    const server = await raw.agentRemoteServer('pc-pair');
+    await refreshAgentRemoteSettings();
+    $('agent-remote-pc-ip').value = server.tailscaleIp ?? '';
+    $('agent-remote-pc-details').hidden = false;
+    status.textContent = 'Connect from Capri Remote on the other PC and approve the request here.';
+  } catch (error) {
+    status.textContent = error.message;
+  } finally {
+    currentTarget.disabled = false;
+  }
+});
 document.getElementById('agent-remote-settings-server').addEventListener('click', toggleAgentRemoteSettingsServer);
+document.getElementById('agent-remote-autostart-capri').addEventListener('change', async (event) => {
+  const input = event.currentTarget;
+  input.disabled = true;
+  try {
+    await raw.agentRemoteServer({ action: 'auto-start-capri', enabled: input.checked });
+    await refreshAgentRemoteSettings();
+  } catch (error) {
+    $('agent-remote-settings-server-state').textContent = error.message || 'Auto-start Capri failed';
+    await refreshAgentRemoteSettings();
+  } finally {
+    input.disabled = false;
+  }
+});
+document.getElementById('agent-remote-autostart-server').addEventListener('change', async (event) => {
+  const input = event.currentTarget;
+  input.disabled = true;
+  try {
+    await raw.agentRemoteServer({ action: 'auto-start-server', enabled: input.checked });
+    await refreshAgentRemoteSettings();
+  } catch (error) {
+    $('agent-remote-settings-server-state').textContent = error.message || 'Auto-start server failed';
+    await refreshAgentRemoteSettings();
+  } finally {
+    input.disabled = false;
+  }
+});
 document.getElementById('agent-remote-settings-debate').addEventListener('click', () => sendAgentRemoteCommand('/debate'));
 document.getElementById('agent-remote-settings-fable').addEventListener('click', () => sendAgentRemoteCommand('/fable-mind'));
 const settingsGuide = new SettingsGuide({

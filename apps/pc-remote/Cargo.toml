@@ -1,0 +1,13 @@
+[package]
+name = "capri-remote"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cpal = "0.15"
+eframe = { version = "0.31", features = ["persistence"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+keyring = { version = "3", features = ["windows-native"] }
+rodio = { version = "0.19", default-features = false, features = ["wav", "mp3"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }

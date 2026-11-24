@@ -734,8 +734,8 @@ export class ChatService {
       recentOwner && Date.now() - Date.parse(recentOwner.createdAt) <= 10 * 60_000
         ? recentOwner.text.slice(0, 800)
         : undefined;
-    const retry = !input.mode && computerTaskRetry(input.text)
-      ? this.unroutedComputerRetry()
+    const retry = (!input.mode || input.mode === 'computer') && computerTaskRetry(input.text)
+      ? this.computerRetryContext() ?? this.unroutedComputerRetry()
       : undefined;
     const retryGoal = state.fullComputerAccess && state.computerSkillEnabled !== false
       ? retry?.goal
@@ -2072,5 +2072,24 @@ export class ChatService {
       return Number.isFinite(age) && age >= 0 && age <= 30 * 60_000 ? { goal: owner.text } : {};
     }
     return undefined;
+  }
+
+  computerRetryContext() {
+    const history = this.store.snapshot();
+    const latest = history.findLast((entry) => entry.role === 'user');
+    const result = latest && history.findLast((entry) =>
+      entry.turnId === latest.turnId && entry.role === 'assistant' && entry.computerTask,
+    );
+    if (!result) return undefined;
+    const age = Date.now() - Date.parse(latest.createdAt);
+    if (!Number.isFinite(age) || age < 0 || age > 10 * 60_000) return {};
+    const task = result.computerTask;
+    if (
+      task.status === 'needs_user' &&
+      task.steps === 0 &&
+      !computerTaskRetry(latest.text) &&
+      computerModeRequest(latest.text, { fullComputerAccess: true })?.run
+    ) return { goal: latest.text };
+    return {};
   }
 }

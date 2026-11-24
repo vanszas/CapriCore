@@ -66,6 +66,10 @@ class TypeBox(context: Context, dp: Float, private val send: (String) -> Unit, p
 
     private fun submit() {
         val text = field.text.toString().trim()
+        runCatching {
+            (context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+                .hideSoftInputFromWindow(field.windowToken, 0)
+        }
         close()
         if (text.isNotEmpty()) send(text)
     }

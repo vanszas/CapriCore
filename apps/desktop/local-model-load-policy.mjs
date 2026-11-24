@@ -1,18 +1,45 @@
 // SPDX-License-Identifier: GPL-3.0-only
-export const LOCAL_LOAD_DEFAULTS = Object.freeze({ enabled: true, percent: 85 });
+export const LOCAL_LOAD_DEFAULTS = Object.freeze({
+  enabled: true,
+  percent: 85,
+  idleUnloadEnabled: true,
+  idleUnloadMinutes: 10,
+});
 export function localLoadSettings(value) {
   if (
     !value ||
     typeof value !== 'object' ||
     Array.isArray(value) ||
-    Object.keys(value).some((key) => !['enabled', 'percent'].includes(key)) ||
+    Object.keys(value).some(
+      (key) => !['enabled', 'percent', 'idleUnloadEnabled', 'idleUnloadMinutes'].includes(key),
+    ) ||
     typeof value.enabled !== 'boolean' ||
     !Number.isInteger(value.percent) ||
     value.percent < 10 ||
     value.percent > 100
   )
     throw new Error('Invalid local model load limit.');
-  return { enabled: value.enabled, percent: value.percent };
+  const idleUnloadEnabled =
+    value.idleUnloadEnabled === undefined
+      ? LOCAL_LOAD_DEFAULTS.idleUnloadEnabled
+      : value.idleUnloadEnabled;
+  const idleUnloadMinutes =
+    value.idleUnloadMinutes === undefined
+      ? LOCAL_LOAD_DEFAULTS.idleUnloadMinutes
+      : value.idleUnloadMinutes;
+  if (
+    typeof idleUnloadEnabled !== 'boolean' ||
+    !Number.isInteger(idleUnloadMinutes) ||
+    idleUnloadMinutes < 1 ||
+    idleUnloadMinutes > 120
+  )
+    throw new Error('Invalid local model load limit.');
+  return {
+    enabled: value.enabled,
+    percent: value.percent,
+    idleUnloadEnabled,
+    idleUnloadMinutes,
+  };
 }
 
 /** GPU control is feedback through the model runner's CPU submission budget.

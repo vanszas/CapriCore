@@ -19,6 +19,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -39,12 +41,17 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -57,6 +64,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.flow.first
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -77,8 +86,14 @@ fun ChatTab(go: (Tab) -> Unit) {
     var running by remember { mutableStateOf(CapriService.running) }
     var text by remember { mutableStateOf("") }
     var askingPc by remember { mutableStateOf(false) }
+    var sendingDraft by remember { mutableStateOf(false) }
+    var controlPhone by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focus = LocalFocusManager.current
+    val density = LocalDensity.current
+    val ime = WindowInsets.ime
     val remoteProfile = RemoteState.activeProfile
     val remote = remember(remoteProfile) { RemoteState.client(ctx) }
     var speaker by remember { mutableStateOf<Speaker?>(null) }
@@ -87,6 +102,14 @@ fun ChatTab(go: (Tab) -> Unit) {
     DisposableEffect(Unit) {
         onDispose { speaker?.release() }
     }
+    fun saveReply(line: String, reply: String) {
+        val saved = JSONArray()
+        (msgs + (line to reply)).takeLast(8).forEach { (u, a) ->
+            saved.put(JSONObject().put("u", u).put("a", a))
+        }
+        prefs.chat = saved.toString()
+        msgs = history(prefs)
+    }
     fun send(line: String, spoken: Boolean) {
         if (line.isBlank() || askingPc) return
         if (line.length > 4000) {
@@ -94,6 +117,24 @@ fun ChatTab(go: (Tab) -> Unit) {
             return
         }
         error = ""
+        if (controlPhone) {
+            val command = line.trim()
+            if (command.equals("lihat layar", ignoreCase = true) || command.equals("look at my screen", ignoreCase = true)) {
+                pending = line
+                CapriService.chatLine = ""
+                ctx.startService(Intent(ctx, CapriService::class.java).setAction(CapriService.ACTION_ASK)
+                    .putExtra("text", line).putExtra("lookAtPhone", true))
+                return
+            }
+            val reply = PhoneControl.handleDirect(ctx, command)
+            if (reply == null) {
+                error = "Gunakan perintah seperti buka Chrome, klik nama tombol, atau lihat layar."
+                if (text.isBlank()) text = line
+            } else {
+                saveReply(line, reply)
+            }
+            return
+        }
         pending = line
         CapriService.chatLine = ""
         if (remote == null) {
@@ -107,12 +148,7 @@ fun ChatTab(go: (Tab) -> Unit) {
                 val turns = JSONArray()
                 msgs.takeLast(6).forEach { (u, a) -> turns.put(JSONObject().put("u", u).put("a", a)) }
                 val reply = withContext(Dispatchers.IO) { remote.capriChat(line, turns) }
-                val saved = JSONArray()
-                (msgs + (line to reply)).takeLast(8).forEach { (u, a) ->
-                    saved.put(JSONObject().put("u", u).put("a", a))
-                }
-                prefs.chat = saved.toString()
-                msgs = history(prefs)
+                saveReply(line, reply)
                 if (spoken || prefs.voice) {
                     val output = speaker ?: Speaker(ctx) {
                         error = tr("Voice playback failed. Check Android text-to-speech settings.")
@@ -168,11 +204,13 @@ fun ChatTab(go: (Tab) -> Unit) {
         }
     }
     val writing = live.isNotEmpty() && live != "..." && live != "*looking*"
-    LaunchedEffect(msgs.size, pending, live.length) {
+    val imeVisible = ime.getBottom(density) > 0
+    LaunchedEffect(msgs.size, pending, live.length, imeVisible) {
+        withFrameNanos { }
         val n = list.layoutInfo.totalItemsCount
         if (n > 0) list.scrollToItem(n - 1)
     }
-    val online = remote != null || (running && CapriService.brainOnline)
+    val online = controlPhone || remote != null || (running && CapriService.brainOnline)
 
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -180,8 +218,17 @@ fun ChatTab(go: (Tab) -> Unit) {
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text("Capri", color = INK, fontFamily = SANS, fontWeight = FontWeight.ExtraBold, fontSize = 18.sp)
-                Text(if (remote != null) tr("Paired PC") else if (running) status else tr("offline"), color = MUTED, fontFamily = SANS, fontSize = 12.sp, maxLines = 1)
+                Text(if (controlPhone) "HP ini" else if (remote != null) tr("Paired PC") else if (running) status else tr("offline"), color = MUTED, fontFamily = SANS, fontSize = 12.sp, maxLines = 1)
             }
+            Text(
+                if (controlPhone) "Kembali ke chat" else "Kontrol HP",
+                color = if (controlPhone) CYAN else PINK,
+                fontSize = 12.sp,
+                modifier = Modifier.clickable(enabled = !askingPc && !sendingDraft && pending.isEmpty()) {
+                    controlPhone = !controlPhone
+                    error = ""
+                }.padding(8.dp),
+            )
             if (msgs.isNotEmpty()) Text(tr("Clear"), color = PINK, fontFamily = SANS, fontWeight = FontWeight.SemiBold, fontSize = 13.sp,
                 modifier = Modifier.clickable { prefs.chat = "[]"; CapriService.chatLine = ""; pending = "" }.padding(8.dp))
         }
@@ -217,7 +264,7 @@ fun ChatTab(go: (Tab) -> Unit) {
                     colors = capriField(), shape = chamfer(9.dp), modifier = Modifier.weight(1f))
                 Spacer(Modifier.width(8.dp))
                 val hasDraft = text.isNotBlank()
-                Box(Modifier.size(52.dp).background(PINK, chamfer(9.dp)).clickable(enabled = !askingPc) {
+                Box(Modifier.size(52.dp).background(PINK, chamfer(9.dp)).clickable(enabled = !askingPc && !sendingDraft) {
                     if (hasDraft) {
                         val line = text.trim()
                         if (line.length > 4000) {
@@ -225,7 +272,20 @@ fun ChatTab(go: (Tab) -> Unit) {
                             return@clickable
                         }
                         text = ""
-                        send(line, spoken = false)
+                        sendingDraft = true
+                        keyboard?.hide()
+                        focus.clearFocus()
+                        scope.launch {
+                            try {
+                                withTimeoutOrNull(750) {
+                                    snapshotFlow { ime.getBottom(density) }.first { it == 0 }
+                                }
+                                withFrameNanos { }
+                                send(line, spoken = false)
+                            } finally {
+                                sendingDraft = false
+                            }
+                        }
                     } else {
                         speaker?.stop()
                         error = ""

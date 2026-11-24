@@ -65,10 +65,14 @@ export class WindowsAudioEndpoints {
     }
   }
 
+  captureDefaultOutput(options) {
+    return this.capture(null, options);
+  }
+
   async capture(id, { onPacket, onError = () => {}, signal } = {}) {
     if (
       this.platform !== 'win32' ||
-      !validWindowsAudioEndpointId(id) ||
+      (id !== null && !validWindowsAudioEndpointId(id)) ||
       typeof onPacket !== 'function'
     )
       throw new Error(startFailure);
@@ -77,7 +81,7 @@ export class WindowsAudioEndpoints {
     try {
       const executable = await this.prepare(this.root, 'audio-endpoints');
       signal?.throwIfAborted();
-      child = this.spawnProcess(executable, ['capture', id], {
+      child = this.spawnProcess(executable, id === null ? ['capture-default-output'] : ['capture', id], {
         windowsHide: true,
         stdio: ['pipe', 'pipe', 'ignore'],
       });

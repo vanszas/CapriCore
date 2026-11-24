@@ -4,10 +4,15 @@ import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.BufferedInputStream
+import java.io.DataInputStream
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
 
 class RemoteHttpException(val code: Int, override val message: String) : RuntimeException(message)
 
@@ -268,13 +273,21 @@ class RemoteClient(
         return decodeSession(obj.optJSONObject("session") ?: obj)
     }
 
-    fun capriChat(message: String, history: JSONArray): String =
+    fun capriChat(message: String, history: JSONArray, screenMonitor: String? = null): String =
         requestJson(
             "POST",
             "/api/capri/chat",
-            JSONObject().put("message", message).put("history", history),
+            JSONObject().put("message", message).put("history", history).apply {
+                if (screenMonitor != null) put("screen_monitor", screenMonitor)
+            },
             readTimeoutMs = 35000,
         ).getString("reply")
+
+    fun launchDesktopApp(name: String) {
+        require(name.matches(Regex("""[\p{L}\p{N} _.-]{1,80}"""))) { "Masukkan nama aplikasi PC, tanpa path atau argumen." }
+        val response = requestJson("POST", "/api/desktop/apps/open", JSONObject().put("app", name))
+        check(response.optBoolean("ok")) { "PC tidak bisa membuka $name." }
+    }
 
     fun loadSession(id: String): RemoteSession {
         val obj = requestJson("GET", "/api/sessions/$id")
@@ -396,6 +409,72 @@ class RemoteClient(
 
     fun screenInfo(): JSONObject = requestJson("GET", "/api/screen/info")
 
+    fun screenDetail(monitor: String, region: String): ByteArray? {
+        val conn = open("GET", "/api/screen/frame",
+            mapOf("monitor" to monitor, "region" to region, "quality" to "92"), readTimeoutMs = 2500)
+        try {
+            if (conn.responseCode != 200 || conn.getHeaderField("X-Capri-Screen-Region") != "1") return null
+            val length = conn.contentLength
+            if (length !in 1..(8 * 1024 * 1024)) return null
+            return DataInputStream(conn.inputStream).use { input ->
+                ByteArray(length).also { input.readFully(it) }
+            }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    fun screenFrames(resolution: String, quality: Int, monitor: String, fps: Int, mbps: Int) = flow {
+        val conn = open("GET", "/api/screen/stream", mapOf(
+            "res" to resolution, "quality" to "$quality", "monitor" to monitor,
+            "fps" to "$fps", "max_kbps" to "${mbps * 1000}",
+        ), readTimeoutMs = 5000)
+        try {
+            conn.setRequestProperty("Accept", "multipart/x-mixed-replace")
+            val code = conn.responseCode
+            if (code !in 200..299) throw RemoteHttpException(code, "Screen stream HTTP $code")
+            DataInputStream(BufferedInputStream(conn.inputStream, 65536)).use { input ->
+                fun headerLine(): String {
+                    val line = StringBuilder()
+                    while (line.length < 512) {
+                        val byte = input.readUnsignedByte()
+                        if (byte == 10) return line.toString().trimEnd('\r')
+                        line.append(byte.toChar())
+                    }
+                    error("Invalid screen stream header")
+                }
+                while (true) {
+                    var boundary = headerLine()
+                    if (boundary.isEmpty()) boundary = headerLine()
+                    check(boundary == "--frame") { "Invalid screen frame boundary" }
+                    var length = 0
+                    for (i in 0..8) {
+                        val header = headerLine()
+                        if (header.isEmpty()) break
+                        check(i < 8) { "Too many screen frame headers" }
+                        if (header.startsWith("Content-Length:", ignoreCase = true)) {
+                            length = header.substringAfter(':').trim().toIntOrNull() ?: 0
+                        }
+                    }
+                    check(length in 1..(8 * 1024 * 1024)) { "Invalid screen frame size" }
+                    emit(ByteArray(length).also { input.readFully(it) })
+                }
+            }
+        } finally {
+            conn.disconnect()
+        }
+    }.flowOn(Dispatchers.IO)
+
+    fun approveHostAudio(): RemoteClient {
+        val response = requestJson("POST", "/api/remote-pc/audio-permission", readTimeoutMs = 45_000)
+        val audioToken = response.optString("audio_token")
+        check(audioToken.startsWith("capri-audio-")) { "Host audio approval did not return a token" }
+        return RemoteClient(baseUrl, audioToken, deviceId)
+    }
+
+    fun hostAudio(after: Long): JSONObject =
+        requestJson("GET", "/api/remote-pc/audio", query = mapOf("after" to after.toString()), readTimeoutMs = 12_000)
+
     fun screenFrame(
         resolution: String = "720p",
         quality: Int = 70,
@@ -415,6 +494,7 @@ class RemoteClient(
         text: String = "",
         monitor: String = "primary",
         pointer: String = "",
+        mouseMode: String = "virtual",
     ): JSONObject = requestJson(
         "POST",
         "/api/screen/input",
@@ -427,8 +507,11 @@ class RemoteClient(
             .put("key", key)
             .put("text", text)
             .put("monitor", monitor)
-            .put("pointer", pointer),
-        readTimeoutMs = 8000,
+            .put("pointer", pointer)
+            .put("mouse_mode", mouseMode)
+            .put("device_name", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim())
+            .put("full_control", true),
+        readTimeoutMs = if (action == "pointer_move") 400 else 8000,
     )
 
     fun sendHotkey(key: String): JSONObject =
