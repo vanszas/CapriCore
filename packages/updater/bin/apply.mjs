@@ -4,6 +4,7 @@ import { readFileSync, appendFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { applyUpdate, managedInstallation } from '../src/transaction.mjs';
+import { progressReporter } from '../src/events.mjs';
 const file = process.argv[2];
 if (!file || !path.isAbsolute(file)) throw new Error('An absolute update request is required');
 const request = JSON.parse(readFileSync(file, 'utf8'));
@@ -14,12 +15,13 @@ const allowed = path.join(path.resolve(request.root), '.runtime/updates') + path
 for (const value of [file, request.source, request.events, request.proceed, request.cancel])
   if (typeof value !== 'string' || !path.resolve(value).startsWith(allowed))
     throw new Error('Update job must stay inside the installation cache');
-const emit = (event) =>
+const emit = progressReporter((event) =>
   appendFileSync(
     request.events,
     JSON.stringify({ ...event, at: new Date().toISOString() }) + '\n',
     'utf8',
-  );
+  ),
+);
 try {
   emit({ phase: 'waiting' });
   let stopped = false;
@@ -42,6 +44,7 @@ try {
   if (!stopped) throw new Error('Capri did not close in time. The installation was not changed.');
   await applyUpdate(request, { emit });
 } catch (error) {
-  emit({ phase: 'failed', message: error.message.slice(0, 1200) });
   process.exitCode = 1;
+  console.error(error);
+  emit({ phase: 'failed', message: error.message.slice(0, 1200) });
 }

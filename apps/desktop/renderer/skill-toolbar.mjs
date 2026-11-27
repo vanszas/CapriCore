@@ -14,6 +14,25 @@ export function skillToolbar({ ui, openSettings, onLayout, inputMic }) {
   group.className = 'toolbar-group skills-toolbar';
   group.setAttribute('role', 'group');
   toolbar.prepend(group);
+  group.addEventListener('scroll', onLayout, { passive: true });
+  group.addEventListener(
+    'wheel',
+    (event) => {
+      if (
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.deltaX ||
+        !event.deltaY ||
+        group.scrollWidth <= group.clientWidth
+      )
+        return;
+      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? group.clientWidth : 1;
+      const direction = getComputedStyle(group).direction === 'rtl' ? -1 : 1;
+      group.scrollLeft += event.deltaY * unit * direction;
+      event.preventDefault();
+    },
+    { passive: false },
+  );
   let previousHeight;
   new ResizeObserver(([entry]) => {
     const unit =

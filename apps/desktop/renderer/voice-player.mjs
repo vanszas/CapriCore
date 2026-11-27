@@ -629,6 +629,13 @@ export class VoicePlayer {
     const revision = this.revision,
       effects = this.output?.effects,
       tail = effects?.tailSeconds ?? 0;
+    const complete = () => {
+      this.clearTurnEffects();
+      this.onState({
+        busy: false,
+        ...(!this.firstPlayback && this.turnId && { completedTurnId: this.turnId }),
+      });
+    };
     clearTimeout(this.tailTimer);
     effects?.speaking(false);
     if (this.output !== this.speakers) this.speakers.effects?.speaking(false);
@@ -636,14 +643,11 @@ export class VoicePlayer {
       this.onState({ busy: true });
       this.tailTimer = setTimeout(() => {
         if (revision === this.revision && !this.source && !this.queue.length) {
-          this.clearTurnEffects();
-          this.onState({ busy: false });
+          complete();
         }
       }, tail * 1000);
-    } else {
-      if (this.generated) this.clearTurnEffects();
-      this.onState({ busy: !this.generated, waiting: !this.generated });
-    }
+    } else if (this.generated) complete();
+    else this.onState({ busy: true, waiting: true });
   }
   accept(event) {
     if (event.turnId !== this.turnId || event.sequence !== this.sequence) return;

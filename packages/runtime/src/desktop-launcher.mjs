@@ -1,5 +1,6 @@
 import { existsSync, writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { root, paths } from './host/paths.mjs';
 import { initialize } from './context.mjs';
 import { launch, managedProcess, stopProcess } from './host/processes.mjs';
@@ -13,11 +14,13 @@ export async function startDesktop({ wait = false } = {}) {
     throw new Error(
       'An update is in progress or was interrupted. Wait for it to finish, or repair this folder with the full installer.',
     );
-  if (process.platform !== 'win32' || process.arch !== 'x64')
-    throw new Error(
-      'This desktop preview currently targets Windows x64. Runtime unit tests also run on Linux.',
-    );
-  if (!existsSync(path.join(root, 'config/core.local.json')))
+  const linux = process.platform === 'linux';
+  const mac = process.platform === 'darwin' && process.arch === 'arm64';
+  if (!mac && ((!linux && process.platform !== 'win32') || process.arch !== 'x64'))
+    throw new Error('Capri desktop requires Windows or Linux on x86-64, or an Apple Silicon Mac.');
+  if (linux && !process.env.DISPLAY)
+    throw new Error('Start Capri in a desktop session with X11 or XWayland.');
+  if (!linux && !mac && !existsSync(path.join(root, 'config/core.local.json')))
     throw new Error('Run npm run setup first to choose a hardware profile.');
   const existing = managedProcess('desktop');
   if (existing) {
@@ -27,14 +30,32 @@ export async function startDesktop({ wait = false } = {}) {
     );
     return { ...existing, alreadyRunning: true };
   }
-  if (!electronBundleReady(path.join(root, 'node_modules/electron')))
+  const electronPackage = path.join(root, 'node_modules/electron');
+  if (linux && !electronBundleReady(electronPackage, undefined, 'linux')) {
+    try {
+      createRequire(path.join(root, 'package.json'))('electron');
+    } catch (cause) {
+      throw new Error('Could not prepare Electron for Linux. Run npm ci and try again.', { cause });
+    }
+  }
+  if (!electronBundleReady(electronPackage, undefined, process.platform)) {
+    if (mac)
+      throw new Error(
+        'The Apple Silicon Electron runtime is incomplete. Run npm ci and try again.',
+      );
     throw new Error(
-      'The Capri desktop download is incomplete. Open Capri Setup again, select this installation folder and choose Retry or Repair. Keep Setup open until it finishes; microphone and voice are optional.',
+      linux
+        ? 'The Capri desktop download is incomplete. Run npm ci and try again.'
+        : 'The Capri desktop download is incomplete. Open Capri Setup again, select this installation folder and choose Retry or Repair. Keep Setup open until it finishes; microphone and voice are optional.',
     );
+  }
   const rt = runtime();
   initialize(rt);
-  let executable = path.join(root, 'node_modules/electron/dist/electron.exe');
-  executable = await ensureDesktopIdentity(executable);
+  const executable = mac
+    ? path.join(electronPackage, 'dist/Electron.app/Contents/MacOS/Electron')
+    : await ensureDesktopIdentity(
+        path.join(electronPackage, 'dist', linux ? 'electron' : 'electron.exe'),
+      );
   for (const action of ['stop', 'show'])
     try {
       unlinkSync(path.join(paths.data, 'run', `desktop.${action}`));
@@ -54,7 +75,7 @@ export async function startDesktop({ wait = false } = {}) {
     const marker = await launch(
       'desktop',
       executable,
-      [path.join(root, 'apps/desktop/main.mjs')],
+      [...(linux ? ['--ozone-platform=x11'] : []), path.join(root, 'apps/desktop/main.mjs')],
       rt,
       wait ? { onExit: ended } : {},
     );

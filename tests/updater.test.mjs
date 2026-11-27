@@ -10,6 +10,8 @@ import {
   existsSync,
   copyFileSync,
   readdirSync,
+  linkSync,
+  unlinkSync,
 } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -339,6 +341,10 @@ test('an update from an older installation includes and synchronizes new local C
     'private conversation',
   );
   assert.equal(json(path.join(plan.root, '.capri-install.json')).releaseTag, plan.tag);
+  assert.equal(
+    json(path.join(plan.root, '.capri-install.json')).previousReleaseTag,
+    'v0.3.0-preview.13',
+  );
 });
 
 test('an update requiring npm refuses insufficient disk space before replacing source', async () => {
@@ -370,6 +376,43 @@ test('failed registration rolls back source and identity, and a retry succeeds',
   assert.equal(json(path.join(plan.root, '.capri-install.json')).releaseTag, undefined);
   await applyUpdate(plan, { execute: async () => {} });
   assert.equal(json(path.join(plan.root, 'config/release.json')).tag, plan.tag);
+});
+
+test('progress logging cannot interrupt a rollback or invalidate a committed update', async () => {
+  const plan = fixture();
+  const error = new Error('mock registration failed');
+  const emit = () => {
+    throw new Error('event file is unavailable');
+  };
+  await assert.rejects(
+    applyUpdate(plan, {
+      emit,
+      execute: async (_exe, args) => {
+        if (args.some((arg) => arg.endsWith('register.ps1'))) throw error;
+      },
+    }),
+    (failure) => failure.cause === error && /restored/.test(failure.message),
+  );
+  assert.equal(readFileSync(path.join(plan.root, 'apps/desktop/sample.mjs'), 'utf8'), 'old source');
+  assert.equal(existsSync(path.join(plan.root, '.runtime/updates/active.json')), false);
+  await applyUpdate(plan, { emit, execute: async () => {} });
+  assert.equal(json(path.join(plan.root, '.capri-install.json')).releaseTag, plan.tag);
+  assert.equal(
+    readFileSync(path.join(plan.root, 'data/desktop/transcript.json'), 'utf8'),
+    'private conversation',
+  );
+});
+
+test('invalid active receipt releases the installation lock for retry in the same process', async () => {
+  const plan = fixture();
+  const dir = path.join(plan.root, '.runtime/updates');
+  mkdirSync(dir, { recursive: true });
+  const active = path.join(dir, 'active.json');
+  linkSync(path.join(plan.root, 'data/desktop/transcript.json'), active);
+  await assert.rejects(applyUpdate(plan), /filesystem links/);
+  assert.equal(existsSync(path.join(plan.root, '.runtime/installer/install.lock.json')), false);
+  unlinkSync(active);
+  await applyUpdate(plan, { execute: async () => {} });
 });
 
 test('update payload rejects tampering, unsafe paths and development checkouts before writes', () => {

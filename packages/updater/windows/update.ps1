@@ -92,8 +92,11 @@ function Show-CapriUpdateFailure {
   $bar.AnimateProgress=$false
 }
 function Read-CapriUpdateEvents {
-  if(-not $job.events -or -not (Test-Path -LiteralPath $job.events)){return}
-  $events=@(Get-Content -LiteralPath $job.events -Encoding UTF8)
+  if(-not $job.events){return}
+  try{
+    if(-not (Test-Path -LiteralPath $job.events)){return}
+    $events=@(Get-Content -LiteralPath $job.events -Encoding UTF8 -ErrorAction Stop)
+  }catch{return}
   for($i=$script:lines;$i -lt $events.Count;$i++){
     try{$record=$events[$i]|ConvertFrom-Json}catch{break}
     $script:lines=$i+1
@@ -117,7 +120,8 @@ $timer.Add_Tick({
     if($script:worker -and $script:worker.HasExited){
       [Console]::WriteLine((@{phase='worker-exited';exitCode=$script:worker.ExitCode}|ConvertTo-Json -Compress))
       $timer.Stop();$script:finished=$true;$close.Enabled=$true
-      if($script:worker.ExitCode -eq 0){
+      if($script:worker.ExitCode -eq 0 -and $script:terminalPhase -ne 'failed'){
+        $script:terminalPhase='complete'
         Start-Process -FilePath (Join-Path $job.root 'Capri.exe') -WorkingDirectory $job.root -WindowStyle Hidden
         $form.Close()
       }else{Show-CapriUpdateFailure}
@@ -153,4 +157,4 @@ $form.Add_Shown({
   }
 })
 try{[void]$form.ShowDialog()}finally{$timer.Dispose();$form.Dispose();if($icon){$icon.Dispose()}}
-if($script:verificationFailed){exit 1}
+if($script:verificationFailed -or (-not $Verification -and $script:terminalPhase -ne 'complete')){exit 1}

@@ -115,8 +115,10 @@ export function surfaceLanding(target, action, { area, scale, canvas, frames }) 
     const maxX =
       area.x + area.width - ((art.x + art.width - frame.anchor.x) * scale) / canvas.width;
     if (minX > maxX) continue;
+    // Keep a search field grip on the column the detector actually verified.
+    if (kind === 'search-field' && (candidate.x < minX || candidate.x > maxX)) continue;
     let contactX = Math.max(minX, Math.min(maxX, candidate.x));
-    if (candidate.frameId === 'pose-ceiling') {
+    if (candidate.frameId === 'pose-ceiling' && kind !== 'search-field') {
       // Reserve space for the next trick at this grip, if the ledge permits it.
       const commonMin = Math.max(
         bounds.x,

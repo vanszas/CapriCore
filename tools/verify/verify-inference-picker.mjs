@@ -211,6 +211,76 @@ try {
   assert.equal(await choices.nth(3).isDisabled(), true);
   await page.keyboard.press('Escape');
 
+  await application.evaluate(({ BrowserWindow }) =>
+    BrowserWindow.getAllWindows()
+      .find((item) => item.webContents.getURL().endsWith('/index.html'))
+      .setContentSize(380, 580),
+  );
+  const ticker = badge.locator('#inference-name');
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  const skillVisibility = await page.evaluate(async () => {
+    const { renderInferenceLabel } = await import('./inference-panel.mjs');
+    renderInferenceLabel(
+      {
+        remote: true,
+        authMode: 'chatgpt',
+        providerHost: 'api.openai.com',
+        model: 'fixture/long-model-name-to-check-the-toolbar-overflow',
+      },
+      { text: (value) => value },
+    );
+    return [...document.querySelectorAll('.skills-toolbar button')].map((button) => {
+      const hidden = button.hidden;
+      button.hidden = false;
+      return hidden;
+    });
+  });
+  await page.waitForFunction(() => document.querySelector('#inference-name[data-overflow]'));
+  const toolbar = await ticker.evaluate((viewport) => {
+    const track = viewport.firstElementChild;
+    const button = viewport.closest('button').getBoundingClientRect();
+    const context = document.querySelector('#context-hud').getBoundingClientRect();
+    const actions = document.querySelector('.window-actions').getBoundingClientRect();
+    const quick = [...document.querySelectorAll('#quick-actions button')]
+      .map((item) => item.getBoundingClientRect())
+      .filter((rect) => rect.width > 0);
+    const scroller = document.querySelector('.skills-toolbar');
+    const tickerAnimation = track.getAnimations()[0];
+    tickerAnimation.pause();
+    tickerAnimation.currentTime = tickerAnimation.effect.getTiming().duration * 0.95;
+    const end = track.getBoundingClientRect().right - viewport.getBoundingClientRect().right;
+    tickerAnimation.play();
+    return {
+      tickerWidth: viewport.clientWidth,
+      identityOnFirstRow: button.top >= actions.top && button.bottom <= actions.bottom,
+      contextFits: context.right <= actions.left,
+      actionsFit: actions.right <= innerWidth,
+      secondRow: quick.every((item) => item.top >= actions.bottom && item.top === quick[0].top),
+      canRevealSkills: scroller.scrollWidth > scroller.clientWidth,
+      tickerEnd: end,
+    };
+  });
+  assert(toolbar.tickerWidth > 20, JSON.stringify(toolbar));
+  assert(toolbar.identityOnFirstRow && toolbar.contextFits && toolbar.actionsFit);
+  assert(toolbar.secondRow && toolbar.canRevealSkills);
+  assert(Math.abs(toolbar.tickerEnd) <= 2, JSON.stringify(toolbar));
+  await page.locator('.skills-toolbar').dispatchEvent('wheel', { deltaY: 75, cancelable: true });
+  assert(await page.locator('.skills-toolbar').evaluate((node) => node.scrollLeft > 0));
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  assert.equal(
+    await ticker.locator('.inference-name-track').evaluate((track) => track.getAnimations().length),
+    0,
+  );
+  await page.evaluate(async (hidden) => {
+    document.querySelectorAll('.skills-toolbar button').forEach((button, index) => {
+      button.hidden = hidden[index];
+    });
+    const { renderInferenceLabel } = await import('./inference-panel.mjs');
+    renderInferenceLabel((await window.capri.bootstrap()).inference, { text: (value) => value });
+  }, skillVisibility);
+  await page.emulateMedia({ reducedMotion: null });
+  report.toolbar = toolbar;
+
   for (const [width, height] of [
     [480, 660],
     [320, 480],
@@ -280,6 +350,38 @@ try {
   await page.locator('#message').click();
   assert.equal(await menu.isVisible(), false);
   assert.equal(await application.evaluate(() => globalThis.pickerLoads > 0), true);
+
+  await page.evaluate(async () => {
+    const { companion } = await window.capri.bootstrap();
+    await window.capri.setCompanionSettings({ ...companion, windowLayout: 'horizontal' });
+    const { renderInferenceLabel } = await import('./inference-panel.mjs');
+    renderInferenceLabel({ model: '4B' }, { text: (value) => value });
+  });
+  await page.waitForFunction(() => document.body.hasAttribute('data-horizontal-portrait'));
+  for (const width of [525, 840]) {
+    await application.evaluate(
+      ({ BrowserWindow }, width) =>
+        BrowserWindow.getAllWindows()
+          .find((item) => item.webContents.getURL().endsWith('/index.html'))
+          .setContentSize(width, 350),
+      width,
+    );
+    await page.waitForFunction((width) => innerWidth === width, width);
+    assert(
+      await page.evaluate(() => {
+        const header = document.querySelector('#handle').getBoundingClientRect();
+        const tools = document.querySelector('#quick-actions').getBoundingClientRect();
+        const name = document.getElementById('inference-name');
+        return (
+          tools.right <= innerWidth &&
+          (tools.left >= header.right || tools.top >= header.bottom) &&
+          name.clientWidth >= name.firstElementChild.offsetWidth &&
+          !name.hasAttribute('data-overflow')
+        );
+      }),
+      `The short badge and both toolbar groups fit at ${width}px in horizontal layout`,
+    );
+  }
   assert.deepEqual(report.errors, []);
   report.switches = await application.evaluate(() => globalThis.pickerCalls);
   report.passed = true;

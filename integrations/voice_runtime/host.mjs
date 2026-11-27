@@ -1,5 +1,6 @@
 import { readFileSync, existsSync, lstatSync } from 'node:fs';
 import path from 'node:path';
+import { availableParallelism } from 'node:os';
 import {
   root,
   launch,
@@ -20,6 +21,8 @@ import { readVoiceSettings } from '../../packages/runtime/src/voice-settings.mjs
 import { requiresPrivacyRestart } from '../../packages/runtime/src/host/processes.mjs';
 import { voiceDeviceLaunch } from '../../packages/runtime/src/hardware/model-devices.mjs';
 import { readModelDevices } from '../../packages/runtime/src/model-device-settings.mjs';
+import { settings } from '../../packages/runtime/src/config/settings.mjs';
+import { voiceWorkerEnvironment } from './environment.mjs';
 
 export function companionVoiceSettings() {
   const value = readVoiceSettings(root);
@@ -63,8 +66,12 @@ export async function startCompanionVoice({ language = 'en', signal, modelId } =
   if (!existsSync(python))
     throw new Error('Install the voice environment with setup-voice-training.cmd.');
   const marker = managedProcess('companion-voice');
-  if (marker && (marker.deviceKey ?? 'auto') !== deviceKey) await stopManaged('companion-voice');
-  if (requiresPrivacyRestart(managedProcess('companion-voice')))
+  if (
+    marker &&
+    ((marker.deviceKey ?? 'auto') !== deviceKey ||
+      requiresPrivacyRestart(marker) ||
+      marker.isolatedEnvironment !== true)
+  )
     await stopManaged('companion-voice');
   const health = async () =>
     request(`${companionVoiceUrl()}/health`, {
@@ -112,7 +119,18 @@ export async function startCompanionVoice({ language = 'en', signal, modelId } =
         ...(modelId ? ['--validate-turbo'] : []),
       ],
       undefined,
-      { env: { ...runtimeEnv, ...device.env }, deviceKey: device.key },
+      {
+        cleanEnv: true,
+        env: {
+          ...voiceWorkerEnvironment(),
+          ...runtimeEnv,
+          ...device.env,
+          CAPRI_CPU_THREADS: String(
+            Math.max(1, Math.min(settings.cpuThreads ?? 8, availableParallelism())),
+          ),
+        },
+        deviceKey: device.key,
+      },
     );
   }
   const result = await waitForVoiceReady({

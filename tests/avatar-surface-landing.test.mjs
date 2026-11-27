@@ -46,6 +46,17 @@ test('a search bar supports a seated search or a lower-rim grip at the actual gl
   assert.equal(surfaceLanding(field(320), 'field-lean', options).clipId, 'ledge-lean');
 });
 
+test('fitting a sprite does not move the grip to an unverified part of a search field', () => {
+  const target = {
+    ...field(350),
+    bounds: { x: -350, y: 350, width: 350, height: 32 },
+    point: { x: -4, y: 366 },
+  };
+  assert.equal(surfaceLanding(target, 'search', options), null);
+  target.point.x = -160;
+  assert.equal(surfaceLanding(target, 'search', options).point.x, -160);
+});
+
 test('redrawn gestures retain the grip and reserve room for the entire drawing', () => {
   const area = options.area;
   const top = {

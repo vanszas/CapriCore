@@ -7,11 +7,12 @@ export class Confirmations {
     this.pending = null;
   }
   async request(options) {
-    if (!options.danger) return (await this.choose(options)) === 'confirm';
-    for (let step = 1; step <= 3; step++) {
+    const steps = options.confirmSteps ?? (options.danger && !options.delayMs ? 3 : 1);
+    if (steps <= 1) return (await this.choose(options)) === 'confirm';
+    for (let step = 1; step <= steps; step++) {
       const choice = await this.choose({
         ...options,
-        title: `${options.title} (${step}/3)`,
+        title: `${options.title} (${step}/${steps})`,
       });
       if (choice !== 'confirm') return false;
     }

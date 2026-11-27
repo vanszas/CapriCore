@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+﻿# SPDX-License-Identifier: GPL-3.0-only
 function Get-CapriPythonRuntime {
     param([Parameter(Mandatory=$true)][string]$ProjectRoot,[ValidateSet('3.11.17','3.12.12')][string]$Version='3.11.17')
     [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
@@ -8,7 +8,7 @@ function Get-CapriPythonRuntime {
     Remove-Item -LiteralPath Env:OPENSSL_ia32cap -ErrorAction SilentlyContinue
     $ProjectRoot = [IO.Path]::GetFullPath($ProjectRoot)
     $capriBundledUv = Join-Path $ProjectRoot '.runtime/uv/uv.exe'
-    $capriUvCommand = Get-Command uv.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $capriUvCommand = Get-Command uv.exe -CommandType Application -ErrorAction SilentlyContinue
     $capriUvPath = if (Test-Path -LiteralPath $capriBundledUv -PathType Leaf) { $capriBundledUv } elseif ($capriUvCommand) { $capriUvCommand.Source } else { $capriBundledUv }
     if (-not (Test-Path -LiteralPath $capriUvPath -PathType Leaf)) {
         $capriRepairMessage = 'Run Capri Setup to repair this folder, or install Node 24 and retry. The private uv runtime can then be restored automatically.'

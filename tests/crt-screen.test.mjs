@@ -33,6 +33,10 @@ test('the CRT keeps the last portrait during a sprite load and clears when hidde
   Object.assign(gl, {
     NO_ERROR: 0,
     getError: () => 0,
+    viewport: (_x, _y, width, height) => {
+      assert.equal(width, innerWidth);
+      assert.equal(height, innerHeight);
+    },
     clear: () => calls.push('clear'),
     texImage2D: (_target, _level, _internal, _format, _type, image) => calls.push(image.src),
     uniform4f: (location, ...rect) => {
@@ -63,8 +67,16 @@ test('the CRT keeps the last portrait during a sprite load and clears when hidde
     assert.deepEqual(draw(second, false), ['clear']);
     Object.assign(sprite, { complete: true, naturalWidth: 1254 });
     assert.deepEqual(draw(second), ['clear', 'second', [60, 63, 210, 210], 'draw']);
+    globalThis.innerHeight = 440;
+    assert.deepEqual(draw(second), ['clear', [60, 63, 210, 210], 'draw']);
+    assert.equal(canvas.height, 440);
     Object.assign(sprite, { src: 'broken', naturalWidth: 0 });
     assert.deepEqual(draw(second), ['clear']);
+    assert.equal(document.body.dataset.crt, 'fallback');
+    Object.assign(sprite, { src: 'restored', naturalWidth: 1254 });
+    assert.deepEqual(draw(second), ['clear', 'restored', [60, 63, 210, 210], 'draw']);
+    gl.drawingBufferHeight = 0;
+    assert.deepEqual(draw(second), []);
     assert.equal(document.body.dataset.crt, 'fallback');
   } finally {
     Object.assign(globalThis, previous);

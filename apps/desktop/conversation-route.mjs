@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-only
-/** Identify unambiguous social turns without swallowing commands or follow-ups. */
+export const conversationFollowUp = (text) =>
+  /^(?:how about you|what about you|а ты|а у тебя|et toi|et vous|¿?y tú)\s*[?!.]*$/iu.test(
+    text.trim(),
+  );
+
+/** Identify unambiguous social turns without swallowing commands. */
 export function conversationOnly(text, routing) {
   if (routing?.mode === 'fast' && routing.reason === 'simple-dialogue') return true;
   if (typeof text !== 'string' || text.length > 100) return false;
   const greeting = text.normalize('NFKC').trim().toLowerCase().replace(/\s+/gu, ' ');
   return (
+    conversationFollowUp(greeting) ||
     /^(?:how are you(?: doing)?|how(?:['’]s| is) it going|как (?:дела|ты|жизнь)|comment (?:vas-tu|ça va)|¿?cómo estás|wie geht(?:['’]s| es dir))\s*[?!.]*$/u.test(
       greeting,
     ) ||

@@ -19,26 +19,24 @@ async function fixture() {
   return { folder, root, file, options, permissions: new FilePermissions(file, options) };
 }
 
-test('the installation receives default write access, including code and configuration under AppData', async () => {
+test('the installation is available read-only, including code and configuration under AppData', async () => {
   const f = await fixture(),
     scopes = f.permissions.snapshot();
   assert.equal(scopes.length, 1);
   assert.equal(scopes[0].id, INSTALLATION_SCOPE_ID);
   assert.equal(scopes[0].kind, 'installation');
-  assert.equal(scopes[0].write, true);
-  assert.equal(scopes[0].confirmationRequired, false);
+  assert.equal(scopes[0].write, false);
   for (const name of [
     'apps/desktop/main.mjs',
     'config/core.local.json',
     'data/workspace/PERSONALITY.md',
-  ])
-    assert.equal(
-      f.permissions.target(INSTALLATION_SCOPE_ID, name, true).path,
-      path.join(f.root, name),
-    );
-  assert.throws(() => f.permissions.target(INSTALLATION_SCOPE_ID, '../Other/file.txt', true));
+  ]) {
+    assert.equal(f.permissions.target(INSTALLATION_SCOPE_ID, name).path, path.join(f.root, name));
+    assert.throws(() => f.permissions.target(INSTALLATION_SCOPE_ID, name, true), /read-only/);
+  }
+  assert.throws(() => f.permissions.target(INSTALLATION_SCOPE_ID, '../Other/file.txt'));
   assert.throws(() =>
-    f.permissions.target(INSTALLATION_SCOPE_ID, path.join(f.folder, 'elsewhere'), true),
+    f.permissions.target(INSTALLATION_SCOPE_ID, path.join(f.folder, 'elsewhere')),
   );
   const outside = path.join(f.folder, 'outside');
   await fs.mkdir(outside);
@@ -47,10 +45,7 @@ test('the installation receives default write access, including code and configu
     path.join(f.root, 'linked'),
     process.platform === 'win32' ? 'junction' : 'dir',
   );
-  assert.throws(
-    () => f.permissions.target(INSTALLATION_SCOPE_ID, 'linked/file.txt', true),
-    /Linked/,
-  );
+  assert.throws(() => f.permissions.target(INSTALLATION_SCOPE_ID, 'linked/file.txt'), /Linked/);
   assert.throws(() => f.permissions.grant(path.join(f.folder, 'AppData')), /personal folder/);
 });
 
@@ -77,7 +72,7 @@ test('migration preserves existing scopes and explicit read-only/revocation choi
     [scope.id],
   );
   restart().grant(f.root);
-  assert.equal(restart().scope(INSTALLATION_SCOPE_ID).write, true);
+  assert.equal(restart().scope(INSTALLATION_SCOPE_ID).write, false);
   restart().save([]);
   assert.deepEqual(restart().snapshot(), []);
 });
@@ -90,7 +85,7 @@ test('corrupt permissions never trigger implicit reset or renewed installation a
   assert.equal(await fs.readFile(f.file, 'utf8'), '{broken');
 });
 
-test('own configuration replacement requires three confirmations, with conflict detection, recovery and undo', async (t) => {
+test('the file service rejects creation and replacement inside the installation', async (t) => {
   const f = await fixture();
   f.permissions.snapshot();
   await fs.mkdir(path.join(f.root, 'config'));
@@ -100,44 +95,25 @@ test('own configuration replacement requires three confirmations, with conflict 
   const service = new FileService(f.permissions, {
     database: path.join(f.root, 'data/filesystem/operations.sqlite'),
     recovery: path.join(f.root, 'data/filesystem/recovery'),
-    review: (_detail, execute) => {
-      pending = approvals.propose({
-        title: 'Replace file?',
-        detail: 'Fixture',
-        kind: 'replace',
-        voice: false,
-        execute,
-      });
-      return pending;
-    },
-    replaceFile: async ({ source, target }) => fs.rename(source, target),
+    review: () => assert.fail('Installation edits must stop before approval'),
+    replaceFile: () => assert.fail('Installation edits must stop before replacement'),
   });
   t.after(() => service.close());
   const base = { scopeId: INSTALLATION_SCOPE_ID, path: 'config/core.json' };
-  await service.execute('create', { ...base, action: 'write_text', text: '{"value":1}' });
-  const read = await service.execute('read', { ...base, action: 'read_text' });
-  const changed = await service.execute('replace', {
-    ...base,
-    action: 'replace_text',
-    text: '{"value":2}',
-    expectedHash: read.expectedHash,
-  });
-  for (let step = 1; step <= 3; step++)
-    pending = await approvals.respond(pending.proposal.id, true);
-  assert.equal(pending.ok, true);
-  assert.equal(await fs.readFile(path.join(f.root, base.path), 'utf8'), '{"value":2}');
   await assert.rejects(
-    service.execute('stale', {
+    service.execute('create', { ...base, action: 'write_text', text: '{"value":1}' }),
+    /read-only/,
+  );
+  await fs.writeFile(path.join(f.root, base.path), '{"value":1}');
+  const read = await service.execute('read', { ...base, action: 'read_text' });
+  await assert.rejects(
+    service.execute('replace', {
       ...base,
       action: 'replace_text',
-      text: '{"value":3}',
+      text: '{"value":2}',
       expectedHash: read.expectedHash,
     }),
-    /changed/,
-  );
-  assert.equal(
-    (await service.execute('undo', { action: 'undo', operationId: 'replace' })).ok,
-    true,
+    /read-only/,
   );
   assert.equal(await fs.readFile(path.join(f.root, base.path), 'utf8'), '{"value":1}');
   f.permissions.revoke(INSTALLATION_SCOPE_ID);
@@ -152,7 +128,7 @@ test('own configuration replacement requires three confirmations, with conflict 
   );
 });
 
-test('own file removal requires three confirmations and keeps verified recovery', async (t) => {
+test('the desktop file bridge rejects trashing an installation file before approval or execution', async (t) => {
   const f = await fixture();
   f.permissions.snapshot();
   const state = path.join(f.root, 'data/desktop');
@@ -160,24 +136,23 @@ test('own file removal requires three confirmations and keeps verified recovery'
     root: f.root,
     state,
     filePermissions: f.permissions,
-    trash: async (file) => fs.unlink(file),
+    trash: () => assert.fail('Installation files must not be trashed'),
   });
   t.after(() => catalog.close());
   const file = path.join(f.root, 'test-note.txt');
   await fs.writeFile(file, 'owned fixture');
-  const approvals = new ActionApprovals({ emit() {} });
-  let pending = await catalog.execute(
-    'trash-own',
-    { action: 'trash', scopeId: INSTALLATION_SCOPE_ID, path: 'test-note.txt' },
-    approvals,
+  const approvals = new ActionApprovals({
+    emit() {
+      assert.fail('Installation files must stop before approval');
+    },
+  });
+  await assert.rejects(
+    catalog.execute(
+      'trash-own',
+      { action: 'trash', scopeId: INSTALLATION_SCOPE_ID, path: 'test-note.txt' },
+      approvals,
+    ),
+    /read-only/,
   );
-  for (let step = 1; step <= 3; step++)
-    pending = await approvals.respond(pending.proposal.id, true);
-  assert.equal(pending.ok, true);
-  await assert.rejects(fs.stat(file), { code: 'ENOENT' });
-  const row = catalog.db.prepare('SELECT * FROM recovery WHERE id=?').get('trash-own');
-  assert.equal(
-    await fs.readFile(path.join(state, 'file-recovery', row.backup), 'utf8'),
-    'owned fixture',
-  );
+  assert.equal(await fs.readFile(file, 'utf8'), 'owned fixture');
 });

@@ -2,9 +2,11 @@
 import {
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   copyFileSync,
   renameSync,
+  rmSync,
   unlinkSync,
   statSync,
 } from 'node:fs';
@@ -14,9 +16,11 @@ import { readJson, noLinks, identityFile, diskFree } from '../../installer/src/p
 import { updateSourcePath, updatePayloadFiles, installerRequired } from './payload-policy.mjs';
 import { installationLock } from '../../installer/src/lock.mjs';
 import { runCommand } from '../../installer/src/commands.mjs';
+import { fetchArtifact } from '../../installer/src/download.mjs';
 import { installNpmDependencies } from '../../installer/src/npm-install.mjs';
 import { ensureElectronRuntime } from '../../installer/src/electron-runtime.mjs';
 import { npmInstallRequired } from './npm-policy.mjs';
+import { progressReporter } from './events.mjs';
 import { writeJsonAtomic } from '../../runtime/src/atomic-json.mjs';
 import {
   compareVersions,
@@ -178,6 +182,66 @@ export function runtimeUpgradeRequired(root, source) {
     (name) => before.artifacts[name]?.sha256 !== after.artifacts[name]?.sha256,
   );
 }
+export function indukRuntimeUpgradeSupported(root, source) {
+  const before = readJson(path.join(root, 'config/installer.json'));
+  const after = readJson(path.join(source, 'config/installer.json'));
+  return ['ollama', 'llama', 'uv', 'git'].every(
+    (name) => before.artifacts[name]?.sha256 === after.artifacts[name]?.sha256,
+  );
+}
+export async function ensureNodeRuntime(
+  root,
+  { command, download = fetchArtifact, emit = () => {} },
+) {
+  const installerPath = path.join(root, 'config/installer.json');
+  if (!existsSync(installerPath)) return false;
+  const spec = readJson(installerPath).artifacts?.node;
+  if (!spec?.directory || !spec?.url || !spec?.sha256) return false;
+  const runtimeRoot = path.join(root, '.runtime');
+  const directory = path.join(runtimeRoot, spec.directory);
+  noLinks(runtimeRoot);
+  if (existsSync(path.join(directory, 'node.exe'))) return false;
+  emit({ phase: 'dependencies', message: `Installing verified Node.js ${spec.version ?? ''} runtime…` });
+  const cache = path.join(runtimeRoot, 'installer');
+  noLinks(cache);
+  const archive = await download(spec, path.join(cache, 'downloads'));
+  const parent = path.join(cache, 'staging');
+  noLinks(parent);
+  mkdirSync(parent, { recursive: true });
+  const staged = mkdtempSync(path.join(parent, 'node-upgrade-'));
+  try {
+    await command('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-File',
+      path.join(root, 'packages/installer/windows/archive.ps1'),
+      '-Archive',
+      archive,
+      '-Destination',
+      staged,
+      '-MaximumBytes',
+      String(512 * 1024 * 1024),
+    ]);
+    const nested = path.join(staged, spec.directory);
+    const extracted = existsSync(path.join(nested, 'node.exe'))
+      ? nested
+      : existsSync(path.join(staged, 'node.exe'))
+        ? staged
+        : null;
+    if (!extracted) throw new Error('The downloaded Node runtime is incomplete. Retry the update.');
+    noLinks(directory);
+    mkdirSync(path.dirname(directory), { recursive: true });
+    if (!existsSync(directory)) renameSync(extracted, directory);
+    return true;
+  } finally {
+    if (path.dirname(staged) === parent && existsSync(staged)) {
+      noLinks(staged);
+      rmSync(staged, { recursive: true, force: true });
+    }
+  }
+}
 function restore(root, backup, journal) {
   for (const item of [...journal.entries].reverse()) {
     const name = backupPath(item.path),
@@ -194,8 +258,14 @@ function restore(root, backup, journal) {
 /** A failed/interrupted update restores owned source files. Private data is never a transaction target. */
 export async function applyUpdate(
   { root, source, tag },
-  { execute = runCommand, emit = () => {}, register = true, availableDisk = diskFree } = {},
+  {
+    execute = runCommand,
+    emit: writeProgress = () => {},
+    register = true,
+    availableDisk = diskFree,
+  } = {},
 ) {
+  const emit = progressReporter(writeProgress);
   root = path.resolve(root);
   source = path.resolve(source);
   const identity = managedInstallation(root);
@@ -212,10 +282,8 @@ export async function applyUpdate(
   const cache = path.join(root, '.runtime/installer');
   noLinks(cache);
   mkdirSync(cache, { recursive: true });
-  const releaseLock = installationLock(cache);
   let journal, backup;
   const active = path.join(updateRoot, 'active.json');
-  noLinks(active);
   const env = {
     ...process.env,
     CAPRI_NODE_PATH: process.execPath,
@@ -259,10 +327,20 @@ export async function applyUpdate(
   let dependenciesStarted = false;
   let npmChanged = false;
   const syncDependencies = async (changed, { forceNpm = false } = {}) => {
+    if (changed.has('config/installer.json')) {
+      await ensureNodeRuntime(root, { command, emit });
+    }
+    const installerNodeDir = existsSync(path.join(root, 'config/installer.json'))
+      ? readJson(path.join(root, 'config/installer.json')).artifacts?.node?.directory
+      : null;
+    const targetNode =
+      installerNodeDir && existsSync(path.join(root, '.runtime', installerNodeDir, 'node.exe'))
+        ? path.join(root, '.runtime', installerNodeDir, 'node.exe')
+        : process.execPath;
     if (forceNpm || npmChanged) {
       emit({ phase: 'dependencies' });
       await installNpmDependencies({
-        nodeExecutable: process.execPath,
+        nodeExecutable: targetNode,
         command,
         root,
         onRecovery: (message) => emit({ phase: 'dependencies', message }),
@@ -274,18 +352,24 @@ export async function applyUpdate(
       });
     } else {
       // Apply reviewed compatibility fixes even when the dependency lock is unchanged.
-      await command(process.execPath, [path.join(root, 'packages/runtime/bin/patch-openclaw.mjs')]);
+      await command(targetNode, [path.join(root, 'packages/runtime/bin/patch-openclaw.mjs')]);
     }
     await ensureElectronRuntime(root, { command, emit });
     const uv = path.join(root, '.runtime/uv/uv.exe');
     for (const [lock, venv] of [
       ['config/asr-requirements.lock.txt', 'asr-venv'],
       ['config/router-requirements.lock.txt', 'router-venv'],
+      ['config/npu-requirements.lock.txt', 'npu-openvino'],
     ]) {
       const python = path.join(root, '.runtime', venv, 'Scripts/python.exe');
-      if (changed.has(lock) && existsSync(python)) {
+      if (changed.has(lock) && existsSync(python) && existsSync(path.join(root, lock))) {
         emit({ phase: 'dependencies' });
-        await command(uv, [
+        const bootstrap = path.join(root, 'tools/setup/uv-retry.py');
+        await command(python, [
+          bootstrap,
+          '--uv',
+          uv,
+          '--',
           'pip',
           'sync',
           '--python',
@@ -293,6 +377,13 @@ export async function applyUpdate(
           path.join(root, lock),
           '--default-index',
           'https://pypi.org/simple',
+          '--no-config',
+          '--index-strategy',
+          'first-index',
+          // Rollback can restore a pre-hash ASR lock.
+          ...(readFileSync(path.join(root, lock), 'utf8').includes('--hash=sha256:')
+            ? ['--require-hashes']
+            : []),
         ]);
       }
     }
@@ -300,6 +391,8 @@ export async function applyUpdate(
       [
         'config/requirements-voice-training.lock',
         'config/requirements-voice-blackwell.lock',
+        'config/requirements-voice-amd.lock',
+        'config/voice-build-requirements.lock.txt',
         'config/voice-blackwell-overrides.txt',
         'config/voice-runtime.json',
         'tools/setup/setup-voice-training.ps1',
@@ -309,7 +402,10 @@ export async function applyUpdate(
     )
       await ps('tools/setup/setup-voice-training.ps1', ['-DependenciesOnly']);
   };
+  const releaseLock = installationLock(cache);
+  let failure;
   try {
+    noLinks(active);
     if (existsSync(active)) {
       const pending = readJson(active);
       if (pending.schemaVersion !== 1 || !/^[a-f0-9-]{36}$/.test(pending.id ?? ''))
@@ -336,8 +432,13 @@ export async function applyUpdate(
     const currentVersion = installedUpdateVersion(root, installedTag);
     if (compareVersions(nextVersion, currentVersion) <= 0)
       throw new Error('This release is already installed or is older.');
+    const induk =
+      (existsSync(path.join(source, 'config/release.json')) &&
+        readJson(path.join(source, 'config/release.json')).distribution === 'induk') ||
+      (existsSync(path.join(root, 'config/release.json')) &&
+        readJson(path.join(root, 'config/release.json')).distribution === 'induk');
     // Runtime replacement requires the full installation wizard; never replace the running Node binary.
-    if (runtimeUpgradeRequired(root, source))
+    if (runtimeUpgradeRequired(root, source) && !(induk && indukRuntimeUpgradeSupported(root, source)))
       throw new Error(
         'This release changes bundled runtimes. Use its full installer to upgrade this installation.',
       );
@@ -410,6 +511,7 @@ export async function applyUpdate(
       ...identity,
       version: parseVersion(tag).version,
       releaseTag: tag,
+      previousReleaseTag: currentVersion,
     });
     // Keep the previous owned-file list as well: a later uninstall may remove old source, but not private files.
     const receipt = path.join(cache, 'source-files.json');
@@ -428,12 +530,13 @@ export async function applyUpdate(
         ...(links.some((file) => /Programs|Start Menu/i.test(file)) ? ['-StartMenuShortcut'] : []),
       ]);
     }
+    writeJsonAtomic(path.join(backup, 'journal.json'), { ...journal, phase: 'complete' });
     journal.phase = 'complete';
-    writeJsonAtomic(path.join(backup, 'journal.json'), journal);
     unlinkSync(active);
     emit({ phase: 'complete' });
     return { tag, backup, changed: updates.length };
   } catch (error) {
+    failure = error;
     if (journal && backup && journal.phase !== 'complete') {
       emit({ phase: 'recovering' });
       try {
@@ -445,17 +548,27 @@ export async function applyUpdate(
         journal.phase = 'rolled-back';
         writeJsonAtomic(path.join(backup, 'journal.json'), journal);
         if (existsSync(active)) unlinkSync(active);
-      } catch {
-        throw new Error(
+      } catch (recoveryError) {
+        failure = new AggregateError(
+          [error, recoveryError],
           'Update failed and automatic recovery could not finish. Keep this folder and run the previous installer to repair it.',
+          { cause: error },
         );
+        throw failure;
       }
-      throw new Error(
+      failure = new Error(
         'The update failed. Previous source files were restored. Try again or use the full installer.',
+        { cause: error },
       );
+      throw failure;
     }
     throw error;
   } finally {
-    releaseLock();
+    try {
+      releaseLock();
+    } catch (cleanupError) {
+      if (!failure) throw cleanupError;
+      throw new AggregateError([failure, cleanupError], failure.message, { cause: failure });
+    }
   }
 }

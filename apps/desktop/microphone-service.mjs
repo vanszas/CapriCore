@@ -18,6 +18,9 @@ const microphoneOff = (text) =>
     commandText(text),
   );
 const startupMessages = Object.freeze({
+  ASR_START_INSTALLING: 'Wait for speech installation to finish, or cancel it in Languages.',
+  ASR_START_CORE_NOT_READY: 'The local core is not ready yet.',
+  ASR_START_PACK_MISSING: 'Install the selected recognition pack first.',
   ASR_START_PYTHON: 'Install the selected recognition pack first.',
   ASR_START_MODEL: 'Install the selected recognition pack first.',
   ASR_START_DETECTOR: 'Install the selected recognition pack first.',
@@ -239,6 +242,11 @@ export class MicrophoneService {
       }
     }
     this.publish();
+  }
+  startBlocked(code) {
+    const message = startupMessages[code];
+    this.lastFailure = { at: new Date().toISOString(), code, message };
+    return { failure: { code, message } };
   }
   async start({ remote = false } = {}) {
     if (remote && this.capture) throw new Error('Capri microphone is already in use.');
