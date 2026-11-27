@@ -62,6 +62,7 @@
   "packages/runtime/src/providers/chat-router.mjs",
   "packages/skills/src/settings-catalog.mjs",
   "packages/updater/src/induk-merge.mjs",
+  "packages/updater/src/payload-policy.mjs",
   "packages/updater/src/transaction.mjs",
   "tests/action-broker.test.mjs",
   "tests/action-tools-skills.test.mjs",

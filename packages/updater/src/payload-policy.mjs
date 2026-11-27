@@ -15,6 +15,7 @@ const sourceDirectories = new Set([
   'config',
   'docs',
   '.github',
+  'native',
 ]);
 const rootFiles = new Set([
   'package.json',
@@ -26,6 +27,8 @@ const rootFiles = new Set([
   'CONTRIBUTING.md',
   'SECURITY.md',
   'THIRD_PARTY_NOTICES.md',
+  'LINUX-PREVIEW.md',
+  'start-capri.sh',
   '.gitignore',
   '.gitattributes',
   '.editorconfig',
@@ -36,7 +39,7 @@ const rootFiles = new Set([
   '.prettierrc.json',
 ]);
 const privatePath =
-  /(?:^|\/)(?:node_modules|\.runtime|\.git|\.venv|__pycache__)(?:\/|$)|^(?:data|logs|vendor|archive|release)(?:\/|$)|^docs\/audit\/(?!npm-sbom\.cdx\.json$)|^(?:apps|packages|integrations)\/[^/]+\/(?:dist|build)(?:\/|$)|\.local\.(?:json|ps1)$|\.pyc$|(?:^|\/)\.env(?:\.|$)/i;
+  /(?:^|\/)(?:node_modules|\.runtime|\.git|\.venv|__pycache__)(?:\/|$)|^(?:data|logs|vendor|archive|release)(?:\/|$)|^docs\/audit\/(?!npm-sbom\.cdx\.json$)|^(?:apps|packages|integrations)\/[^/]+\/(?:dist|build)(?:\/|$)|^native\/[^/]+\/target(?:\/|$)|\.local\.(?:json|ps1)$|\.pyc$|(?:^|\/)\.env(?:\.|$)/i;
 const device = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])[ ]*(?:\.|$)/iu;
 
 export function installerRequired(reason = 'payload_format') {
