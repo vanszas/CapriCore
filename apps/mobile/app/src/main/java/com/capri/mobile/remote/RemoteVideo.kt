@@ -26,15 +26,24 @@ internal data class RemoteVideoSource(
 )
 
 @Composable
-internal fun RemoteVideo(source: RemoteVideoSource, modifier: Modifier, onSize: (Float) -> Unit, onError: () -> Unit) {
+internal fun RemoteVideo(source: RemoteVideoSource, modifier: Modifier, onSize: (Float) -> Unit, onError: () -> Unit, onFps: (Int) -> Unit) {
     val failure by rememberUpdatedState(onError)
+    val reportFps by rememberUpdatedState(onFps)
     val sizeChanged by rememberUpdatedState(onSize)
-    var rendering by remember(source) { mutableStateOf(false) }
-    LaunchedEffect(source) {
+    var attempt by remember(source) { mutableStateOf(0) }
+    var failed by remember(source, attempt) { mutableStateOf(false) }
+    var rendering by remember(source, attempt) { mutableStateOf(false) }
+    LaunchedEffect(source, attempt) {
         delay(8_000)
-        if (!rendering) failure()
+        if (!rendering) failed = true
     }
-    androidx.compose.runtime.key(source) {
+    LaunchedEffect(source, attempt, failed) {
+        if (!failed) return@LaunchedEffect
+        failure()
+        delay(if (attempt < 3) 1500L else 8000L)
+        attempt++
+    }
+    androidx.compose.runtime.key(source, attempt) {
         AndroidView(modifier = modifier, factory = { context ->
             TextureView(context).apply {
                 surfaceTextureListener = object : TextureView.SurfaceTextureListener {
@@ -63,19 +72,31 @@ internal fun RemoteVideo(source: RemoteVideoSource, modifier: Modifier, onSize: 
                             }
                             media.setOnPreparedListener { if (player === media) it.start() }
                             media.setOnErrorListener { _, _, _ ->
-                                if (player === media) failure()
+                                if (player === media) failed = true
                                 true
                             }
-                            media.setOnCompletionListener { if (player === media) failure() }
+                            media.setOnCompletionListener { if (player === media) failed = true }
                             media.prepareAsync()
                         } catch (_: Exception) {
                             player = null
                             media.release()
-                            failure()
+                            failed = true
                         }
                     }
                     override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
-                    override fun onSurfaceTextureUpdated(texture: SurfaceTexture) { rendering = true }
+                    private var tick = 0L
+                    private var frames = 0
+                    override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {
+                        rendering = true
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        if (tick == 0L) tick = now else frames++
+                        val elapsed = now - tick
+                        if (elapsed >= 1000L) {
+                            reportFps((frames * 1000L / elapsed).toInt())
+                            frames = 0
+                            tick = now
+                        }
+                    }
                     override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
                         val previous = player
                         player = null

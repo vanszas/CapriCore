@@ -1039,6 +1039,7 @@ class ScreenStreamer:
         quality: int | None = None,
         monitor: str | None = None,
         region: tuple[float, float, float, float] | None = None,
+        draw_cursor: bool = True,
     ) -> bytes:
         target_mon = monitor if monitor else self.monitor
         left, top, width, height = get_screen_bounds(target_mon)
@@ -1067,7 +1068,8 @@ class ScreenStreamer:
             new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
             img = img.resize(new_size, Image.Resampling.BILINEAR)
 
-        draw_host_cursor(img, (left, top, width, height))
+        if draw_cursor:
+            draw_host_cursor(img, (left, top, width, height))
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=eff_quality, subsampling=2, optimize=False)
         return buf.getvalue()
@@ -1114,6 +1116,7 @@ class ScreenStreamer:
         monitor: str = "primary",
         profile: str | None = None,
         max_kbps: int = 0,
+        draw_cursor: bool = True,
     ) -> Generator[bytes, None, None]:
         if profile and profile in STREAM_PROFILES:
             cfg = STREAM_PROFILES[profile]
@@ -1126,19 +1129,18 @@ class ScreenStreamer:
         self.quality = quality
         self.monitor = monitor
         target_max = {"540p": 540, "720p": 720, "1080p": 1080, "native": 0}.get(resolution, 720)
-        res_ladder = [0, 1080, 720, 540]
         effective_max = target_max
         interval = 1.0 / max(1, min(60, fps))
         frame_budget = max_kbps * 1000 * interval / 8
-        # Keep delivery at target FPS; adapt JPEG quality/scale smoothly rather than sleeping away FPS.
+        # Keep delivery at target FPS; gently adapt JPEG quality without downscaling resolution to blurry 540p.
         requested_quality = max(1, min(95, quality))
-        if max_kbps and max_kbps <= 4000:
-            stream_quality = min(requested_quality, 60)
+        if max_kbps and max_kbps <= 2000:
+            stream_quality = min(requested_quality, 62)
         elif frame_budget:
-            stream_quality = min(requested_quality, 72)
+            stream_quality = min(requested_quality, 76)
         else:
             stream_quality = requested_quality
-        minimum_quality = min(requested_quality, 28)
+        minimum_quality = min(requested_quality, 54)
         average_size = None
 
         with self.lock:
@@ -1155,7 +1157,7 @@ class ScreenStreamer:
             while True:
                 t0 = time.perf_counter()
                 try:
-                    frame = self._capture_frame(sct, target_max=effective_max, quality=stream_quality, monitor=monitor)
+                    frame = self._capture_frame(sct, target_max=effective_max, quality=stream_quality, monitor=monitor, draw_cursor=draw_cursor)
                 except Exception:
                     if sct is not None:
                         try:
@@ -1163,30 +1165,15 @@ class ScreenStreamer:
                         except Exception:
                             pass
                         sct = None
-                    frame = self._capture_frame(None, target_max=effective_max, quality=stream_quality, monitor=monitor)
+                    frame = self._capture_frame(None, target_max=effective_max, quality=stream_quality, monitor=monitor, draw_cursor=draw_cursor)
 
                 if frame_budget:
                     average_size = len(frame) if average_size is None else 0.75 * average_size + 0.25 * len(frame)
                     if average_size > frame_budget * 1.15:
                         if stream_quality > minimum_quality:
-                            stream_quality = max(minimum_quality, stream_quality - 5)
-                        elif average_size > frame_budget * 1.45:
-                            try:
-                                idx = res_ladder.index(effective_max)
-                            except ValueError:
-                                idx = 2
-                            if idx + 1 < len(res_ladder):
-                                effective_max = res_ladder[idx + 1]
+                            stream_quality = max(minimum_quality, stream_quality - 4)
                     elif average_size < frame_budget * 0.72:
                         stream_quality = min(requested_quality, stream_quality + 2)
-                        if effective_max != target_max and stream_quality >= requested_quality - 5:
-                            try:
-                                cur_idx = res_ladder.index(effective_max)
-                                target_idx = res_ladder.index(target_max)
-                            except ValueError:
-                                cur_idx, target_idx = 0, 0
-                            if cur_idx > target_idx:
-                                effective_max = res_ladder[cur_idx - 1]
 
                 yield (
                     b"--frame\r\n"

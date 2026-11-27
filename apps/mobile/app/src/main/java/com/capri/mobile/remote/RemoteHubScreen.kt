@@ -457,6 +457,7 @@ private fun AgentsSubTab() {
             }
             if (RemoteState.streaming) {
                 item {
+                    val liveStatus = RemoteState.streamingStatus.ifBlank { tr("Streaming...") }
                     Column(
                         Modifier
                             .fillMaxWidth()
@@ -465,13 +466,14 @@ private fun AgentsSubTab() {
                             .padding(11.dp),
                     ) {
                         Text(
-                            tr("Streaming..."),
+                            liveStatus,
                             color = GREEN, fontFamily = MONO, fontWeight = FontWeight.Bold, fontSize = 11.sp,
                         )
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            RemoteState.streamingText.ifBlank { "..." },
-                            color = INK, fontFamily = SANS, fontSize = 13.5.sp, lineHeight = 19.sp,
+                            RemoteState.streamingText.ifBlank { liveStatus },
+                            color = if (RemoteState.streamingText.isBlank()) MUTED else INK,
+                            fontFamily = SANS, fontSize = 13.5.sp, lineHeight = 19.sp,
                         )
                     }
                 }

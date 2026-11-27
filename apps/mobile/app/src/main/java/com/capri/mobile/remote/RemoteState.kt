@@ -50,6 +50,7 @@ object RemoteState {
     var messages by mutableStateOf<List<RemoteMessage>>(emptyList())
     var streaming by mutableStateOf(false)
     var streamingText by mutableStateOf("")
+    var streamingStatus by mutableStateOf("")
     var toolActivities by mutableStateOf<List<ToolActivityItem>>(emptyList())
     var approvals by mutableStateOf<List<ApprovalItem>>(emptyList())
     var clarifications by mutableStateOf<List<ClarificationItem>>(emptyList())
@@ -117,6 +118,22 @@ object RemoteState {
     }
 
     private fun post(block: () -> Unit) = main.post(block)
+
+    private fun pickDefaultModel(mods: List<String>): String =
+        mods.firstOrNull { it.equals("low-agent", ignoreCase = true) }
+            ?: mods.firstOrNull { it.equals("oc/deepseek-v4.1-flash-free", ignoreCase = true) }
+            ?: mods.firstOrNull { !it.equals("smart-router", ignoreCase = true) && !it.equals("free-model", ignoreCase = true) }
+            ?: mods.firstOrNull { !it.equals("smart-router", ignoreCase = true) }
+            ?: mods.firstOrNull().orEmpty()
+
+    private fun pickDefaultAgents(ag: List<RemoteAgentInfo>, current: Set<String>): Set<String> {
+        val installedIds = ag.filter { it.installed }.map { it.id }.toSet()
+        val kept = current.intersect(installedIds)
+        if (kept.isNotEmpty()) return kept
+        val fallback = ag.firstOrNull { it.installed && it.id == "codex" }?.id
+            ?: ag.firstOrNull { it.installed }?.id
+        return if (fallback != null) setOf(fallback) else emptySet()
+    }
 
     fun pairAndSave(
         ctx: Context,
@@ -245,7 +262,6 @@ object RemoteState {
             for ((isTs, url) in candidates) {
                 try {
                     val probe = RemoteClient(url, token, prefs.deviceId)
-                    val status = probe.status()
                     val authorizedClient = try {
                         probe.workspaces()
                         probe
@@ -261,7 +277,7 @@ object RemoteState {
                             prefs.saveProfile(profile, approvedToken)
                         }
                     }
-                    stJson = status
+                    stJson = authorizedClient.status()
                     chosenClient = authorizedClient
                     chosenIsTailscale = isTs
                     break
@@ -271,7 +287,7 @@ object RemoteState {
             }
 
             if (chosenClient == null || stJson == null) {
-                val msg = lastErr?.message ?: "Unreachable"
+                val msg = if ((lastErr as? RemoteHttpException)?.code == 401) "PC menolak token HP. Pindai ulang QR Android dari Capri di PC." else lastErr?.message ?: "Unreachable"
                 post {
                     connected = false
                     connecting = false
@@ -283,19 +299,31 @@ object RemoteState {
             val c = chosenClient
             val st = stJson
             try {
-                val wsPath = st.optJSONObject("workspace")?.optString("path", "").orEmpty()
+                var wsPath = st.optJSONObject("workspace")?.optString("path", "").orEmpty()
                 val perm = st.optString("permission", "workspace")
                 val maxC = st.optInt("max_concurrent_agents", 2).coerceIn(1, 8)
                 val ts = st.optString("tailscale_ip", "")
                 val net = st.optString("network_mode", "")
                 val rRun = st.optJSONObject("router")?.optBoolean("running", false) == true
 
-                val ag = runCatching { c.agents() }.getOrDefault(emptyList())
+                val ag = c.agents()
                 val rMods = runCatching { c.routerModels() }.getOrDefault(emptyList())
                 val aMods = runCatching { c.models() }.getOrDefault(emptyList())
                 val mods = (rMods + aMods).distinct()
                 val sk = runCatching { c.skills() }.getOrDefault(emptyList())
-                val wss = runCatching { c.workspaces() }.getOrDefault(emptyList())
+                var wss = runCatching { c.workspaces() }.getOrDefault(emptyList())
+                // Auto-heal bare drive root workspace (e.g. C:\) to a real project folder
+                if (wsPath.matches(Regex("""^[A-Za-z]:\\?$"""))) {
+                    val nonRoot = wss.filter { !it.path.matches(Regex("""^[A-Za-z]:\\?$""")) }
+                    val betterWs = nonRoot.firstOrNull { it.path.endsWith("\\Capri", ignoreCase = true) }
+                        ?: nonRoot.firstOrNull()
+                    if (betterWs != null) {
+                        runCatching { c.selectWorkspace(betterWs.path) }.onSuccess { selected ->
+                            wsPath = selected.path
+                            wss = runCatching { c.workspaces() }.getOrDefault(wss)
+                        }
+                    }
+                }
                 val sess = runCatching { c.sessions() }.getOrDefault(emptyList())
                 val tks = runCatching { c.tasks() }.getOrDefault(emptyList())
                 val deb = runCatching { c.debateStatus().optBoolean("running", false) }.getOrDefault(false)
@@ -338,11 +366,15 @@ object RemoteState {
                     permissionMode = RemotePermissionMode.entries.firstOrNull { it.wire == perm }
                         ?: RemotePermissionMode.WORKSPACE
                     agents = ag
-                    selectedAgentIds = selectedAgentIds.intersect(ag.filter { it.installed }.map { it.id }.toSet())
-                    if (coordinatorId.isBlank()) coordinatorId = selectedAgentIds.firstOrNull().orEmpty()
+                    selectedAgentIds = pickDefaultAgents(ag, selectedAgentIds)
+                    if (coordinatorId.isBlank() || coordinatorId !in selectedAgentIds) {
+                        coordinatorId = selectedAgentIds.firstOrNull().orEmpty()
+                    }
                     models = mods
                     routerModels = rMods
-                    if (selectedModel.isBlank() && mods.isNotEmpty()) selectedModel = mods.first()
+                    if ((selectedModel.isBlank() || selectedModel.equals("smart-router", ignoreCase = true)) && mods.isNotEmpty()) {
+                        selectedModel = pickDefaultModel(mods)
+                    }
                     skills = sk
                     workspaces = wss
                     sessions = sess
@@ -475,6 +507,7 @@ object RemoteState {
 
         streaming = true
         streamingText = ""
+        streamingStatus = "Menghubungkan ke agent PC…"
         toolActivities = emptyList()
         approvals = emptyList()
         clarifications = emptyList()
@@ -482,6 +515,8 @@ object RemoteState {
         if (reasoningFocus) CapriService.setReasoningFocus(app, true)
 
         io.execute {
+            val doneFlag = java.util.concurrent.atomic.AtomicBoolean(false)
+            val startedMs = System.currentTimeMillis()
             try {
                 val workspace = activeWorkspace
                 val previous = activeSession
@@ -499,6 +534,27 @@ object RemoteState {
                 val optimisticUser = RemoteMessage("local_${System.currentTimeMillis()}", "user", text)
                 post { messages = messages + optimisticUser }
 
+                // Live progress & task status poller while PC agent executes
+                io.execute {
+                    while (!doneFlag.get()) {
+                        try {
+                            Thread.sleep(1500L)
+                        } catch (_: InterruptedException) {
+                            break
+                        }
+                        if (doneFlag.get()) break
+                        val sec = ((System.currentTimeMillis() - startedMs) / 1000L).coerceAtLeast(1L)
+                        val liveTasks = runCatching { c.tasks() }.getOrNull()
+                        val activeTask = liveTasks?.firstOrNull { it.sessionId == sid && it.status == "running" }
+                            ?: liveTasks?.firstOrNull { !it.id.startsWith("pc_agent_") && it.status == "running" }
+                        val note = activeTask?.detail?.takeIf { it.isNotBlank() } ?: "Menunggu respons agent PC…"
+                        post {
+                            if (liveTasks != null) tasks = liveTasks
+                            if (streaming && !doneFlag.get()) streamingStatus = "$note (${sec}s)"
+                        }
+                    }
+                }
+
                 val buf = StringBuilder()
                 val announced = HashSet<String>()
                 fun send() = c.streamPrompt(
@@ -513,7 +569,9 @@ object RemoteState {
                     permission = permissionMode,
                 ) { ev ->
                     when (ev) {
-                        is RemoteStreamEvent.Started -> Unit
+                        is RemoteStreamEvent.Started -> {
+                            post { streamingStatus = "Agent mulai memproses…" }
+                        }
                         is RemoteStreamEvent.Delta -> {
                             if (useAgents.size > 1 && ev.agentId.isNotBlank() && announced.add(ev.agentId)) {
                                 val label = agents.firstOrNull { it.id == ev.agentId }?.name ?: ev.agentId
@@ -521,7 +579,10 @@ object RemoteState {
                             }
                             buf.append(ev.text)
                             val snap = buf.toString()
-                            post { streamingText = snap }
+                            post {
+                                streamingText = snap
+                                streamingStatus = "Menerima respons…"
+                            }
                         }
                         is RemoteStreamEvent.Reasoning -> {
                             val item = ToolActivityItem(
@@ -533,11 +594,15 @@ object RemoteState {
                             )
                             post {
                                 toolActivities = toolActivities.filterNot { it.id == item.id } + item
+                                if (ev.text.isNotBlank()) streamingStatus = ev.text
                             }
                         }
                         is RemoteStreamEvent.ToolStarted -> {
                             val item = ToolActivityItem(ev.toolId, ev.name, ev.agentId, ev.text, "running")
-                            post { toolActivities = toolActivities.filterNot { it.id == item.id } + item }
+                            post {
+                                toolActivities = toolActivities.filterNot { it.id == item.id } + item
+                                streamingStatus = "Menjalankan ${ev.name}…"
+                            }
                         }
                         is RemoteStreamEvent.ToolCompleted -> {
                             val item = ToolActivityItem(ev.toolId, ev.name, ev.agentId, ev.text, "completed")
@@ -560,6 +625,7 @@ object RemoteState {
                         }
                     }
                 }
+                var streamIoError: java.io.IOException? = null
                 try {
                     send()
                 } catch (e: RemoteHttpException) {
@@ -567,6 +633,24 @@ object RemoteState {
                     sid = newSession()
                     post { messages = listOf(optimisticUser) }
                     send()
+                } catch (e: java.io.IOException) {
+                    streamIoError = e
+                }
+                // Stream recovery: if Tailscale dropped/timed out while PC agent is still generating, poll session until done
+                if (streamIoError != null) {
+                    val firstSess = runCatching { c.loadSession(sid) }.getOrNull()
+                    if (firstSess?.status == "generating") {
+                        val deadline = System.currentTimeMillis() + 90_000L
+                        while (!doneFlag.get() && System.currentTimeMillis() < deadline) {
+                            val sec = ((System.currentTimeMillis() - startedMs) / 1000L).coerceAtLeast(1L)
+                            post { streamingStatus = "Menunggu agent PC menyelesaikan tugas… (${sec}s)" }
+                            Thread.sleep(2000L)
+                            val poll = runCatching { c.loadSession(sid) }.getOrNull() ?: continue
+                            if (poll.status != "generating") break
+                        }
+                    } else if (firstSess == null || firstSess.messages.size <= (previous?.messages?.size ?: 0)) {
+                        throw streamIoError
+                    }
                 }
                 val refreshed = runCatching { c.loadSession(sid) }.getOrNull()
                 val refreshedTasks = runCatching { c.tasks() }.getOrDefault(tasks)
@@ -579,6 +663,7 @@ object RemoteState {
                     }
                     streaming = false
                     streamingText = ""
+                    streamingStatus = ""
                     tasks = refreshedTasks
                 }
             } catch (e: Exception) {
@@ -586,9 +671,11 @@ object RemoteState {
                 post {
                     streaming = false
                     streamingText = ""
+                    streamingStatus = ""
                     onError(msg)
                 }
             } finally {
+                doneFlag.set(true)
                 if (reasoningFocus) CapriService.setReasoningFocus(app, false)
             }
         }
@@ -597,9 +684,13 @@ object RemoteState {
     fun stopActiveSession(ctx: Context) {
         val c = client(ctx) ?: return
         val sid = activeSession?.id ?: return
+        streamingStatus = "Menghentikan…"
         io.execute {
             runCatching { c.stopSession(sid) }
-            post { streaming = false }
+            post {
+                streaming = false
+                streamingStatus = ""
+            }
             if (RemotePrefs(ctx).zeroAvatarReasoning) CapriService.setReasoningFocus(ctx.applicationContext, false)
         }
     }
@@ -668,7 +759,10 @@ object RemoteState {
             runCatching { c.agents() }.onSuccess { found ->
                 post {
                     agents = found
-                    selectedAgentIds = selectedAgentIds.intersect(found.filter { it.installed }.map { it.id }.toSet())
+                    selectedAgentIds = pickDefaultAgents(found, selectedAgentIds)
+                    if (coordinatorId.isBlank() || coordinatorId !in selectedAgentIds) {
+                        coordinatorId = selectedAgentIds.firstOrNull().orEmpty()
+                    }
                 }
             }
         }
@@ -766,7 +860,9 @@ object RemoteState {
                 fetchingModels = false
                 if (merged.isNotEmpty()) {
                     models = merged
-                    if (selectedModel.isBlank()) selectedModel = merged.first()
+                    if (selectedModel.isBlank() || selectedModel.equals("smart-router", ignoreCase = true)) {
+                        selectedModel = pickDefaultModel(merged)
+                    }
                 }
                 routerModels = rMods
                 onDone(rMods.size)

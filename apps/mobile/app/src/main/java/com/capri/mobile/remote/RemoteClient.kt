@@ -7,9 +7,20 @@ import java.io.BufferedReader
 import java.io.BufferedInputStream
 import java.io.DataInputStream
 import java.io.InputStreamReader
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.URI
 import java.net.URL
 import java.net.URLEncoder
+import java.nio.ByteBuffer
+import java.security.MessageDigest
+import java.security.SecureRandom
+import java.util.concurrent.atomic.AtomicLong
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
@@ -22,6 +33,85 @@ class RemoteClient(
     val deviceId: String,
 ) {
     val baseUrl: String = baseEndpoint.trim().trimEnd('/')
+    private val fastPathKey: ByteArray by lazy {
+        MessageDigest.getInstance("SHA-256").digest(token.toByteArray(Charsets.UTF_8))
+    }
+    private val udpNonce: Int = SecureRandom().nextInt()
+    private val udpSeq = AtomicLong(0L)
+    @Volatile private var udpSocket: DatagramSocket? = null
+    @Volatile private var udpTarget: Pair<Int, InetSocketAddress>? = null
+
+    private var pointerClosed = false
+
+    @Synchronized
+    fun closePointerSocket() {
+        pointerClosed = true
+        udpSocket?.close()
+        udpSocket = null
+    }
+
+    fun hostAddress(): String = runCatching { URI(baseUrl).host.orEmpty() }.getOrDefault("")
+
+    fun sendPointerUdp(
+        action: String,
+        x: Double,
+        y: Double,
+        monitor: String,
+        pointer: String,
+        mouseMode: String,
+        button: String = "left",
+        delta: Int = 0,
+        udpPort: Int = 9120,
+    ): Boolean {
+        if (udpPort <= 0 || token.isBlank()) return false
+        val host = hostAddress()
+        if (host.isBlank()) return false
+        return runCatching {
+            val sock = udpSocket ?: synchronized(this) {
+                if (pointerClosed) return false
+                udpSocket ?: DatagramSocket().also { udpSocket = it }
+            }
+            val cached = udpTarget
+            val targetAddr = if (cached != null && cached.first == udpPort) {
+                cached.second
+            } else {
+                InetSocketAddress(host, udpPort).also { udpTarget = udpPort to it }
+            }
+            val payload = JSONObject()
+                .put("d", deviceId)
+                .put("a", action)
+                .put("x", x)
+                .put("y", y)
+                .put("m", monitor)
+                .put("w", if (mouseMode == "windows") 1 else 0)
+                .put("b", button)
+                .put("dl", delta)
+                .put("p", pointer)
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            val seqVal = udpSeq.incrementAndGet()
+            val header = ByteBuffer.allocate(17)
+                .put('C'.code.toByte())
+                .put('R'.code.toByte())
+                .put('F'.code.toByte())
+                .put('P'.code.toByte())
+                .put(1.toByte())
+                .putInt(udpNonce)
+                .putLong(seqVal)
+                .array()
+            val mac = Mac.getInstance("HmacSHA256").apply {
+                init(SecretKeySpec(fastPathKey, "HmacSHA256"))
+                update(header)
+                update(payload)
+            }.doFinal()
+            val packetBytes = ByteArray(17 + 16 + payload.size)
+            System.arraycopy(header, 0, packetBytes, 0, 17)
+            System.arraycopy(mac, 0, packetBytes, 17, 16)
+            System.arraycopy(payload, 0, packetBytes, 33, payload.size)
+            sock.send(DatagramPacket(packetBytes, packetBytes.size, targetAddr))
+            true
+        }.getOrDefault(false)
+    }
 
     private fun buildUrl(path: String, query: Map<String, String> = emptyMap()): URL {
         val sb = StringBuilder(baseUrl).append(path)
@@ -63,8 +153,9 @@ class RemoteClient(
         payload: JSONObject? = null,
         query: Map<String, String> = emptyMap(),
         readTimeoutMs: Int = 18000,
+        connectTimeoutMs: Int = 8000,
     ): JSONObject {
-        val conn = open(method, path, query, readTimeoutMs = readTimeoutMs)
+        val conn = open(method, path, query, connectTimeoutMs = connectTimeoutMs, readTimeoutMs = readTimeoutMs)
         try {
             if (payload != null) {
                 conn.doOutput = true
@@ -85,8 +176,9 @@ class RemoteClient(
             }
             if (body.isBlank()) return JSONObject()
             return JSONObject(body)
-        } finally {
+        } catch (e: Exception) {
             conn.disconnect()
+            throw e
         }
     }
 
@@ -99,8 +191,9 @@ class RemoteClient(
                 throw RemoteHttpException(code, err.ifBlank { "HTTP $code" })
             }
             return conn.inputStream.use { it.readBytes() }
-        } finally {
+        } catch (e: Exception) {
             conn.disconnect()
+            throw e
         }
     }
 
@@ -280,7 +373,7 @@ class RemoteClient(
             JSONObject().put("message", message).put("history", history).apply {
                 if (screenMonitor != null) put("screen_monitor", screenMonitor)
             },
-            readTimeoutMs = 35000,
+            readTimeoutMs = 45000,
         ).getString("reply")
 
     fun launchDesktopApp(name: String) {
@@ -367,7 +460,7 @@ class RemoteClient(
             .put("coordinator", coordinator)
             .put("permission", permission.wire)
 
-        val conn = open("POST", "/api/prompts/stream", connectTimeoutMs = 10000, readTimeoutMs = 0)
+        val conn = open("POST", "/api/prompts/stream", connectTimeoutMs = 10000, readTimeoutMs = 180000)
         try {
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
@@ -424,10 +517,18 @@ class RemoteClient(
         }
     }
 
-    fun screenFrames(resolution: String, quality: Int, monitor: String, fps: Int, mbps: Int) = flow {
+    fun screenFrames(
+        resolution: String,
+        quality: Int,
+        monitor: String,
+        fps: Int,
+        mbps: Int,
+        hideCursor: Boolean = false,
+    ) = flow {
         val conn = open("GET", "/api/screen/stream", mapOf(
             "res" to resolution, "quality" to "$quality", "monitor" to monitor,
-            "fps" to "$fps", "max_kbps" to "${mbps * 1000}",
+            "fps" to "$fps", "max_kbps" to if (mbps in 1..2) "${mbps * 1000}" else "0",
+            "cursor" to if (hideCursor) "0" else "1",
         ), readTimeoutMs = 5000)
         try {
             conn.setRequestProperty("Accept", "multipart/x-mixed-replace")
@@ -464,6 +565,68 @@ class RemoteClient(
             conn.disconnect()
         }
     }.flowOn(Dispatchers.IO)
+
+    fun pasteImage(bytes: ByteArray) {
+        try {
+            requestJson("POST", "/api/screen/paste-image",
+                JSONObject().put("image", Base64.encodeToString(bytes, Base64.NO_WRAP)))
+        } catch (error: RemoteHttpException) {
+            if (error.code == 404) error("Gateway PC perlu dimuat ulang untuk paste gambar.")
+            throw error
+        }
+    }
+
+    fun rdpStatus(): JSONObject {
+        try {
+            return requestJson("GET", "/api/rdp/status", readTimeoutMs = 4000)
+        } catch (err: RemoteHttpException) {
+            if (err.code != 404) throw err
+        }
+        val host = hostAddress()
+        val listening = if (host.isBlank()) false else runCatching {
+            Socket().use { it.connect(InetSocketAddress(host, 3389), 600) }
+            true
+        }.getOrDefault(false)
+        return JSONObject()
+            .put("supported", true)
+            .put("legacy", true)
+            .put("enabled", listening)
+            .put("listening", listening)
+            .put("host", host)
+            .put("port", 3389)
+            .put("username", "")
+    }
+
+    fun setRdpEnabled(enabled: Boolean): JSONObject =
+        requestJson("POST", "/api/rdp/toggle", JSONObject().put("enabled", enabled), readTimeoutMs = 30000)
+
+    fun rdpOpenHostSettings(): JSONObject {
+        return try {
+            requestJson("POST", "/api/rdp/open-settings", readTimeoutMs = 5000)
+        } catch (err: RemoteHttpException) {
+            if (err.code != 404) throw err
+            requestJson("POST", "/api/desktop/open", JSONObject().put("app", "ms-settings:remotedesktop"), readTimeoutMs = 5000)
+        }
+    }
+
+    fun buildOrDownloadRdpFile(): ByteArray {
+        val downloaded = runCatching { getBytes("/api/rdp/connect.rdp") }.getOrNull()
+        if (downloaded != null && downloaded.isNotEmpty()) return downloaded
+        val host = hostAddress()
+        val text = buildString {
+            append("full address:s:").append(host).append(":3389\r\n")
+            append("prompt for credentials:i:1\r\n")
+            append("screen mode id:i:2\r\n")
+            append("smart sizing:i:1\r\n")
+            append("audiomode:i:0\r\n")
+            append("audiocapturemode:i:1\r\n")
+            append("redirectclipboard:i:1\r\n")
+            append("compression:i:1\r\n")
+            append("networkautodetect:i:1\r\n")
+            append("bandwidthautodetect:i:1\r\n")
+        }
+        return text.toByteArray(Charsets.UTF_8)
+    }
 
     fun approveHostAudio(): RemoteClient {
         val response = requestJson("POST", "/api/remote-pc/audio-permission", readTimeoutMs = 45_000)
@@ -511,7 +674,8 @@ class RemoteClient(
             .put("mouse_mode", mouseMode)
             .put("device_name", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim())
             .put("full_control", true),
-        readTimeoutMs = if (action == "pointer_move") 400 else 8000,
+        readTimeoutMs = if (action == "pointer_move") 600 else 8000,
+        connectTimeoutMs = if (action == "pointer_move") 1500 else 8000,
     )
 
     fun sendHotkey(key: String): JSONObject =
@@ -790,6 +954,7 @@ class RemoteClient(
             workspaceName = s.optString("workspaceName", ""),
             modelName = s.optString("activeModelName", ""),
             updatedAt = s.optString("updatedAt", ""),
+            status = s.optString("status", "idle"),
             personalizationOverride = overrideVal,
             messages = msgs,
         )

@@ -227,6 +227,7 @@ data class RemoteSession(
     val workspaceName: String,
     val modelName: String,
     val updatedAt: String,
+    val status: String = "idle",
     val personalizationOverride: String? = null,
     val messages: List<RemoteMessage> = emptyList(),
 )

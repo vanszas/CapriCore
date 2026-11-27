@@ -178,6 +178,14 @@ def normalize_codex_event(line: str, agent_id: str) -> list[dict]:
                 return [{"type": "native_session", "id": str(uuid.UUID(thread_id))}]
             except ValueError:
                 return []
+        if event_type == "turn.started":
+            return [{
+                "type": "reasoning",
+                "agent_id": agent_id,
+                "text": "Menjalankan agent di PC…",
+                "task_text": "Menjalankan agent di PC…",
+                "status": "running",
+            }]
         if event_type in {"turn.failed", "error"}:
             return [{
                 "type": "agent_failed",

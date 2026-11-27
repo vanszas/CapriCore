@@ -66,10 +66,7 @@ def _models_from(value):
 
 
 def active_moa_models():
-    """Return seat models from the latest running MoA, else saved MoA config."""
-    profile_models = _profile_models()
-    if profile_models:
-        return profile_models
+    """Return seat models only when an HDO council run is actively in progress."""
     root = Path.home() / ".hermes" / "hdo"
     runs = root / "runs"
     if runs.is_dir():
@@ -82,8 +79,5 @@ def active_moa_models():
                 models = _models_from(state)
                 if models:
                     return models
-    try:
-        return _models_from(json.loads((root / "config.json").read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return []
+    return []
 

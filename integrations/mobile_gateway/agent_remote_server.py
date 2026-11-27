@@ -25,6 +25,7 @@ import base64
 import ctypes
 import difflib
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -37,6 +38,7 @@ import socket
 import sqlite3
 import ipaddress
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -1727,13 +1729,17 @@ def nine_router_quota_accounts(db_path: Path | None = None) -> list[dict]:
 
 
 def agent_environment(agent_id: str) -> dict[str, str]:
-    if agent_id != 'codex':
+    if agent_id not in {'codex', 'hermes'}:
         return {}
     mobile_key = nine_router_mobile_key()
-    return {
-        MOBILE_KEY_ENV: mobile_key,
-        'NINE_ROUTER_API_KEY': mobile_key,
-    } if mobile_key else {}
+    env: dict[str, str] = {}
+    if mobile_key:
+        env[MOBILE_KEY_ENV] = mobile_key
+        env['NINE_ROUTER_API_KEY'] = mobile_key
+        env['OPENAI_API_KEY'] = mobile_key
+    if agent_id == 'hermes':
+        env['HERMES_ACCEPT_HOOKS'] = '1'
+    return env
 
 
 def provider_usage(
@@ -2322,9 +2328,13 @@ def prompt_command(
     if HERMES is None:
         raise ValueError("Hermes CLI is not installed")
     attachment_text = "".join(f"\n\nAttached file on PC: {path}" for path in attachments)
-    command = [str(HERMES), "chat", "-q", text + attachment_text]
-    if model:
-        command += ["-m", model]
+    command = [str(HERMES), "chat", "--oneshot", "-Q", "--accept-hooks", "-q", text + attachment_text]
+    eff_model = "low-agent" if (model == "smart-router" and not router_running()) else model
+    if nine_router_mobile_key():
+        router_url = "http://127.0.0.1:20130/v1" if eff_model == "smart-router" else NINE_ROUTER_BASE_URL
+        command += ["--provider", "custom", "--base-url", router_url]
+    if eff_model:
+        command += ["-m", eff_model]
     return command
 
 
@@ -2336,8 +2346,9 @@ def codex_command(
     if not executable:
         raise ValueError("Codex CLI is not installed")
     attachment_text = "".join(f"\n\nAttached file on PC: {path}" for path in attachments)
-    command = [executable]
-    router_url = "http://127.0.0.1:20130/v1" if model == "smart-router" else NINE_ROUTER_BASE_URL
+    command = [executable, '-c', 'mcp_servers={}', '-c', 'notify=[]']
+    eff_model = "low-agent" if (model == "smart-router" and not router_running()) else model
+    router_url = "http://127.0.0.1:20130/v1" if eff_model == "smart-router" else NINE_ROUTER_BASE_URL
     if nine_router_mobile_key():
         command += [
             '-c',
@@ -2359,8 +2370,8 @@ def codex_command(
     elif permission == "workspace":
         command += ["--ask-for-approval", "never", "--sandbox", "workspace-write"]
     command += ["-C", str(WORKSPACE)]
-    if model:
-        command += ["-m", model]
+    if eff_model:
+        command += ["-m", eff_model]
     command += ["exec"]
     if native_session:
         command.append("resume")
@@ -2717,11 +2728,14 @@ class Handler(BaseHTTPRequestHandler):
                 if route == "/api/remote-pc/audio":
                     return "audio" in self.remote_pc_grants
                 return "screen" in self.remote_pc_grants and route in {
-                    "/api/screen/info", "/api/screen/frame", "/api/screen/stream", "/api/screen/video", "/api/remote-mic/audio",
+                    "/api/screen/info", "/api/screen/frame", "/api/screen/stream", "/api/screen/video",
+                    "/api/remote-mic/audio", "/api/rdp/status", "/api/rdp/connect.rdp",
                 }
             return self.command == "POST" and route in {
                 "/api/remote-pc/audio-permission",
                 "/api/screen/input",
+                "/api/rdp/open-settings",
+                "/api/rdp/toggle",
                 "/api/voice/transcribe",
                 "/api/voice/chat",
                 "/api/voice/tts",
@@ -2759,13 +2773,14 @@ class Handler(BaseHTTPRequestHandler):
             pairing_handshake = parsed_url.path in {"/api/status", "/api/auth/pair"}
             device_ok = (not device_id) or is_device_trusted(device_id) or pairing_handshake
             authorized = token_ok and device_ok
-        record_security_audit(
-            self.client_address[0],
-            authorized,
-            self.command,
-            self.path,
-            self.headers.get("User-Agent", ""),
-        )
+        if not (authorized and urlparse(self.path).path == "/api/screen/input"):
+            record_security_audit(
+                self.client_address[0],
+                authorized,
+                self.command,
+                self.path,
+                self.headers.get("User-Agent", ""),
+            )
         return authorized
 
     def _stream_event(self, payload):
@@ -2812,7 +2827,7 @@ class Handler(BaseHTTPRequestHandler):
         if not ffmpeg or get_screen_bounds is None:
             return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "FFmpeg video capture unavailable"})
         try:
-            fps = min(30, max(5, int(query.get("fps", ["20"])[0])))
+            fps = min(60, max(5, int(query.get("fps", ["20"])[0])))
             mbps = min(16, max(1, int(query.get("mbps", ["4"])[0])))
         except ValueError:
             return self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid video settings"})
@@ -2827,8 +2842,8 @@ class Handler(BaseHTTPRequestHandler):
                 "-video_size", f"{width}x{height}", "-i", "desktop",
                 "-an", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
                 "-c:v", "h264_nvenc", "-pix_fmt", "yuv420p", "-preset", "p3", "-tune", "ull",
-                "-rc", "cbr", "-b:v", f"{mbps}M", "-maxrate", f"{mbps}M",
-                "-bufsize", f"{mbps * 100}k", "-bf", "0", "-g", str(fps),
+                "-rc", "vbr", "-cq", "24", "-b:v", f"{mbps}M", "-maxrate", f"{mbps}M",
+                "-bufsize", f"{max(2, mbps * 2)}M", "-bf", "0", "-g", str(fps * 2),
                 "-muxdelay", "0", "-muxpreload", "0", "-flush_packets", "1", "-f", "mpegts", "pipe:1",
             ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
             startup_timeout = threading.Timer(5, process.kill)
@@ -3150,6 +3165,8 @@ class Handler(BaseHTTPRequestHandler):
                         "resolutions": ["540p", "720p", "1080p", "native"],
                         "mouse_modes": ["virtual", "windows"],
                         "default_resolution": "720p",
+                        "udp_fastpath_port": PORT,
+                        "rdp": _rdp_status_info(),
                         "monitors": monitors,
                         "default_monitor": "primary",
                         "bounds": {
@@ -3158,6 +3175,18 @@ class Handler(BaseHTTPRequestHandler):
                         },
                     },
                 )
+            if url.path == "/api/rdp/status":
+                return self._json(HTTPStatus.OK, _rdp_status_info())
+            if url.path == "/api/rdp/connect.rdp":
+                body = _rdp_file_contents().encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/x-rdp")
+                self.send_header("Content-Disposition", 'attachment; filename="Capri-PC.rdp"')
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if url.path == "/api/devices":
                 return self._json(HTTPStatus.OK, {
                     "trusted": list(TRUSTED_DEVICES.values()),
@@ -3218,6 +3247,7 @@ class Handler(BaseHTTPRequestHandler):
                 qual = int(query.get("quality", ["70"])[0])
                 mon = query.get("monitor", ["primary"])[0]
                 prof = query.get("profile", [None])[0]
+                draw_cursor = query.get("cursor", ["1"])[0] != "0"
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                 self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -3225,7 +3255,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Connection", "close")
                 self.end_headers()
                 try:
-                    for chunk in STREAMER.stream_mjpeg(fps=fps, resolution=res, quality=qual, monitor=mon, profile=prof, max_kbps=max_kbps):
+                    for chunk in STREAMER.stream_mjpeg(fps=fps, resolution=res, quality=qual, monitor=mon, profile=prof, max_kbps=max_kbps, draw_cursor=draw_cursor):
                         self.wfile.write(chunk)
                         self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -3415,28 +3445,38 @@ class Handler(BaseHTTPRequestHandler):
         headers = {"Content-Type": "application/json"}
         if key:
             headers["Authorization"] = f"Bearer {key}"
-        request = urllib.request.Request(
-            f"{NINE_ROUTER_BASE_URL.rstrip('/')}/chat/completions",
-            data=json.dumps({
-                "model": os.environ.get("AGENT_REMOTE_VOICE_MODEL", "").strip() or "free-model",
-                "messages": messages,
-                "max_tokens": 220,
-                "temperature": 0.6,
-            }).encode("utf-8"),
-            headers=headers,
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                reply = json.load(response)["choices"][0]["message"]["content"]
-            if not isinstance(reply, str) or not reply.strip():
-                raise ValueError("Empty model reply")
-        except (OSError, ValueError, TypeError, KeyError, IndexError):
+        candidates = []
+        for cand in [os.environ.get("AGENT_REMOTE_VOICE_MODEL", "").strip(), "low-agent", "oc/deepseek-v4.1-flash-free", "free-model"]:
+            if cand and cand not in candidates:
+                candidates.append(cand)
+        reply = ""
+        for model_name in candidates:
+            request = urllib.request.Request(
+                f"{NINE_ROUTER_BASE_URL.rstrip('/')}/chat/completions",
+                data=json.dumps({
+                    "model": model_name,
+                    "messages": messages,
+                    "max_tokens": 220,
+                    "temperature": 0.6,
+                }).encode("utf-8"),
+                headers=headers,
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    msg = json.load(response)["choices"][0]["message"]
+                text_reply = msg.get("content") or ""
+                if isinstance(text_reply, str) and text_reply.strip():
+                    reply = text_reply.strip()
+                    break
+            except (OSError, ValueError, TypeError, KeyError, IndexError):
+                continue
+        if not reply:
             logger.warning("Capri mobile chat provider did not return text")
             return self._json(HTTPStatus.BAD_GATEWAY, {
                 "error": "PC model could not read the selected monitor. Check vision support."
                 if monitor is not None else "Capri's PC model could not reply",
             })
-        return self._json(HTTPStatus.OK, {"ok": True, "reply": reply.strip(), "mode": "chat", "tts_preset": "normal"})
+        return self._json(HTTPStatus.OK, {"ok": True, "reply": reply, "mode": "chat", "tts_preset": "normal"})
 
     def do_POST(self):
         import time
@@ -4737,6 +4777,36 @@ class Handler(BaseHTTPRequestHandler):
                     "text": text,
                     "executed": executed
                 })
+            if self.path == "/api/screen/paste-image":
+                if os.name != "nt" or inject_input is None:
+                    return self._json(HTTPStatus.NOT_IMPLEMENTED, {"error": "Paste gambar perlu host Windows"})
+                import base64 as image_base64
+                import subprocess as image_process
+                try:
+                    data = image_base64.b64decode(self._payload().get("image", ""), validate=True)
+                    if not 0 < len(data) <= 8 * 1024 * 1024:
+                        raise ValueError("Ukuran gambar maksimal 8 MB")
+                    from io import BytesIO
+                    from PIL import Image
+                    with Image.open(BytesIO(data)) as image:
+                        if image.width * image.height > 16_000_000:
+                            raise ValueError("Gambar maksimal 16 megapiksel")
+                        encoded = BytesIO()
+                        image.convert("RGBA").save(encoded, format="PNG")
+                    script = (
+                        "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; "
+                        "$stream = New-Object IO.MemoryStream; [Console]::OpenStandardInput().CopyTo($stream); "
+                        "$stream.Position = 0; $image = [Drawing.Image]::FromStream($stream); "
+                        "[Windows.Forms.Clipboard]::SetImage($image); $image.Dispose(); $stream.Dispose()"
+                    )
+                    image_process.run(["powershell.exe", "-NoProfile", "-STA", "-Command", script],
+                                   input=encoded.getvalue(), check=True, timeout=10, creationflags=CREATE_NO_WINDOW)
+                    result = inject_input(action="hotkey", key="ctrl+v")
+                    if isinstance(result, dict) and result.get("ok") is False:
+                        return self._json(HTTPStatus.CONFLICT, {"error": "Ctrl+V gagal dikirim ke aplikasi aktif"})
+                    return self._json(HTTPStatus.OK, {"ok": True})
+                except (ValueError, TypeError, OSError, image_process.SubprocessError):
+                    return self._json(HTTPStatus.BAD_REQUEST, {"error": "Gambar gagal dimuat ke clipboard Windows"})
             if self.path == "/api/screen/input":
                 if inject_input is None:
                     return self._json(HTTPStatus.NOT_IMPLEMENTED, {"error": "Input injection not available"})
@@ -4808,6 +4878,46 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as err:
                     logger.exception(f"Screen input error: {err}")
                     return self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(err)})
+            if self.path == "/api/rdp/toggle":
+                if os.name != "nt":
+                    return self._json(HTTPStatus.NOT_IMPLEMENTED, {"ok": False, "error": "Windows RDP hanya tersedia di host Windows"})
+                payload = self._payload()
+                enabled = bool(payload.get("enabled"))
+                try:
+                    import ctypes
+                    if not ctypes.windll.shell32.IsUserAnAdmin():
+                        return self._json(HTTPStatus.FORBIDDEN, {
+                            "ok": False,
+                            "admin_required": True,
+                            "error": "Jalankan Capri di PC host dengan Run as administrator, lalu coba lagi.",
+                            **_rdp_status_info(),
+                        })
+                    import winreg
+                    with winreg.OpenKey(
+                        winreg.HKEY_LOCAL_MACHINE,
+                        r"System\CurrentControlSet\Control\Terminal Server",
+                        0,
+                        winreg.KEY_SET_VALUE,
+                    ) as key:
+                        winreg.SetValueEx(key, "fDenyTSConnections", 0, winreg.REG_DWORD, 0 if enabled else 1)
+                    import subprocess
+                    if enabled:
+                        subprocess.run(["sc.exe", "config", "TermService", "start=", "demand"], check=True, capture_output=True, timeout=8)
+                        subprocess.run(["sc.exe", "start", "TermService"], check=False, capture_output=True, timeout=12)
+                        subprocess.run(["netsh.exe", "advfirewall", "firewall", "set", "rule", "group=remote desktop", "new", "enable=Yes"], check=False, capture_output=True, timeout=12)
+                    else:
+                        subprocess.run(["sc.exe", "stop", "TermService"], check=False, capture_output=True, timeout=12)
+                        subprocess.run(["netsh.exe", "advfirewall", "firewall", "set", "rule", "group=remote desktop", "new", "enable=No"], check=False, capture_output=True, timeout=12)
+                    return self._json(HTTPStatus.OK, {"ok": True, **_rdp_status_info()})
+                except Exception as err:
+                    return self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(err), **_rdp_status_info()})
+            if self.path == "/api/rdp/open-settings":
+                if os.name == "nt":
+                    try:
+                        os.startfile("ms-settings:remotedesktop")
+                    except OSError as err:
+                        return self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(err)})
+                return self._json(HTTPStatus.OK, {"ok": True, **_rdp_status_info()})
             if self.path == "/api/screen/hotkey":
                 if inject_input is None:
                     return self._json(HTTPStatus.NOT_IMPLEMENTED, {"error": "Input injection not available"})
@@ -5185,7 +5295,11 @@ class Handler(BaseHTTPRequestHandler):
         })
         try:
             while True:
-                event = events.get()
+                try:
+                    event = events.get(timeout=3.0)
+                except queue.Empty:
+                    self._stream_event({"type": "heartbeat", "ts": time.time()})
+                    continue
                 if event["type"] == "runtime_done":
                     break
                 self._stream_event(event)
@@ -5366,6 +5480,190 @@ def _log_remote_pc(message: str):
         pass
 
 
+_FASTPATH_MAGIC = b"CRFP\x01"
+_FASTPATH_ACTIONS = {"move", "click", "double_click", "rclick", "down", "up", "scroll"}
+_FASTPATH_SEQ_LOCK = threading.Lock()
+_FASTPATH_SEQ: dict[tuple[str, int], int] = {}
+
+
+def _rdp_status_info() -> dict:
+    supported = os.name == "nt"
+    enabled = False
+    port = 3389
+    if supported:
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"System\CurrentControlSet\Control\Terminal Server",
+            ) as key:
+                deny, _ = winreg.QueryValueEx(key, "fDenyTSConnections")
+                enabled = int(deny) == 0
+        except OSError:
+            pass
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp",
+            ) as key:
+                p, _ = winreg.QueryValueEx(key, "PortNumber")
+                if int(p) > 0:
+                    port = int(p)
+        except OSError:
+            pass
+    listening = False
+    if supported:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.15):
+                listening = True
+        except OSError:
+            listening = False
+    return {
+        "supported": supported,
+        "enabled": enabled,
+        "listening": listening,
+        "host": get_local_ip(),
+        "port": port,
+        "username": os.environ.get("USERNAME", ""),
+    }
+
+
+def _rdp_file_contents() -> str:
+    info = _rdp_status_info()
+    lines = [
+        f"full address:s:{info['host']}:{info['port']}",
+        "prompt for credentials:i:1",
+        "screen mode id:i:2",
+        "smart sizing:i:1",
+        "audiomode:i:0",
+        "audiocapturemode:i:1",
+        "redirectclipboard:i:1",
+        "compression:i:1",
+        "networkautodetect:i:1",
+        "bandwidthautodetect:i:1",
+    ]
+    if info.get("username"):
+        lines.insert(1, f"username:s:{info['username']}")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _fastpath_verify_and_extract(packet: bytes, client_ip: str = "127.0.0.1") -> dict | None:
+    if len(packet) < 35 or packet[:5] != _FASTPATH_MAGIC:
+        return None
+    _, nonce, seq = struct.unpack("!5sIQ", packet[:17])
+    mac = packet[17:33]
+    payload_bytes = packet[33:]
+    try:
+        data = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    device_id = str(data.get("d") or "").strip()
+    if is_device_banned(device_id, client_ip):
+        return None
+    if device_id.startswith("rust-"):
+        record = TRUSTED_DEVICES.get(device_id, {})
+        digest_hex = record.get("remote_pc_digest") or ""
+        grants = set(record.get("remote_pc_grants", []))
+        if not digest_hex or not {"screen", "pointer"} <= grants:
+            return None
+        try:
+            key_bytes = bytes.fromhex(digest_hex)
+        except ValueError:
+            return None
+    else:
+        if not TOKEN:
+            return None
+        if device_id and client_ip not in {"127.0.0.1", "::1"} and not is_device_trusted(device_id):
+            return None
+        key_bytes = hashlib.sha256(TOKEN.encode("utf-8")).digest()
+    expected = hmac.new(key_bytes, packet[:17] + payload_bytes, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(mac, expected):
+        return None
+    action = str(data.get("a") or "").strip()
+    if action not in _FASTPATH_ACTIONS:
+        return None
+    session_key = (device_id, int(nonce))
+    with _FASTPATH_SEQ_LOCK:
+        last_seq = _FASTPATH_SEQ.get(session_key, 0)
+        if seq <= last_seq:
+            return None
+        if session_key not in _FASTPATH_SEQ and len(_FASTPATH_SEQ) >= 64:
+            _FASTPATH_SEQ.pop(next(iter(_FASTPATH_SEQ)))
+        _FASTPATH_SEQ[session_key] = seq
+    return {
+        "device_id": device_id,
+        "action": action,
+        "x": float(data.get("x") or 0.0),
+        "y": float(data.get("y") or 0.0),
+        "monitor": str(data.get("m") or "primary"),
+        "windows": int(data.get("w") or 0) == 1,
+        "button": str(data.get("b") or "left"),
+        "delta": int(data.get("dl") or 0),
+        "pointer": str(data.get("p") or ""),
+    }
+
+
+class FastPathUdpServer:
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((host, port))
+        self.bound_port = int(self.sock.getsockname()[1])
+        self._stop = False
+        self._thread: threading.Thread | None = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._loop, name=f"fastpath-udp-{self.host}:{self.bound_port}", daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop:
+            try:
+                packet, addr = self.sock.recvfrom(2048)
+            except OSError:
+                break
+            parsed = _fastpath_verify_and_extract(packet, addr[0] if addr else "")
+            if not parsed:
+                continue
+            try:
+                if parsed["windows"] and native_mouse is not None:
+                    native_mouse(
+                        parsed["action"],
+                        parsed["x"],
+                        parsed["y"],
+                        parsed["monitor"],
+                        parsed["device_id"] or f"udp-{addr[0]}",
+                        parsed["button"],
+                        parsed["delta"],
+                    )
+                elif inject_input is not None:
+                    is_desktop = parsed["device_id"].startswith("rust-")
+                    inject_input(
+                        action=f"pointer_{parsed['action']}",
+                        x=parsed["x"],
+                        y=parsed["y"],
+                        button=parsed["button"],
+                        delta=parsed["delta"],
+                        monitor=parsed["monitor"],
+                        pointer=parsed["pointer"],
+                        pointer_kind="desktop" if is_desktop else "android",
+                        full_control=True,
+                    )
+            except Exception as err:
+                _log_remote_pc(f"UDP fastpath dispatch error: {err}")
+
+    def close(self):
+        self._stop = True
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 class RemotePcHTTPServer(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         import traceback
@@ -5402,6 +5700,14 @@ def main():
             hosts = [HOST]
         for host in hosts:
             servers.append(RemotePcHTTPServer((host, PORT), Handler))
+        udp_servers = []
+        for host in hosts:
+            try:
+                udp_srv = FastPathUdpServer(host, PORT)
+                udp_srv.start()
+                udp_servers.append(udp_srv)
+            except OSError as error:
+                logger.warning("FastPath UDP bind skipped for %s:%s: %s", host, PORT, error)
         for server in servers[1:]:
             threading.Thread(target=server.serve_forever, daemon=True).start()
         if managed and NINE_ROUTER_BASE_URL == "http://127.0.0.1:20128/v1":
@@ -5426,6 +5732,8 @@ def main():
             server.shutdown()
         for server in servers:
             server.server_close()
+        for udp_srv in udp_servers:
+            udp_srv.close()
         stop_pet(pet_process)
         PET_PROCESS = None
         release_server_instance(instance)

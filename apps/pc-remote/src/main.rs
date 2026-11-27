@@ -77,6 +77,83 @@ fn detect_tailscale_self_name() -> String {
         .unwrap_or_else(|| "Capri Remote Windows".into())
 }
 
+fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    let bit_len = (data.len() as u64) * 8;
+    let mut padded = Vec::with_capacity(data.len() + 72);
+    padded.extend_from_slice(data);
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, add) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *slot = slot.wrapping_add(add);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+fn hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..32 {
+        ipad[i] ^= key[i];
+        opad[i] ^= key[i];
+    }
+    let mut inner = Vec::with_capacity(64 + msg.len());
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(msg);
+    let inner_hash = sha256_bytes(&inner);
+    let mut outer = Vec::with_capacity(96);
+    outer.extend_from_slice(&opad);
+    outer.extend_from_slice(&inner_hash);
+    sha256_bytes(&outer)
+}
+
 #[derive(Clone)]
 struct StreamConfig {
     endpoint: String,
@@ -87,6 +164,7 @@ struct StreamConfig {
     resolution: String,
     quality: u8,
     fps_cap: u32,
+    udp_port: u16,
 }
 
 enum VoiceEvent {
@@ -195,6 +273,7 @@ struct Remote {
     screen_center: egui::Pos2,
     windows_mouse: bool,
     supports_windows_mouse: bool,
+    udp_port: u16,
     pan_screen: bool,
     frame: Option<egui::TextureHandle>,
     next_pointer: Instant,
@@ -412,6 +491,7 @@ impl Remote {
                     resolution: self.resolution.clone(),
                     quality: self.quality,
                     fps_cap: self.effective_fps_cap(),
+                    udp_port: self.udp_port,
                 });
             } else {
                 *guard = None;
@@ -537,7 +617,7 @@ impl Remote {
             }
         });
 
-        // Background keep-alive input sender (never blocks UI thread)
+        // Background keep-alive + UDP Fast-Path input sender (never blocks UI thread)
         let cfg_in = Arc::clone(&self.stream_cfg);
         let stop_i = Arc::clone(&self.stop_workers);
         std::thread::spawn(move || {
@@ -545,7 +625,67 @@ impl Remote {
                 .redirects(0)
                 .timeout(Duration::from_secs(4))
                 .build();
-            let send_once = |cfg: &StreamConfig, payload: &Value| -> bool {
+            let udp_sock = std::net::UdpSocket::bind("0.0.0.0:0").ok();
+            let udp_nonce = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+                ^ std::process::id()) as u32;
+            let mut udp_seq: u64 = 0;
+            let try_send_udp = |sock: Option<&std::net::UdpSocket>,
+                                cfg: &StreamConfig,
+                                payload: &Value,
+                                seq: &mut u64|
+             -> bool {
+                let Some(s) = sock else { return false };
+                if cfg.udp_port == 0 || cfg.token.is_empty() {
+                    return false;
+                }
+                let Some(act_raw) = payload["action"].as_str() else {
+                    return false;
+                };
+                let Some(act) = act_raw.strip_prefix("pointer_") else {
+                    return false;
+                };
+                if !matches!(
+                    act,
+                    "move" | "click" | "double_click" | "rclick" | "down" | "up" | "scroll"
+                ) {
+                    return false;
+                }
+                let json_bytes = serde_json::to_vec(&json!({
+                    "d": cfg.device,
+                    "a": act,
+                    "x": payload["x"].as_f64().unwrap_or(0.0),
+                    "y": payload["y"].as_f64().unwrap_or(0.0),
+                    "m": payload["monitor"].as_str().unwrap_or("primary"),
+                    "w": if payload["mouse_mode"].as_str() == Some("windows") { 1 } else { 0 },
+                    "b": payload["button"].as_str().unwrap_or("left"),
+                    "dl": payload["delta"].as_i64().unwrap_or(0),
+                    "p": ""
+                }))
+                .unwrap_or_default();
+                if json_bytes.is_empty() {
+                    return false;
+                }
+                *seq = seq.saturating_add(1);
+                let mut pkt = Vec::with_capacity(33 + json_bytes.len());
+                pkt.extend_from_slice(b"CRFP\x01");
+                pkt.extend_from_slice(&udp_nonce.to_be_bytes());
+                pkt.extend_from_slice(&seq.to_be_bytes());
+                let key = sha256_bytes(cfg.token.as_bytes());
+                let mut signed = Vec::with_capacity(17 + json_bytes.len());
+                signed.extend_from_slice(&pkt);
+                signed.extend_from_slice(&json_bytes);
+                let mac = hmac_sha256(&key, &signed);
+                pkt.extend_from_slice(&mac[..16]);
+                pkt.extend_from_slice(&json_bytes);
+                s.send_to(&pkt, (cfg.endpoint.trim(), cfg.udp_port)).is_ok()
+            };
+            let send_once = |cfg: &StreamConfig, payload: &Value, seq: &mut u64| -> bool {
+                if try_send_udp(udp_sock.as_ref(), cfg, payload, seq) {
+                    return true;
+                }
                 build_request(
                     &agent,
                     "POST",
@@ -569,16 +709,20 @@ impl Remote {
                         payload = next;
                     } else {
                         if let Some(cfg) = cfg_in.lock().ok().and_then(|g| g.clone()) {
-                            if !send_once(&cfg, &payload) {
-                                let _ = send_once(&cfg, &payload);
+                            if !send_once(&cfg, &payload, &mut udp_seq)
+                                && payload["action"] != "pointer_move"
+                            {
+                                let _ = send_once(&cfg, &payload, &mut udp_seq);
                             }
                         }
                         payload = next;
                     }
                 }
                 if let Some(cfg) = cfg_in.lock().ok().and_then(|g| g.clone()) {
-                    if !send_once(&cfg, &payload) {
-                        let _ = send_once(&cfg, &payload);
+                    if !send_once(&cfg, &payload, &mut udp_seq)
+                        && payload["action"] != "pointer_move"
+                    {
+                        let _ = send_once(&cfg, &payload, &mut udp_seq);
                     }
                 }
             }
@@ -692,6 +836,7 @@ impl Remote {
         self.supports_windows_mouse = info["mouse_modes"]
             .as_array()
             .is_some_and(|modes| modes.iter().any(|mode| mode == "windows"));
+        self.udp_port = info["udp_fastpath_port"].as_u64().unwrap_or(0) as u16;
         self.monitors = info["monitors"]
             .as_array()
             .into_iter()
@@ -1422,6 +1567,69 @@ impl eframe::App for Remote {
                             self.voice_status = e;
                         }
                     }
+                    let rdp_btn = egui::Button::new(
+                        egui::RichText::new("Windows RDP")
+                            .size(12.5)
+                            .color(text_primary),
+                    )
+                    .fill(egui::Color32::from_rgb(15, 118, 110));
+                    if ui
+                        .add(rdp_btn)
+                        .on_hover_text("Buka Microsoft Remote Desktop (mstsc) ke PC host.")
+                        .clicked()
+                    {
+                        let host = self.endpoint.trim().to_owned();
+                        let port: u16 = build_request(
+                            &self.agent,
+                            "GET",
+                            &host,
+                            "/api/rdp/status",
+                            &self.token,
+                            &self.device,
+                            &self.device_name,
+                        )
+                        .timeout(Duration::from_millis(800))
+                        .call()
+                        .ok()
+                        .and_then(|r| r.into_json::<Value>().ok())
+                        .and_then(|v| v["port"].as_u64())
+                        .unwrap_or(3389) as u16;
+                        let target = format!("{host}:{port}");
+                        let reachable = target
+                            .parse::<std::net::SocketAddr>()
+                            .ok()
+                            .is_some_and(|addr| {
+                                std::net::TcpStream::connect_timeout(
+                                    &addr,
+                                    Duration::from_millis(200),
+                                )
+                                .is_ok()
+                            });
+                        if reachable {
+                            let _ = std::process::Command::new("mstsc.exe")
+                                .arg(format!("/v:{target}"))
+                                .spawn();
+                            self.status = format!("Membuka Microsoft Remote Desktop ke {target}");
+                        } else {
+                            let opened = build_request(
+                                &self.agent,
+                                "POST",
+                                &host,
+                                "/api/rdp/open-settings",
+                                &self.token,
+                                &self.device,
+                                &self.device_name,
+                            )
+                            .timeout(Duration::from_secs(2))
+                            .send_json(json!({}))
+                            .is_ok();
+                            self.status = if opened {
+                                "Pengaturan Remote Desktop dibuka di PC host — aktifkan lalu klik Windows RDP lagi.".into()
+                            } else {
+                                "Aktifkan Remote Desktop di Windows Settings PC host (port 3389 belum aktif).".into()
+                            };
+                        }
+                    }
 
                     if !self.status.is_empty() {
                         ui.label(
@@ -1594,7 +1802,8 @@ impl eframe::App for Remote {
                             } else if response.secondary_clicked() {
                                 "pointer_rclick"
                             } else if Instant::now() >= self.next_pointer {
-                                self.next_pointer = Instant::now() + Duration::from_millis(16);
+                                let step_ms = if self.udp_port > 0 { 8 } else { 26 };
+                                self.next_pointer = Instant::now() + Duration::from_millis(step_ms);
                                 "pointer_move"
                             } else {
                                 ""
@@ -1745,6 +1954,7 @@ fn main() -> eframe::Result {
                 screen_center: egui::pos2(0.5, 0.5),
                 windows_mouse: false,
                 supports_windows_mouse: false,
+                udp_port: 0,
                 pan_screen: false,
                 frame: None,
                 next_pointer: Instant::now(),

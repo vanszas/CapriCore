@@ -144,10 +144,13 @@ fun ChatTab(go: (Tab) -> Unit) {
         }
         askingPc = true
         scope.launch {
+            var delegatedToBrain = false
             try {
                 val turns = JSONArray()
                 msgs.takeLast(6).forEach { (u, a) -> turns.put(JSONObject().put("u", u).put("a", a)) }
-                val reply = withContext(Dispatchers.IO) { remote.capriChat(line, turns) }
+                val reply = withContext(Dispatchers.IO) {
+                    remote.capriChat(line, turns)
+                }
                 saveReply(line, reply)
                 if (spoken || prefs.voice) {
                     val output = speaker ?: Speaker(ctx) {
@@ -158,11 +161,19 @@ fun ChatTab(go: (Tab) -> Unit) {
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
-                error = failure.message ?: tr("Capri could not reply. Try again.")
-                if (text.isBlank()) text = line
+                if (running && CapriService.brainOnline) {
+                    delegatedToBrain = true
+                    ctx.startService(
+                        Intent(ctx, CapriService::class.java).setAction(CapriService.ACTION_ASK)
+                            .putExtra("text", line).putExtra("chatOnly", true).putExtra("speakReply", spoken),
+                    )
+                } else {
+                    error = failure.message ?: tr("Capri could not reply. Try again.")
+                    if (text.isBlank()) text = line
+                }
             } finally {
                 askingPc = false
-                pending = ""
+                if (!delegatedToBrain) pending = ""
             }
         }
     }
@@ -220,6 +231,15 @@ fun ChatTab(go: (Tab) -> Unit) {
                 Text("Capri", color = INK, fontFamily = SANS, fontWeight = FontWeight.ExtraBold, fontSize = 18.sp)
                 Text(if (controlPhone) "HP ini" else if (remote != null) tr("Paired PC") else if (running) status else tr("offline"), color = MUTED, fontFamily = SANS, fontSize = 12.sp, maxLines = 1)
             }
+            if (remote != null) Text(
+                "Agent PC",
+                color = CYAN,
+                fontSize = 12.sp,
+                modifier = Modifier.clickable {
+                    RemoteState.requestedSubTab = "agents"
+                    go(Tab.REMOTE)
+                }.padding(8.dp),
+            )
             Text(
                 if (controlPhone) "Kembali ke chat" else "Kontrol HP",
                 color = if (controlPhone) CYAN else PINK,
@@ -275,17 +295,8 @@ fun ChatTab(go: (Tab) -> Unit) {
                         sendingDraft = true
                         keyboard?.hide()
                         focus.clearFocus()
-                        scope.launch {
-                            try {
-                                withTimeoutOrNull(750) {
-                                    snapshotFlow { ime.getBottom(density) }.first { it == 0 }
-                                }
-                                withFrameNanos { }
-                                send(line, spoken = false)
-                            } finally {
-                                sendingDraft = false
-                            }
-                        }
+                        send(line, spoken = false)
+                        sendingDraft = false
                     } else {
                         speaker?.stop()
                         error = ""

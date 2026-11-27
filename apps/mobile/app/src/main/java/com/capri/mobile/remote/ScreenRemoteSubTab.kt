@@ -4,7 +4,13 @@ import android.app.Activity
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.net.Uri
 import android.speech.RecognizerIntent
+import androidx.core.content.FileProvider
+import org.json.JSONObject
+import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -82,6 +88,7 @@ import com.capri.mobile.ON_NEON
 import com.capri.mobile.PANEL
 import com.capri.mobile.PANEL_HI
 import com.capri.mobile.PINK
+import com.capri.mobile.Pill
 import com.capri.mobile.SANS
 import com.capri.mobile.capriField
 import com.capri.mobile.capriSwitch
@@ -104,10 +111,13 @@ fun ScreenRemoteSubTab() {
     val io = remember { Executors.newCachedThreadPool() }
     val pointerIo = remember { ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, LinkedBlockingQueue()) }
     val pointerId = remember { java.util.UUID.randomUUID().toString().replace("-", "") }
-    val pendingMove = remember { arrayOfNulls<Runnable>(1) }
+    val latestMove = remember { AtomicReference<RemoteMoveReq?>(null) }
+    val moveDraining = remember { AtomicBoolean(false) }
+    var udpFastPathPort by remember { mutableIntStateOf(0) }
+    var showRdpDialog by remember { mutableStateOf(false) }
     var playing by remember { mutableStateOf(true) }
-    var resolution by remember { mutableStateOf("720p") }
     val prefs = remember { ctx.getSharedPreferences("remote_screen", 0) }
+    var resolution by remember { mutableStateOf(prefs.getString("resolution", "1080p") ?: "1080p") }
     var trackpadSensitivity by remember { mutableIntStateOf(prefs.getInt("trackpad_sensitivity", 100).coerceIn(25, 300)) }
     val setTrackpadSensitivity: (Int) -> Unit = { value ->
         trackpadSensitivity = value.coerceIn(25, 300)
@@ -115,16 +125,33 @@ fun ScreenRemoteSubTab() {
     }
     var targetFps by remember { mutableIntStateOf(prefs.getInt("fps", 30)) }
     var mbps by remember { mutableIntStateOf(prefs.getInt("mbps", 8)) }
-    var quality by remember { mutableIntStateOf(62) }
+    var quality by remember { mutableIntStateOf(when (resolution) { "native" -> 85; "1080p" -> 80; "540p" -> 58; else -> 74 }) }
     var monitor by remember { mutableStateOf("primary") }
     var monitors by remember { mutableStateOf(mapOf("primary" to "Main monitor", "virtual" to "All monitors")) }
+    var monitorSizes by remember { mutableStateOf(mapOf("primary" to IntSize(1920, 1080), "virtual" to IntSize(1920, 1080))) }
     var frameBitmap by remember { mutableStateOf<ImageBitmap?>(null) }
     var aspectRatio by remember { mutableFloatStateOf(16f / 9f) }
     var fps by remember { mutableIntStateOf(0) }
     var streamErr by remember { mutableStateOf("") }
-    var useVideo by remember { mutableStateOf(false) }
-    val videoClient = if (useVideo && playing && RemoteState.connected) RemoteState.client(ctx) else null
-    val video = videoClient?.let { RemoteVideoSource(it.baseUrl, it.token, it.deviceId, monitor, targetFps, mbps) }
+    var useVideo by remember { mutableStateOf(prefs.getBoolean("use_h264_stream", prefs.getBoolean("use_h264", true))) }
+    val screenClient = remember(RemoteState.activeProfile, RemoteState.connected) {
+        if (RemoteState.connected) RemoteState.client(ctx) else null
+    }
+    DisposableEffect(screenClient) {
+        onDispose { screenClient?.closePointerSocket() }
+    }
+    var videoCoolingDown by remember(screenClient, monitor, targetFps, mbps, useVideo, playing) { mutableStateOf(false) }
+    LaunchedEffect(videoCoolingDown) {
+        if (videoCoolingDown) {
+            delay(30_000)
+            videoCoolingDown = false
+        }
+    }
+    val playingVideo = useVideo && !videoCoolingDown
+    val videoClient = screenClient.takeIf { playingVideo && playing }
+    val video = remember(videoClient, monitor, targetFps, mbps) {
+        videoClient?.let { RemoteVideoSource(it.baseUrl, it.token, it.deviceId, monitor, targetFps, mbps) }
+    }
     var controlledApp by remember { mutableStateOf<String?>(null) }
 
     var showWindowPicker by remember { mutableStateOf(false) }
@@ -134,14 +161,14 @@ fun ScreenRemoteSubTab() {
     var showFullscreen by remember { mutableStateOf(false) }
     var showTrackpad by remember { mutableStateOf(false) }
 
-    var cursorX by remember { mutableFloatStateOf(0.5f) }
-    var cursorY by remember { mutableFloatStateOf(0.5f) }
+    val cursor = remember { RemoteCursorController() }
     var statusNote by remember { mutableStateOf("") }
     var windowsMouse by remember { mutableStateOf(prefs.getBoolean("windows_mouse", false)) }
     var supportsWindowsMouse by remember { mutableStateOf(false) }
     val onVideoError = {
-        useVideo = false
-        statusNote = "Video H.264 terputus atau gagal mulai. Kembali ke JPEG."
+        fps = 0
+        videoCoolingDown = true
+        statusNote = "Menyambungkan ulang H.264…"
     }
     var hostAudioEnabled by remember { mutableStateOf(false) }
     var hostAudioStatus by remember { mutableStateOf("") }
@@ -182,18 +209,33 @@ fun ScreenRemoteSubTab() {
     // Fetch monitor metadata once connected
     LaunchedEffect(RemoteState.connected) {
         supportsWindowsMouse = false
+        udpFastPathPort = 0
         if (!RemoteState.connected) return@LaunchedEffect
         withContext(Dispatchers.IO) {
             runCatching { RemoteState.client(ctx)?.screenInfo() }.getOrNull()?.let { info ->
+                udpFastPathPort = info.optInt("udp_fastpath_port", 0)
                 val modes = info.optJSONArray("mouse_modes")
                 supportsWindowsMouse = modes != null && (0 until modes.length()).any { modes.optString(it) == "windows" }
                 if (!supportsWindowsMouse) windowsMouse = false
                 val list = linkedMapOf("primary" to "Main monitor")
+                val sizes = linkedMapOf("primary" to IntSize(1920, 1080), "virtual" to IntSize(1920, 1080))
                 val arr = info.optJSONArray("monitors")
                 if (arr != null) {
                     for (i in 0 until arr.length()) {
                         val m = arr.optJSONObject(i)
                         val id = m?.optString("id") ?: m?.optString("name") ?: arr.optString(i)
+                        val w = m?.optInt("width", 0) ?: 0
+                        val h = m?.optInt("height", 0) ?: 0
+                        if (w > 0 && h > 0) {
+                            if (id == "all" || id == "virtual") {
+                                sizes["virtual"] = IntSize(w, h)
+                            } else if (id.isNotBlank()) {
+                                sizes[id] = IntSize(w, h)
+                                if (m?.optBoolean("is_primary", false) == true) {
+                                    sizes["primary"] = IntSize(w, h)
+                                }
+                            }
+                        }
                         if (id.isNotBlank() && id !in setOf("all", "virtual")) {
                             list[id] = m?.optString("name", id)?.ifBlank { id } ?: id
                         }
@@ -201,6 +243,7 @@ fun ScreenRemoteSubTab() {
                 }
                 list["virtual"] = "All monitors"
                 monitors = list
+                monitorSizes = sizes
                 if (monitor !in list) monitor = "primary"
             }
         }
@@ -208,10 +251,8 @@ fun ScreenRemoteSubTab() {
 
     // Frame streaming loop
     LaunchedEffect(monitor, RemoteState.connected) {
-        pendingMove[0]?.let(pointerIo::remove)
-        pendingMove[0] = null
-        cursorX = 0.5f
-        cursorY = 0.5f
+        latestMove.set(null)
+        cursor.reset()
         frameBitmap = null
         fps = 0
         streamErr = ""
@@ -219,27 +260,30 @@ fun ScreenRemoteSubTab() {
     val decodeOpts = remember {
         BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 }
     }
-    LaunchedEffect(playing, resolution, quality, targetFps, mbps, monitor, RemoteState.connected, useVideo) {
-        if (!playing || !RemoteState.connected || useVideo) return@LaunchedEffect
+    LaunchedEffect(playing, resolution, quality, targetFps, mbps, monitor, RemoteState.connected, playingVideo, showTrackpad && windowsMouse) {
+        if (!playing || !RemoteState.connected || playingVideo) return@LaunchedEffect
         var frames = 0
         var lastTick = android.os.SystemClock.elapsedRealtime()
+        val hideCursor = showTrackpad && windowsMouse
         while (playing && RemoteState.connected) {
             val client = RemoteState.client(ctx) ?: break
             try {
-                client.screenFrames(resolution, quality, monitor, targetFps, mbps)
+                client.screenFrames(resolution, quality, monitor, targetFps, mbps, hideCursor = hideCursor)
                     .conflate()
                     .collect { bytes ->
                         val bmp = withContext(Dispatchers.Default) {
                             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts)
                         } ?: return@collect
-                        aspectRatio = bmp.width.toFloat() / bmp.height.toFloat()
+                        val newRatio = bmp.width.toFloat() / bmp.height.toFloat()
+                        if (kotlin.math.abs(newRatio - aspectRatio) > 0.005f) aspectRatio = newRatio
                         frameBitmap = bmp.asImageBitmap()
-                        streamErr = ""
+                        if (streamErr.isNotEmpty()) streamErr = ""
                         frames++
                         val now = android.os.SystemClock.elapsedRealtime()
                         val elapsed = now - lastTick
                         if (elapsed >= 1000L) {
-                            fps = (frames * 1000L / elapsed).toInt()
+                            val newFps = (frames * 1000L / elapsed).toInt()
+                            if (newFps != fps) fps = newFps
                             frames = 0
                             lastTick = now
                         }
@@ -256,16 +300,107 @@ fun ScreenRemoteSubTab() {
         }
     }
 
-    fun sendInput(action: String, x: Float = cursorX, y: Float = cursorY, delta: Int = 0, text: String = "", key: String = "") {
-        val nx = x.coerceIn(0f, 0.999999f)
-        val ny = y.coerceIn(0f, 0.999999f)
-        cursorX = nx
-        cursorY = ny
+    fun sendInput(
+        action: String,
+        x: Float = cursor.x,
+        y: Float = cursor.y,
+        delta: Int = 0,
+        text: String = "",
+        key: String = "",
+        updateCursor: Boolean = true,
+    ) {
+        val (nx, ny) = if (updateCursor) cursor.setTo(x, y) else {
+            x.coerceIn(0f, 0.999999f) to y.coerceIn(0f, 0.999999f)
+        }
         val selectedMonitor = monitor
         val mode = if (windowsMouse) "windows" else "virtual"
-        val pointerInput = Runnable {
+        val fastPort = udpFastPathPort
+
+        fun flushMoveQueue() {
+            if (!moveDraining.compareAndSet(false, true)) return
+            pointerIo.execute {
+                try {
+                    while (true) {
+                        val req = latestMove.getAndSet(null) ?: break
+                        val client = screenClient ?: continue
+                        val sentUdp = req.udpPort > 0 && client.sendPointerUdp(
+                            action = "move",
+                            x = req.x.toDouble(),
+                            y = req.y.toDouble(),
+                            monitor = req.monitor,
+                            pointer = pointerId,
+                            mouseMode = req.mode,
+                            udpPort = req.udpPort,
+                        )
+                        if (sentUdp) {
+                            Thread.sleep(7L)
+                        } else {
+                            val t0 = android.os.SystemClock.elapsedRealtime()
+                            runCatching {
+                                client.screenInput(
+                                    action = "pointer_move",
+                                    x = req.x.toDouble(),
+                                    y = req.y.toDouble(),
+                                    monitor = req.monitor,
+                                    pointer = pointerId,
+                                    mouseMode = req.mode,
+                                )
+                            }.onFailure { error ->
+                                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                    statusNote = error.message ?: "Remote pointer unavailable"
+                                }
+                            }
+                            val waitMs = 28L - (android.os.SystemClock.elapsedRealtime() - t0)
+                            if (waitMs > 0L) Thread.sleep(waitMs)
+                        }
+                    }
+                } finally {
+                    moveDraining.set(false)
+                    if (latestMove.get() != null) flushMoveQueue()
+                }
+            }
+        }
+
+        if (action == "move") {
+            latestMove.set(RemoteMoveReq(nx, ny, selectedMonitor, mode, fastPort))
+            flushMoveQueue()
+            return
+        }
+
+        latestMove.set(null)
+        pointerIo.execute {
+            val client = screenClient ?: return@execute
+            val udpEligible = fastPort > 0 && action in setOf("click", "double_click", "rclick", "down", "up", "scroll")
+            if (udpEligible) {
+                val ok = client.sendPointerUdp(
+                    action = action,
+                    x = nx.toDouble(),
+                    y = ny.toDouble(),
+                    monitor = selectedMonitor,
+                    pointer = pointerId,
+                    mouseMode = mode,
+                    delta = delta,
+                    udpPort = fastPort,
+                )
+                if (ok) {
+                    if (action == "up") {
+                        Thread.sleep(8L)
+                        client.sendPointerUdp(
+                            action = "up",
+                            x = nx.toDouble(),
+                            y = ny.toDouble(),
+                            monitor = selectedMonitor,
+                            pointer = pointerId,
+                            mouseMode = mode,
+                            delta = delta,
+                            udpPort = fastPort,
+                        )
+                    }
+                    return@execute
+                }
+            }
             runCatching {
-                RemoteState.client(ctx)?.screenInput(
+                client.screenInput(
                     action = "pointer_$action",
                     x = nx.toDouble(),
                     y = ny.toDouble(),
@@ -282,9 +417,11 @@ fun ScreenRemoteSubTab() {
                 }
             }
         }
-        if (action != "up") pendingMove[0]?.let(pointerIo::remove)
-        pendingMove[0] = if (action == "move") pointerInput else null
-        pointerIo.execute(pointerInput)
+    }
+
+    fun moveByTrackpad(dx: Float, dy: Float) {
+        val (nx, ny) = cursor.moveBy(dx, dy)
+        sendInput("move", nx, ny, updateCursor = false)
     }
 
     fun sendHotkey(key: String) {
@@ -325,6 +462,10 @@ fun ScreenRemoteSubTab() {
         )
     }
 
+    if (showRdpDialog) {
+        WindowsRdpDialog(onDismiss = { showRdpDialog = false })
+    }
+
     if (showShortcuts) {
         CustomShortcutsModal(
             onDismiss = { showShortcuts = false },
@@ -341,11 +482,14 @@ fun ScreenRemoteSubTab() {
                 ScreenCanvas(
                     bitmap = frameBitmap,
                     video = video,
-                    onVideoSize = { aspectRatio = it },
+                    onVideoSize = { if (kotlin.math.abs(it - aspectRatio) > 0.005f) aspectRatio = it },
+                    onVideoFps = { fps = it; if (statusNote == "Menyambungkan ulang H.264…") statusNote = "" },
                     onVideoError = onVideoError,
                     monitor = monitor,
-                    detailEnabled = playing && RemoteState.connected,
-                    localPointer = if (showTrackpad && !windowsMouse) Offset(cursorX, cursorY) else null,
+                    detailEnabled = playing && RemoteState.connected && !useVideo && resolution != "native",
+                    cursor = cursor,
+                    showLocalCursor = showTrackpad || !windowsMouse,
+                    remoteMonitorSize = monitorSizes[monitor] ?: IntSize(1920, 1080),
                     aspectRatio = aspectRatio,
                     onTap = { x, y -> sendInput("click", x, y) },
                     onDoubleTap = { x, y -> sendInput("double_click", x, y) },
@@ -368,7 +512,7 @@ fun ScreenRemoteSubTab() {
                         onSensitivity = setTrackpadSensitivity,
                         modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp),
                         aspectRatio = aspectRatio,
-                        onMove = { dx, dy -> sendInput("move", cursorX + dx, cursorY + dy) },
+                        onMove = { dx, dy -> moveByTrackpad(dx, dy) },
                         onDragButton = { held -> sendInput(if (held) "down" else "up") },
                         onClick = { sendInput("click") },
                         onRightClick = { sendInput("rclick") },
@@ -389,6 +533,7 @@ fun ScreenRemoteSubTab() {
                         }
                         SmallChip("Keys", AMBER) { showKeyboard = true }
                         SmallChip("Trackpad", CYAN, selected = showTrackpad) { showTrackpad = !showTrackpad }
+                        SmallChip("🖥 Windows RDP", CYAN) { showRdpDialog = true }
                     }
                     MonitorChips(monitors, monitor) { monitor = it }
                     HostAudioControls(hostAudioEnabled, hostAudioStatus, toggleHostAudio)
@@ -415,7 +560,7 @@ fun ScreenRemoteSubTab() {
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    (if (useVideo) "$monitor · Native H.264" else "$monitor · $resolution · $fps FPS") +
+                    (if (playingVideo) "$monitor · Native H.264 · $fps FPS" else "$monitor · $resolution · $fps FPS") +
                         (if (statusNote.isNotEmpty()) " · $statusNote" else ""),
                     color = MUTED, fontFamily = MONO, fontSize = 10.5.sp, maxLines = 1,
                 )
@@ -429,6 +574,7 @@ fun ScreenRemoteSubTab() {
         HostAudioControls(hostAudioEnabled, hostAudioStatus, toggleHostAudio)
         SmallChip("Native H.264 (Beta)", CYAN, selected = useVideo) {
             useVideo = !useVideo
+            prefs.edit().putBoolean("use_h264_stream", useVideo).apply()
             statusNote = ""
         }
 
@@ -449,6 +595,7 @@ fun ScreenRemoteSubTab() {
             }
             SmallChip("⌨ Keys", INK) { showKeyboard = true }
             SmallChip("Trackpad", CYAN, selected = showTrackpad) { showTrackpad = !showTrackpad }
+            SmallChip("🖥 Windows RDP", CYAN) { showRdpDialog = true }
             SmallChip(if (windowsMouse) "Mouse Windows" else "Mouse virtual", CYAN, selected = windowsMouse) {
                 if (supportsWindowsMouse) {
                     sendInput("up")
@@ -470,23 +617,20 @@ fun ScreenRemoteSubTab() {
             for ((id, name) in monitors) {
                 SmallChip(tr(name), CYAN, selected = monitor == id) { monitor = id }
             }
-            for (rate in listOf(5, 10, 20, 30)) {
-                SmallChip("$rate FPS", MUTED, selected = targetFps == rate) {
-                    targetFps = rate
-                    prefs.edit().putInt("fps", rate).apply()
-                }
+            ScreenOption(targetFps, listOf(5, 10, 20, 30, 45, 60), { "$it FPS" }) {
+                targetFps = it
+                prefs.edit().putInt("fps", it).apply()
             }
-            for (rate in listOf(1, 2, 4, 8, 16)) {
-                SmallChip("$rate Mbps", MUTED, selected = mbps == rate) {
-                    mbps = rate
-                    prefs.edit().putInt("mbps", rate).apply()
-                }
+            ScreenOption(mbps, listOf(1, 2, 4, 8, 16), { "$it Mbps" }) {
+                mbps = it
+                prefs.edit().putInt("mbps", it).apply()
             }
-            for (r in listOf("540p", "720p", "1080p", "native")) {
-                SmallChip(if (r == "native") tr("Native") else r, MUTED, selected = resolution == r) {
-                    resolution = r
-                    quality = when (r) { "native" -> 80; "1080p" -> 75; "540p" -> 50; else -> 62 }
-                }
+            ScreenOption(resolution, listOf("540p", "720p", "1080p", "native"), {
+                if (it == "native") tr("Native") else it
+            }) {
+                resolution = it
+                prefs.edit().putString("resolution", it).apply()
+                quality = when (it) { "native" -> 85; "1080p" -> 80; "540p" -> 58; else -> 74 }
             }
         }
 
@@ -502,11 +646,14 @@ fun ScreenRemoteSubTab() {
             ScreenCanvas(
                 bitmap = frameBitmap,
                 video = if (showFullscreen) null else video,
-                onVideoSize = { aspectRatio = it },
+                onVideoSize = { if (kotlin.math.abs(it - aspectRatio) > 0.005f) aspectRatio = it },
+                onVideoFps = { fps = it; if (statusNote == "Menyambungkan ulang H.264…") statusNote = "" },
                 onVideoError = onVideoError,
                 monitor = monitor,
-                detailEnabled = playing && RemoteState.connected,
-                localPointer = if (showTrackpad && !windowsMouse) Offset(cursorX, cursorY) else null,
+                detailEnabled = playing && RemoteState.connected && !useVideo && resolution != "native",
+                cursor = cursor,
+                showLocalCursor = showTrackpad || !windowsMouse,
+                remoteMonitorSize = monitorSizes[monitor] ?: IntSize(1920, 1080),
                 aspectRatio = aspectRatio,
                 onTap = { x, y -> sendInput("click", x, y) },
                 onDoubleTap = { x, y -> sendInput("double_click", x, y) },
@@ -536,7 +683,7 @@ fun ScreenRemoteSubTab() {
                     onSensitivity = setTrackpadSensitivity,
                     modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp),
                     aspectRatio = aspectRatio,
-                    onMove = { dx, dy -> sendInput("move", cursorX + dx, cursorY + dy) },
+                    onMove = { dx, dy -> moveByTrackpad(dx, dy) },
                     onDragButton = { held -> sendInput(if (held) "down" else "up") },
                     onClick = { sendInput("click") },
                     onRightClick = { sendInput("rclick") },
@@ -671,18 +818,14 @@ private fun MovableRemoteTrackpad(
                             val first = awaitFirstDown()
                             first.consume()
                             var previous = first.position
+                            var prevUptimeMs = first.uptimeMillis
                             var moving = false
                             val locked = dragLocked
                             var held = false
-                            var pending = Offset.Zero
-                            var lastSent = first.uptimeMillis
-                            fun flush() {
-                                if (pending != Offset.Zero) {
-                                    val scale = 1.35f * (pointerSensitivity / 100f) / size.width.coerceAtLeast(1)
-                                    move(pending.x * scale, pending.y * scale * ratio)
-                                    pending = Offset.Zero
-                                }
-                            }
+                            var totalTravel = 0f
+                            val moveSlop = 2.dp.toPx()
+                            val tapSlop = 6.dp.toPx()
+                            val downAt = first.uptimeMillis
                             val holdAt = android.os.SystemClock.uptimeMillis() + viewConfiguration.longPressTimeoutMillis
                             try {
                                 while (true) {
@@ -699,18 +842,26 @@ private fun MovableRemoteTrackpad(
                                     if (change.isConsumed || event.changes.any { it.id != first.id && it.pressed }) break
                                     if (!change.pressed) {
                                         change.consume()
-                                        flush()
-                                        if (!moving && !held && !locked) click()
+                                        if ((!moving || (totalTravel < tapSlop && change.uptimeMillis - downAt < 240L)) && !held && !locked) {
+                                            click()
+                                        }
                                         break
                                     }
-                                    if (!moving && !held && !locked && (change.position - first.position).getDistance() < viewConfiguration.touchSlop) continue
-                                    moving = true
-                                    pending += change.position - previous
+                                    val d = change.position - previous
                                     previous = change.position
+                                    val dtMs = (change.uptimeMillis - prevUptimeMs).coerceIn(4L, 64L).toFloat()
+                                    prevUptimeMs = change.uptimeMillis
+                                    totalTravel += d.getDistance()
+                                    if (!moving && !held && !locked && (change.position - first.position).getDistance() < moveSlop) continue
+                                    moving = true
                                     change.consume()
-                                    if (change.uptimeMillis - lastSent >= 24) {
-                                        flush()
-                                        lastSent = change.uptimeMillis
+                                    if (d != Offset.Zero) {
+                                        val speedDpPerMs = (d.getDistance() / density) / dtMs
+                                        val accel = (1f + (speedDpPerMs - 0.22f).coerceAtLeast(0f) * 0.9f).coerceIn(1f, 2.5f)
+                                        val sens = (pointerSensitivity / 100f) * accel
+                                        val dxNorm = d.x * (1.65f * sens) / size.width.coerceAtLeast(1)
+                                        val dyNorm = d.y * (1.65f * sens) / size.height.coerceAtLeast(1)
+                                        move(dxNorm, dyNorm)
                                     }
                                 }
                             } finally {
@@ -739,11 +890,14 @@ private fun MovableRemoteTrackpad(
 private fun ScreenCanvas(
     bitmap: ImageBitmap?,
     video: RemoteVideoSource?,
+    onVideoFps: (Int) -> Unit,
     onVideoSize: (Float) -> Unit,
     onVideoError: () -> Unit,
     monitor: String,
     detailEnabled: Boolean,
-    localPointer: Offset?,
+    cursor: RemoteCursorController,
+    showLocalCursor: Boolean,
+    remoteMonitorSize: IntSize,
     aspectRatio: Float,
     onTap: (Float, Float) -> Unit,
     onDoubleTap: (Float, Float) -> Unit,
@@ -776,6 +930,9 @@ private fun ScreenCanvas(
         val client = RemoteState.client(ctx) ?: return@LaunchedEffect
         val coordinates = listOf(crop.left, crop.top, crop.right, crop.bottom).joinToString(",")
         while (true) {
+            while (android.os.SystemClock.uptimeMillis() - cursor.lastMoveUptimeMs < 500L) {
+                delay(250)
+            }
             val next = try {
                 val bytes = withContext(Dispatchers.IO) { client.screenDetail(monitor, coordinates) }
                     ?: break
@@ -857,7 +1014,7 @@ private fun ScreenCanvas(
         ) {
             if (bitmap != null || video != null) {
                 if (video != null) {
-                    RemoteVideo(video, Modifier.fillMaxSize(), onVideoSize, onVideoError)
+                    RemoteVideo(video, Modifier.fillMaxSize(), onVideoSize, onVideoError, onVideoFps)
                 } else if (bitmap != null) Image(
                     bitmap = bitmap,
                     contentDescription = "PC Screen",
@@ -875,17 +1032,25 @@ private fun ScreenCanvas(
                         )
                     }
                 }
-                if (localPointer != null) {
+                if (showLocalCursor) {
                     Canvas(Modifier.fillMaxSize()) {
-                        val tip = Offset(localPointer.x * size.width, localPointer.y * size.height)
+                        val _tick = cursor.drawTick.intValue
+                        val tip = Offset(cursor.x * size.width, cursor.y * size.height)
+                        val remoteH = remoteMonitorSize.height.coerceAtLeast(540).toFloat()
+                        // Exact 1:1 PC pixel scale so a 19px arrow matches the remote Windows cursor size
+                        val u = (size.height / remoteH).coerceAtLeast(0.18f)
                         val arrow = androidx.compose.ui.graphics.Path().apply {
                             moveTo(tip.x, tip.y)
-                            lineTo(tip.x, tip.y + 17.dp.toPx())
-                            lineTo(tip.x + 5.dp.toPx(), tip.y + 12.dp.toPx())
-                            lineTo(tip.x + 12.dp.toPx(), tip.y + 11.dp.toPx())
+                            lineTo(tip.x, tip.y + 19f * u)
+                            lineTo(tip.x + 5f * u, tip.y + 14f * u)
+                            lineTo(tip.x + 8f * u, tip.y + 20f * u)
+                            lineTo(tip.x + 11f * u, tip.y + 19f * u)
+                            lineTo(tip.x + 8f * u, tip.y + 12f * u)
+                            lineTo(tip.x + 15f * u, tip.y + 12f * u)
                             close()
                         }
-                        drawPath(arrow, Color.Black, style = androidx.compose.ui.graphics.drawscope.Stroke(2.dp.toPx()))
+                        val strokePx = (1.35f * u).coerceAtLeast(1.1f)
+                        drawPath(arrow, Color(0xEE081018), style = androidx.compose.ui.graphics.drawscope.Stroke(strokePx))
                         drawPath(arrow, CYAN)
                     }
                 }
@@ -1079,6 +1244,38 @@ private fun KeyboardModal(
     onKey: (String) -> Unit,
     onHotkey: (String) -> Unit,
 ) {
+    val ctx = LocalContext.current
+    var imageStatus by remember { mutableStateOf("") }
+    var sendingImage by remember { mutableStateOf(false) }
+    val sendImage: (Uri) -> Unit = { uri ->
+        sendingImage = true
+        imageStatus = ""
+        Thread {
+            val result = runCatching {
+                val bytes = checkNotNull(ctx.contentResolver.openInputStream(uri)) { "Gambar tidak bisa dibaca" }
+                    .use { input ->
+                        val buffer = ByteArray(8192)
+                        val output = java.io.ByteArrayOutputStream()
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            require(output.size() + count <= 8 * 1024 * 1024) { "Ukuran gambar maksimal 8 MB" }
+                            output.write(buffer, 0, count)
+                        }
+                        output.toByteArray()
+                    }
+                require(bytes.size in 1..(8 * 1024 * 1024)) { "Ukuran gambar maksimal 8 MB" }
+                checkNotNull(RemoteState.client(ctx)) { "PC belum tersambung" }.pasteImage(bytes)
+            }
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                sendingImage = false
+                imageStatus = result.exceptionOrNull()?.message ?: "Ctrl+V dikirim ke aplikasi aktif di PC."
+            }
+        }.start()
+    }
+    val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) sendImage(uri)
+    }
     var text by remember { mutableStateOf("") }
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Column(
@@ -1097,6 +1294,7 @@ private fun KeyboardModal(
                 value = text,
                 onValueChange = { text = it },
                 label = { Text(tr("Text to type on PC")) },
+                maxLines = 5,
                 colors = capriField(),
                 shape = chamfer(9.dp),
                 modifier = Modifier.fillMaxWidth(),
@@ -1105,6 +1303,14 @@ private fun KeyboardModal(
                 onTypeText(text)
                 text = ""
             }
+            CapriButton(if (sendingImage) "Mengirim gambar…" else "Paste gambar ke PC",
+                Modifier.fillMaxWidth(), color = CYAN, enabled = !sendingImage) {
+                val clipboard = ctx.getSystemService(android.content.ClipboardManager::class.java)
+                val uri = clipboard?.primaryClip?.takeIf { it.description.hasMimeType("image/*") }
+                    ?.getItemAt(0)?.uri
+                if (uri != null) sendImage(uri) else pickImage.launch("image/*")
+            }
+            if (imageStatus.isNotEmpty()) Text(imageStatus, color = MUTED, fontSize = 12.sp)
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 SmallChip("Enter", INK) { onKey("Enter") }
                 SmallChip("Backspace", INK) { onKey("Backspace") }
@@ -1173,6 +1379,238 @@ private fun CustomShortcutsModal(onDismiss: () -> Unit, onRun: (String) -> Unit)
                 }
                 label = ""
                 key = ""
+            }
+        }
+    }
+}
+
+private class RemoteCursorController {
+    @Volatile var x: Float = 0.5f
+    @Volatile var y: Float = 0.5f
+    @Volatile var lastMoveUptimeMs: Long = 0L
+    val drawTick = mutableIntStateOf(0)
+
+    fun reset() {
+        x = 0.5f
+        y = 0.5f
+        drawTick.intValue++
+    }
+
+    fun setTo(nx: Float, ny: Float): Pair<Float, Float> {
+        val cx = nx.coerceIn(0f, 0.999999f)
+        val cy = ny.coerceIn(0f, 0.999999f)
+        x = cx
+        y = cy
+        drawTick.intValue++
+        return cx to cy
+    }
+
+    fun moveBy(dx: Float, dy: Float): Pair<Float, Float> {
+        val cx = (x + dx).coerceIn(0f, 0.999999f)
+        val cy = (y + dy).coerceIn(0f, 0.999999f)
+        x = cx
+        y = cy
+        lastMoveUptimeMs = android.os.SystemClock.uptimeMillis()
+        drawTick.intValue++
+        return cx to cy
+    }
+}
+
+private data class RemoteMoveReq(
+    val x: Float,
+    val y: Float,
+    val monitor: String,
+    val mode: String,
+    val udpPort: Int,
+)
+
+@Composable
+private fun <T> ScreenOption(current: T, options: List<T>, label: (T) -> String, onSelect: (T) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        SmallChip("${label(current)} ▾", MUTED) { expanded = true }
+        androidx.compose.material3.DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            options.forEach { option ->
+                androidx.compose.material3.DropdownMenuItem(text = { Text(label(option)) }, onClick = {
+                    expanded = false
+                    onSelect(option)
+                })
+            }
+        }
+    }
+}
+
+@Composable
+private fun WindowsRdpDialog(onDismiss: () -> Unit) {
+    val ctx = LocalContext.current
+    var loading by remember { mutableStateOf(true) }
+    var busy by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf<JSONObject?>(null) }
+    var message by remember { mutableStateOf("") }
+    var reloadNonce by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(reloadNonce) {
+        loading = true
+        val res = withContext(Dispatchers.IO) { runCatching { RemoteState.client(ctx)?.rdpStatus() } }
+        res.onSuccess { status = it }.onFailure { message = it.message ?: "Gagal memeriksa status RDP." }
+        loading = false
+    }
+
+    val info = status
+    val host = info?.optString("host").orEmpty().ifBlank { RemoteState.client(ctx)?.hostAddress().orEmpty() }
+    val port = info?.optInt("port", 3389) ?: 3389
+    val username = info?.optString("username").orEmpty()
+    val listening = info?.optBoolean("listening", false) == true
+
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Column(
+            Modifier
+                .fillMaxWidth(0.92f)
+                .background(PANEL, chamfer(14.dp))
+                .border(1.dp, EDGE, chamfer(14.dp))
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.weight(1f)) { Label("Windows Remote Desktop (RDP)") }
+                SmallChip(tr("Refresh"), CYAN) { reloadNonce++ }
+                Spacer(Modifier.width(6.dp))
+                CapriButton(tr("Close"), quiet = true, color = MUTED) { onDismiss() }
+            }
+            Text(
+                tr("Native Microsoft RDP (0 delay untuk video & kursor). Catatan: layar fisik PC host otomatis ter-lock saat sesi RDP tersambung."),
+                color = MUTED,
+                fontFamily = SANS,
+                fontSize = 12.sp,
+            )
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .background(PANEL_HI, chamfer(8.dp))
+                    .border(1.dp, EDGE, chamfer(8.dp))
+                    .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        if (host.isBlank()) "Host belum tersambung" else "$host:$port",
+                        Modifier.weight(1f),
+                        color = INK,
+                        fontFamily = MONO,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Pill(
+                        if (loading) "Checking…" else if (listening) "Siap Konek" else "Belum Aktif",
+                        if (listening) GREEN else AMBER,
+                    )
+                }
+                if (info?.optBoolean("legacy") == true) Text("Aktifkan RDP melalui Pengaturan Windows di PC host.", color = MUTED, fontSize = 12.sp)
+                if (username.isNotBlank()) {
+                    Text("User Windows: $username", color = MUTED, fontFamily = MONO, fontSize = 11.5.sp)
+                }
+            }
+            CapriButton(
+                if (listening) "Matikan RDP di PC" else "Nyalakan RDP di PC",
+                Modifier.fillMaxWidth(),
+                color = if (listening) AMBER else CYAN,
+                enabled = !busy && info?.optBoolean("supported") == true && !info.optBoolean("legacy"),
+            ) {
+                busy = true
+                message = ""
+                Executors.newSingleThreadExecutor().execute {
+                    val result = runCatching {
+                        checkNotNull(RemoteState.client(ctx)) { "Host belum tersambung" }.setRdpEnabled(!listening)
+                    }
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        busy = false
+                        result.onSuccess {
+                            status = it
+                            message = if (it.optBoolean("listening")) "RDP aktif dan siap dikoneksikan." else "RDP dimatikan."
+                        }.onFailure {
+                            message = it.message ?: "Gagal mengubah status RDP."
+                        }
+                    }
+                }
+            }
+            if (message.isNotEmpty()) {
+                Text(message, color = AMBER, fontFamily = SANS, fontSize = 12.sp)
+            }
+            CapriButton(
+                tr("Konek via Microsoft Remote Desktop"),
+                Modifier.fillMaxWidth(),
+                color = GREEN,
+                enabled = !busy && host.isNotBlank(),
+            ) {
+                busy = true
+                message = ""
+                Executors.newSingleThreadExecutor().execute {
+                    val result = runCatching {
+                        val client = checkNotNull(RemoteState.client(ctx)) { "Host belum tersambung" }
+                        val bytes = client.buildOrDownloadRdpFile()
+                        val dir = File(ctx.cacheDir, "rdp").apply { mkdirs() }
+                        val file = File(dir, "Capri-PC.rdp").apply { writeBytes(bytes) }
+                        FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
+                    }
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        busy = false
+                        val uri = result.getOrNull()
+                        if (uri == null) {
+                            message = result.exceptionOrNull()?.message ?: "Gagal menyiapkan file .rdp"
+                            return@post
+                        }
+                        val fileIntent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(uri, "application/x-rdp")
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        if (runCatching { ctx.startActivity(fileIntent) }.isSuccess) {
+                            onDismiss()
+                            return@post
+                        }
+                        val encodedUser = Uri.encode(username)
+                        val rdpUrl = Uri.parse(
+                            "rdp://full%20address=s:$host:$port" +
+                                (if (encodedUser.isNotBlank()) "&username=s:$encodedUser" else "") +
+                                "&audiomode=i:0",
+                        )
+                        val schemeIntent = Intent(Intent.ACTION_VIEW, rdpUrl).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        if (runCatching { ctx.startActivity(schemeIntent) }.isSuccess) {
+                            onDismiss()
+                            return@post
+                        }
+                        message = "Install Windows App / Microsoft Remote Desktop di Play Store terlebih dahulu."
+                        val market = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.microsoft.rdc.androidx"))
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        if (runCatching { ctx.startActivity(market) }.isFailure) {
+                            runCatching {
+                                ctx.startActivity(
+                                    Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=com.microsoft.rdc.androidx"))
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            CapriButton(
+                tr("Buka Pengaturan RDP di PC Host"),
+                Modifier.fillMaxWidth(),
+                quiet = true,
+                color = CYAN,
+                enabled = !busy,
+            ) {
+                busy = true
+                Executors.newSingleThreadExecutor().execute {
+                    val res = runCatching { RemoteState.client(ctx)?.rdpOpenHostSettings() }
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        busy = false
+                        res.onSuccess {
+                            message = "Pengaturan Remote Desktop dibuka di PC host. Aktifkan lalu tekan Refresh."
+                        }.onFailure {
+                            message = it.message ?: "Gagal membuka Pengaturan RDP di PC host."
+                        }
+                    }
+                }
             }
         }
     }

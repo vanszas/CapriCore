@@ -34,18 +34,17 @@ ROUTER_MUTEX_NAME = "Local\\AgentRemoteSmartRouterProxy"
 DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": True,
     "mode": "auto",  # "auto", "simple_only", "complex_only", "off"
-    "simple_model": "ag/gemini-3.8-flash-high",
-    "complex_model": "x-kiro/anthropic/claude-opus-5.5",
+    "simple_model": "low-agent",
+    "complex_model": "cx/gpt-6-sol",
     "fallback_models": [
-        "ag/gemini-3.7-flash-high",
-        "ag/claude-sonnet-4-6",
-        "x-kiro/anthropic/claude-sonnet-4.6",
+        "low-agent",
+        "oc/deepseek-v4.1-flash-free",
         "free-model",
     ],
     "complexity_threshold": 35,
     "listen_host": "127.0.0.1",
     "listen_port": 20130,
-    "upstream_url": "http://localhost:20128/v1",
+    "upstream_url": "http://127.0.0.1:20128/v1",
 }
 
 _CONFIG_LOCK = threading.RLock()
@@ -460,7 +459,7 @@ class SmartRouterHandler(BaseHTTPRequestHandler):
                 req.add_header("Authorization", auth_header)
 
             try:
-                upstream_resp = urllib.request.urlopen(req, timeout=25)
+                upstream_resp = urllib.request.urlopen(req, timeout=12)
                 # Success HTTP 200
                 logger.info(
                     f"Routed prompt [score={score}, reasons={reasons}] -> '{model_target}' (attempt {attempt_idx+1}/{len(candidates)}) [OK 200]"
