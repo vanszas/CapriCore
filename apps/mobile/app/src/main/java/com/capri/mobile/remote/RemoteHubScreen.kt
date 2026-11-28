@@ -314,7 +314,10 @@ private fun AgentsSubTab() {
             SmallChip(
                 RemoteState.activeSession?.title?.take(14) ?: tr("Sessions"),
                 INK,
-            ) { showSessions = true }
+            ) {
+                RemoteState.refreshSessions(ctx)
+                showSessions = true
+            }
             SmallChip(
                 if (RemoteState.debateRunning) "/debate (ON)" else "/debate",
                 if (RemoteState.debateRunning) GREEN else AMBER,

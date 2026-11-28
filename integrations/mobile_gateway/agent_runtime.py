@@ -7,6 +7,7 @@ import signal
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -120,7 +121,7 @@ def available_agents(hermes: Path | None) -> list[dict]:
         "description": "Hermes Agent CLI",
         "command": str(hermes) if hermes_installed else "",
         "installed": hermes_installed,
-        "supports_streaming": False,
+        "supports_streaming": True,
         "supports_tools": True,
     })
     agy_commands = ("agy.cmd", "agy.exe", "agy", "antigravity.cmd", "antigravity.exe", "antigravity")
@@ -239,6 +240,109 @@ def normalize_codex_event(line: str, agent_id: str) -> list[dict]:
     return []
 
 
+def normalize_hermes_event(line: str, agent_id: str) -> list[dict]:
+    """Normalize a single JSONL line from `hermes chat --oneshot --format stream-json`."""
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        cleaned = line.strip()
+        return [{
+            "type": "diagnostic",
+            "agent_id": agent_id,
+            "text": cleaned,
+        }] if cleaned else []
+    if not isinstance(event, dict):
+        return []
+    event_type = str(event.get("type") or "").strip().lower()
+    if event_type == "system":
+        out = [{
+            "type": "reasoning",
+            "agent_id": agent_id,
+            "text": "Menjalankan Hermes di PC…",
+            "task_text": "Menjalankan Hermes di PC…",
+            "status": "running",
+        }]
+        sid = event.get("session_id")
+        if isinstance(sid, str) and sid.strip():
+            out.append({"type": "native_session", "id": sid.strip()})
+        return out
+    if event_type in {"text", "assistant", "delta", "message"}:
+        text = str(event.get("text") or event.get("content") or "")
+        if not text:
+            return []
+        return [{
+            "type": "delta",
+            "agent_id": agent_id,
+            "text": text,
+            "task_text": concise_activity_detail(text) or "Menyusun respons",
+            "phase": "responding",
+        }]
+    if event_type in {"thinking", "reasoning"}:
+        text = str(event.get("text") or event.get("content") or "Menganalisis task")
+        detail = concise_activity_detail(text) or "Menganalisis task"
+        return [{
+            "type": "reasoning",
+            "agent_id": agent_id,
+            "text": detail,
+            "task_text": detail,
+            "status": "running",
+        }]
+    if event_type in {"tool_call", "tool_use", "tool_start"}:
+        tool_id = str(event.get("id") or event.get("call_id") or new_id("tool"))
+        name = str(event.get("name") or event.get("tool") or "tool")
+        args = event.get("arguments") or event.get("input") or ""
+        detail = concise_activity_detail(f"{name}: {args}" if args else name)
+        return [{
+            "type": "tool_started",
+            "agent_id": agent_id,
+            "tool_id": tool_id,
+            "name": name,
+            "text": detail,
+            "task_text": detail,
+        }]
+    if event_type in {"tool_result", "tool_end"}:
+        tool_id = str(event.get("id") or event.get("call_id") or new_id("tool"))
+        name = str(event.get("name") or event.get("tool") or "tool")
+        output = str(event.get("output") or event.get("result") or event.get("content") or "")
+        return [{
+            "type": "tool_completed",
+            "agent_id": agent_id,
+            "tool_id": tool_id,
+            "name": name,
+            "text": f"{name} selesai",
+            "task_text": f"{name} selesai",
+            "output": output,
+        }]
+    if event_type == "error":
+        err = str(event.get("error") or event.get("message") or event)
+        return [{
+            "type": "agent_failed",
+            "agent_id": agent_id,
+            "error": err,
+        }]
+    if event_type == "result":
+        out = []
+        sid = event.get("session_id")
+        if isinstance(sid, str) and sid.strip():
+            out.append({"type": "native_session", "id": sid.strip()})
+        exit_code = event.get("exit_code")
+        if (isinstance(exit_code, int) and exit_code != 0) or event.get("is_error") or event.get("error"):
+            err = str(event.get("error") or event.get("text") or f"hermes exited with {exit_code}")
+            out.append({
+                "type": "agent_failed",
+                "agent_id": agent_id,
+                "error": err,
+            })
+        elif str(event.get("text") or "").strip():
+            out.append({
+                "type": "final_text",
+                "agent_id": agent_id,
+                "text": str(event.get("text") or ""),
+            })
+        return out
+    return []
+
+
 class SessionStore:
     def __init__(self, path: Path, workspace_name: str):
         self.path = path
@@ -265,12 +369,43 @@ class SessionStore:
 
     def _save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(list(self.sessions.values()), ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        serialized = json.dumps(list(self.sessions.values()), ensure_ascii=False, indent=2)
+        temporary = (
+            self.path.parent
+            / f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp"
         )
-        temporary.replace(self.path)
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            replaced = False
+            last_error = None
+            for delay in (0.02, 0.04, 0.08, 0.16, 0.32, 0.5):
+                try:
+                    os.replace(temporary, self.path)
+                    replaced = True
+                    break
+                except (PermissionError, OSError) as err:
+                    last_error = err
+                    time.sleep(delay)
+            if not replaced:
+                for delay in (0.05, 0.1, 0.2):
+                    try:
+                        self.path.write_text(serialized, encoding="utf-8")
+                        replaced = True
+                        break
+                    except (PermissionError, OSError) as err:
+                        last_error = err
+                        time.sleep(delay)
+            if not replaced and last_error is not None:
+                raise last_error
+        finally:
+            try:
+                if temporary.exists():
+                    temporary.unlink()
+            except OSError:
+                pass
 
     def list(self, limit: int = 200) -> list[dict]:
         with self.lock:
@@ -810,6 +945,8 @@ class AgentRuntime:
                     continue
                 if agent_id == "codex":
                     normalized = normalize_codex_event(value, agent_id)
+                elif agent_id == "hermes":
+                    normalized = normalize_hermes_event(value, agent_id)
                 else:
                     detail = concise_activity_detail(value)
                     normalized = [{
@@ -821,8 +958,24 @@ class AgentRuntime:
                     }]
                 for event in normalized:
                     if event["type"] == "native_session":
-                        self.store.remember_native_session(session_id, agent_id, event["id"])
+                        try:
+                            self.store.remember_native_session(session_id, agent_id, event["id"])
+                        except KeyError:
+                            pass
                         continue
+                    if event["type"] == "final_text":
+                        if "".join(output).strip():
+                            continue
+                        final_str = str(event.get("text") or "")
+                        if not final_str:
+                            continue
+                        event = {
+                            "type": "delta",
+                            "agent_id": agent_id,
+                            "text": final_str,
+                            "task_text": "Menyusun respons akhir",
+                            "phase": "responding",
+                        }
                     if event["type"] == "delta":
                         output.append(event["text"])
                         self._update_agent_state(
@@ -1032,23 +1185,23 @@ class AgentRuntime:
                 "createdAt": timestamp,
                 "updatedAt": timestamp,
             }
-        self.store.update(
-            session_id,
-            status="generating",
-            activeModelName=" + ".join(effective_agent_ids),
-        )
-        self.store.append_message(session_id, "user", text)
-        self.store.append_activity(
-            session_id,
-            run_id,
-            "+".join(effective_agent_ids),
-            "queued",
-            "completed",
-            "Task diterima dan masuk antrean",
-        )
-        execution_text = agent_text if agent_text is not None else text
         results = {}
         try:
+            self.store.update(
+                session_id,
+                status="generating",
+                activeModelName=" + ".join(effective_agent_ids),
+            )
+            self.store.append_message(session_id, "user", text)
+            self.store.append_activity(
+                session_id,
+                run_id,
+                "+".join(effective_agent_ids),
+                "queued",
+                "completed",
+                "Task diterima dan masuk antrean",
+            )
+            execution_text = agent_text if agent_text is not None else text
             if mode == "coordinator" and len(effective_agent_ids) > 1:
                 workers = [agent for agent in effective_agent_ids if agent != lead]
                 with concurrent.futures.ThreadPoolExecutor(
@@ -1157,6 +1310,15 @@ class AgentRuntime:
                 completion_detail,
             )
             events.put({"type": "completed", "ok": not failed, "run_id": run_id})
+        except Exception as error:
+            err_msg = str(error) or "Execution failed"
+            try:
+                self.store.update(session_id, status="failed")
+            except Exception:
+                pass
+            self._finish_pending_agent_states(run_id, "failed", "failed", err_msg[:240])
+            self._update_task(run_id, status="failed", detail=err_msg[:240])
+            events.put({"type": "completed", "ok": False, "run_id": run_id, "error": err_msg})
         finally:
             with self.lock:
                 self.cancelled.discard(run_id)

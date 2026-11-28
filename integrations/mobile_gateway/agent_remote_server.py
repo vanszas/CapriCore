@@ -26,12 +26,15 @@ import ctypes
 import difflib
 import hashlib
 import hmac
+import importlib
+import io
 import json
 import math
 import os
 import platform
 import queue
 import re
+import shlex
 import shutil
 import secrets
 import socket
@@ -47,6 +50,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+import webbrowser
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2323,18 +2328,37 @@ def personalized_prompt(text: str, global_text: str, session_override) -> str:
     )
 
 def prompt_command(
-    text: str, model: str, attachments: list[Path], permission: str = "workspace"
+    text: str,
+    model: str,
+    attachments: list[Path],
+    permission: str = "workspace",
+    native_session: str | None = None,
 ) -> list[str]:
     if HERMES is None:
         raise ValueError("Hermes CLI is not installed")
     attachment_text = "".join(f"\n\nAttached file on PC: {path}" for path in attachments)
-    command = [str(HERMES), "chat", "--oneshot", "-Q", "--accept-hooks", "-q", text + attachment_text]
+    command = [
+        str(HERMES),
+        "chat",
+        "--oneshot",
+        "--format",
+        "stream-json",
+        "--ignore-user-config",
+        "--in",
+        str(WORKSPACE),
+    ]
+    if permission in {"full", "workspace"}:
+        command.append("--yolo")
+    if native_session:
+        command += ["--resume", native_session]
     eff_model = "low-agent" if (model == "smart-router" and not router_running()) else model
-    if nine_router_mobile_key():
+    mobile_key = nine_router_mobile_key()
+    if mobile_key:
         router_url = "http://127.0.0.1:20130/v1" if eff_model == "smart-router" else NINE_ROUTER_BASE_URL
-        command += ["--provider", "custom", "--base-url", router_url]
+        command += ["--provider", "custom", "--base-url", router_url, "--api-key", mobile_key]
     if eff_model:
         command += ["-m", eff_model]
+    command += ["-q", text + attachment_text]
     return command
 
 
@@ -2430,7 +2454,7 @@ def agent_command(
     native_session: str | None = None,
 ) -> list[str]:
     if agent_id == "hermes":
-        return prompt_command(text, model, attachments, permission)
+        return prompt_command(text, model, attachments, permission, native_session)
     if agent_id == "codex":
         return codex_command(text, model, attachments, permission, native_session)
     if agent_id in {"claude", "gemini", "opencode"}:
@@ -2901,7 +2925,7 @@ class Handler(BaseHTTPRequestHandler):
             ).decode("utf-8").rstrip("=")
             payload = f"agentremote://pair?data={pair_data}"
             try:
-                import qrcode, io
+                import qrcode
                 img = qrcode.make(payload)
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
@@ -2950,7 +2974,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(HTTPStatus.OK, _mc.installed_packages())
 
         if url.path == "/api/voice/session/status":
-            import time
             sess = globals().setdefault("GLOBAL_VOICE_SESSION", {"active": False, "owner": None, "acquired_at": 0.0})
             is_active = bool(sess.get("active", False))
             if is_active and (time.time() - float(sess.get("acquired_at", 0.0) or 0.0) > 45.0):
@@ -2961,8 +2984,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if url.path == "/api/voice/models":
             try:
-                import pathlib
-                db_path = pathlib.Path.home() / "AppData/Roaming/9router/db/data.sqlite"
+                db_path = Path.home() / "AppData/Roaming/9router/db/data.sqlite"
                 api_key = "local-key"
                 if db_path.exists():
                     try:
@@ -3037,7 +3059,6 @@ class Handler(BaseHTTPRequestHandler):
                     jpeg_bytes = STREAMER.grab_jpeg()
                 if not jpeg_bytes:
                     from PIL import ImageGrab
-                    import io
                     shot = ImageGrab.grab()
                     buf = io.BytesIO()
                     shot.save(buf, format="JPEG", quality=80)
@@ -3479,12 +3500,6 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(HTTPStatus.OK, {"ok": True, "reply": reply, "mode": "chat", "tts_preset": "normal"})
 
     def do_POST(self):
-        import time
-        import json
-        import urllib
-        import urllib.request
-        import urllib.error
-        import urllib.parse
         if self.path.startswith("/api/remote-pc/"):
             return self._remote_pc_pairing()
         if self.path in {"/api/remote-mic/start", "/api/remote-mic/pcm", "/api/remote-mic/stop"}:
@@ -3526,7 +3541,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/api/voice/transcribe":
             try:
-                import base64, tempfile
                 content_type = self.headers.get("Content-Type", "")
                 if "application/json" in content_type:
                     body = self._payload()
@@ -3556,8 +3570,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not ninerouter_key:
                     # Optional silent fallback key check from local db
                     try:
-                        import sqlite3, pathlib
-                        db_p = pathlib.Path.home() / "AppData/Roaming/9router/db/data.sqlite"
+                        db_p = Path.home() / "AppData/Roaming/9router/db/data.sqlite"
                         if db_p.exists():
                             conn = sqlite3.connect(str(db_p))
                             c = conn.cursor()
@@ -3571,7 +3584,6 @@ class Handler(BaseHTTPRequestHandler):
 
                 if ninerouter_enabled and stt_model:
                     try:
-                        import urllib.request, uuid, json
                         boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
                         ext = "wav" if "wav" in mime else "webm"
                         boundary_b = boundary.encode("ascii")
@@ -3678,7 +3690,6 @@ class Handler(BaseHTTPRequestHandler):
                 action = body.get("action", "pause")
                 logger.info(f"[MediaControl] Spotify/Media control requested: {action}")
                 try:
-                    import ctypes
                     user32 = ctypes.windll.user32
                     if action == "pause":
                         # Explicit pause to Spotify window via WM_APPCOMMAND (0x0319), APPCOMMAND_MEDIA_PAUSE (0xE0000)
@@ -3851,11 +3862,9 @@ class Handler(BaseHTTPRequestHandler):
 
                 # 2. Fallback otomatis ke Notepad (jika Notion tidak terhubung atau gagal)
                 if not saved_to_notion:
-                    import datetime, subprocess
-                    import pathlib
-                    save_dir = pathlib.Path(os.environ.get("APPDATA", ".")) / "AgentRemote" / "meetings"
+                    save_dir = Path(os.environ.get("APPDATA", ".")) / "AgentRemote" / "meetings"
                     save_dir.mkdir(parents=True, exist_ok=True)
-                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     file_path = save_dir / f"meeting_{ts}.txt"
                     
                     file_content = (
@@ -3863,7 +3872,7 @@ class Handler(BaseHTTPRequestHandler):
                         f"  AGENT REMOTE — CATATAN RAPAT\n"
                         f"====================================================\n"
                         f"Judul : {title}\n"
-                        f"Waktu : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"Waktu : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                         f"Status: Simpan Lokal (Notepad Fallback)\n"
                         f"====================================================\n\n"
                         f"--- RINGKASAN ---\n"
@@ -3901,7 +3910,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(HTTPStatus.OK, {"ok": True, "active": is_active})
 
         if self.path == "/api/voice/session/acquire":
-            import time, uuid
             body = self._payload() if self.headers.get("Content-Length") else {}
             client_owner = str(body.get("owner") or "").strip()
             sess = globals().setdefault("GLOBAL_VOICE_SESSION", {"active": False, "owner": None, "acquired_at": 0.0})
@@ -3938,10 +3946,6 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             try:
-                import re
-                import urllib.request
-                import urllib.error
-                import urllib.parse
                 body = self._payload()
                 msg = str(body.get("message") or "").strip()
                 history = (body.get("history") or [])[-4:]
@@ -4044,7 +4048,6 @@ class Handler(BaseHTTPRequestHandler):
                 proc_name = ""
                 active_rect = None
                 try:
-                    import ctypes
                     user32 = ctypes.windll.user32
                     hwnd = user32.GetForegroundWindow()
                     
@@ -4125,7 +4128,6 @@ class Handler(BaseHTTPRequestHandler):
                     if not is_sensitive:
                         try:
                             from PIL import ImageGrab, ImageStat
-                            import io, base64
                             
                             def _is_black(im):
                                 try:
@@ -4286,7 +4288,6 @@ class Handler(BaseHTTPRequestHandler):
                 # Ambil API key langsung dari database lokal 9router
                 api_key = ""
                 try:
-                    import sqlite3
                     db_p = os.path.expanduser(r"~\AppData\Roaming\9router\db\data.sqlite")
                     if os.path.exists(db_p):
                         with sqlite3.connect(db_p) as _conn:
@@ -4311,10 +4312,6 @@ class Handler(BaseHTTPRequestHandler):
                 effective_tools = available_tools
 
                 def _send_chat_completion(msgs, tools=None):
-                    import json
-                    import urllib.request
-                    import urllib.error
-                    import urllib.parse
                     payload_dict = {
                         "model": voice_model,
                         "messages": msgs,
@@ -4406,7 +4403,6 @@ class Handler(BaseHTTPRequestHandler):
                         elif fn_name == "browser_action":
                             action = fn_args.get("action")
                             target = fn_args.get("target", "")
-                            import webbrowser
                             if action == "open_url" and target.startswith("http"):
                                 webbrowser.open(target)
                                 tool_result = {"status": "ok", "message": f"Browser membuka URL: {target}"}
@@ -4419,7 +4415,6 @@ class Handler(BaseHTTPRequestHandler):
                             action = fn_args.get("action")
                             app_n = fn_args.get("app_name", "").strip()
                             if action == "launch":
-                                import shlex, subprocess
                                 # ponytail: Cegah shell=True & command injection, jalankan subprocess array murni
                                 safe_tokens = shlex.split(app_n)
                                 if safe_tokens:
@@ -4432,7 +4427,6 @@ class Handler(BaseHTTPRequestHandler):
                                     tool_result = {"status": "error", "message": "Nama aplikasi tidak valid."}
                             elif action in ("focus", "minimize"):
                                 try:
-                                    import ctypes
                                     user32 = ctypes.windll.user32
                                     def _enum_cb(hwnd_target, extra):
                                         if user32.IsWindowVisible(hwnd_target):
@@ -4467,7 +4461,6 @@ class Handler(BaseHTTPRequestHandler):
                         elif fn_name == "computer_use_action":
                             action = fn_args.get("action")
                             try:
-                                import ctypes
                                 user32 = ctypes.windll.user32
                                 if action == "click":
                                     x = int(fn_args.get("x", 0))
@@ -4502,7 +4495,6 @@ class Handler(BaseHTTPRequestHandler):
                             task_instruction = fn_args.get("instruction", "").strip()
                             # ponytail: Eksekusi biner Hermes lokal nyata via subprocess, bounded 8s voice loop
                             hermes_bin = str(Path.home() / "AppData" / "Local" / "hermes" / "hermes-agent" / "venv" / "Scripts" / "hermes.exe")
-                            import subprocess
                             if os.path.exists(hermes_bin) and task_instruction:
                                 try:
                                     res_sub = subprocess.run(
@@ -4884,7 +4876,6 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self._payload()
                 enabled = bool(payload.get("enabled"))
                 try:
-                    import ctypes
                     if not ctypes.windll.shell32.IsUserAnAdmin():
                         return self._json(HTTPStatus.FORBIDDEN, {
                             "ok": False,
@@ -4900,7 +4891,6 @@ class Handler(BaseHTTPRequestHandler):
                         winreg.KEY_SET_VALUE,
                     ) as key:
                         winreg.SetValueEx(key, "fDenyTSConnections", 0, winreg.REG_DWORD, 0 if enabled else 1)
-                    import subprocess
                     if enabled:
                         subprocess.run(["sc.exe", "config", "TermService", "start=", "demand"], check=True, capture_output=True, timeout=8)
                         subprocess.run(["sc.exe", "start", "TermService"], check=False, capture_output=True, timeout=12)
@@ -5074,7 +5064,6 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if self.path == "/api/debate/config":
                 payload = self._payload()
-                from pathlib import Path
                 cfg_file = Path.home() / ".hermes" / "hdo" / "config.json"
                 cfg_file.parent.mkdir(parents=True, exist_ok=True)
                 cfg_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -5098,12 +5087,9 @@ class Handler(BaseHTTPRequestHandler):
                 task = str(payload.get("task") or "").strip()
                 if not task:
                     return self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "task is required"})
-                import sys
-                from pathlib import Path
                 plugins_dir = Path.home() / "AppData" / "Local" / "hermes" / "profiles" / "vans" / "plugins"
                 if str(plugins_dir) not in sys.path:
                     sys.path.insert(0, str(plugins_dir))
-                import importlib
                 hdo_srv = importlib.import_module("hermes-debate-orchestrator.server")
                 hdo_supervisor = importlib.import_module("hermes-debate-orchestrator.supervisor")
                 srv = hdo_srv.DashboardServer.get_instance()
@@ -5113,12 +5099,9 @@ class Handler(BaseHTTPRequestHandler):
                 res["dashboard_url"] = f"{res['url']}/index.html?run={run_id}"
                 return self._json(HTTPStatus.OK, {"ok": True, "status": "RUNNING", **res})
             if self.path == "/api/debate/stop":
-                import sys
-                from pathlib import Path
                 plugins_dir = Path.home() / "AppData" / "Local" / "hermes" / "profiles" / "vans" / "plugins"
                 if str(plugins_dir) not in sys.path:
                     sys.path.insert(0, str(plugins_dir))
-                import importlib
                 hdo_srv = importlib.import_module("hermes-debate-orchestrator.server")
                 hdo_srv.DashboardServer.get_instance().stop()
                 return self._json(HTTPStatus.OK, {"ok": True, "status": "stopped"})
@@ -5151,7 +5134,6 @@ class Handler(BaseHTTPRequestHandler):
                         s_model = current.get("simple_model", "ag/gemini-3.8-flash-high").strip()
                         c_model = current.get("complex_model", "ag/claude-opus-4-6-thinking").strip()
                         txt = proxy_yaml.read_text(encoding="utf-8")
-                        import re
                         # Update simple model mapping
                         txt = re.sub(
                             r"(- model_name:\s*gemini_flash_high\s*\n\s*litellm_params:\s*\n\s*model:\s*)openai/[^\n]+",

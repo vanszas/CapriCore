@@ -462,6 +462,14 @@ object RemoteState {
         }
     }
 
+    fun refreshSessions(ctx: Context) {
+        val c = client(ctx) ?: return
+        io.execute {
+            val list = runCatching { c.sessions() }.getOrNull() ?: return@execute
+            post { sessions = list }
+        }
+    }
+
     fun switchWorkspace(ctx: Context, path: String, onDone: (String?) -> Unit = {}) {
         val c = client(ctx) ?: return
         io.execute {
@@ -469,14 +477,26 @@ object RemoteState {
                 val ws = c.selectWorkspace(path)
                 val wss = runCatching { c.workspaces() }.getOrDefault(workspaces)
                 val sess = runCatching { c.sessions() }.getOrDefault(emptyList())
+                val nextSess = sess.firstOrNull()?.let { runCatching { c.loadSession(it.id) }.getOrDefault(it) }
+                val prefs = RemotePrefs(ctx)
+                prefs.activeProfile()?.let { cur ->
+                    prefs.updateProfile(
+                        cur.copy(
+                            lastWorkspace = ws.path,
+                            lastSessionId = nextSess?.id.orEmpty(),
+                        ),
+                    )
+                }
                 post {
-                    if (activeWorkspace != ws.path) {
-                        activeSession = null
-                        messages = emptyList()
-                    }
+                    activeProfile = prefs.activeProfile()
                     activeWorkspace = ws.path
                     workspaces = wss
                     sessions = sess
+                    activeSession = nextSess
+                    messages = nextSess?.messages ?: emptyList()
+                    toolActivities = emptyList()
+                    approvals = emptyList()
+                    clarifications = emptyList()
                     treePath = ""
                     openFile = null
                     onDone(null)
@@ -520,16 +540,34 @@ object RemoteState {
             try {
                 val workspace = activeWorkspace
                 val previous = activeSession
+                fun persistLastSession(id: String) {
+                    prefs.activeProfile()?.let { cur ->
+                        if (cur.lastSessionId != id) {
+                            prefs.updateProfile(cur.copy(lastSessionId = id))
+                        }
+                    }
+                }
                 fun newSession() = c.createSession(
                     activeWorkspace.substringAfterLast('\\').ifBlank { "Workspace" },
                     selectedModel.ifBlank { "PC Agent" },
                 ).also { created ->
-                    check(workspace.isBlank() || created.workspace.equals(workspace, ignoreCase = true)) {
+                    val wsCreated = created.workspace.trimEnd('\\', '/')
+                    val wsExpected = workspace.trimEnd('\\', '/')
+                    check(wsExpected.isBlank() || wsCreated.isBlank() || wsCreated.equals(wsExpected, ignoreCase = true)) {
                         "Workspace PC berubah. Sambungkan ulang."
                     }
-                    post { activeSession = created }
+                    persistLastSession(created.id)
+                    post {
+                        activeProfile = prefs.activeProfile()
+                        activeSession = created
+                        sessions = listOf(created) + sessions.filterNot { it.id == created.id }
+                    }
                 }.id
                 var sid = previous?.id ?: newSession()
+                if (previous != null) {
+                    persistLastSession(sid)
+                    post { activeProfile = prefs.activeProfile() }
+                }
 
                 val optimisticUser = RemoteMessage("local_${System.currentTimeMillis()}", "user", text)
                 post { messages = messages + optimisticUser }
@@ -653,13 +691,28 @@ object RemoteState {
                     }
                 }
                 val refreshed = runCatching { c.loadSession(sid) }.getOrNull()
+                val refreshedSessions = runCatching { c.sessions() }.getOrNull()
                 val refreshedTasks = runCatching { c.tasks() }.getOrDefault(tasks)
+                persistLastSession(sid)
                 post {
-                    if (refreshed != null) {
+                    activeProfile = prefs.activeProfile()
+                    if (refreshedSessions != null) {
+                        sessions = refreshedSessions
+                    } else if (refreshed != null) {
+                        sessions = listOf(refreshed) + sessions.filterNot { it.id == refreshed.id }
+                    }
+                    if (refreshed != null && refreshed.messages.isNotEmpty()) {
                         activeSession = refreshed
-                        messages = refreshed.messages
-                    } else if (buf.isNotEmpty()) {
-                        messages = messages + RemoteMessage("asst_${System.currentTimeMillis()}", "assistant", buf.toString())
+                        messages = if (buf.isNotEmpty() && refreshed.messages.lastOrNull()?.role == "user") {
+                            refreshed.messages + RemoteMessage("asst_${System.currentTimeMillis()}", "assistant", buf.toString())
+                        } else {
+                            refreshed.messages
+                        }
+                    } else {
+                        if (refreshed != null) activeSession = refreshed
+                        if (buf.isNotEmpty()) {
+                            messages = messages + RemoteMessage("asst_${System.currentTimeMillis()}", "assistant", buf.toString())
+                        }
                     }
                     streaming = false
                     streamingText = ""
@@ -668,7 +721,9 @@ object RemoteState {
                 }
             } catch (e: Exception) {
                 val msg = e.message ?: "Stream error"
+                val latestSessions = runCatching { c.sessions() }.getOrNull()
                 post {
+                    if (latestSessions != null) sessions = latestSessions
                     streaming = false
                     streamingText = ""
                     streamingStatus = ""
