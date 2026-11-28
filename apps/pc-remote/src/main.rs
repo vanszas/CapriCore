@@ -172,6 +172,94 @@ enum VoiceEvent {
     Error(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RdpStatusInfo {
+    supported: bool,
+    enabled: bool,
+    listening: bool,
+    legacy: bool,
+    host: String,
+    port: u16,
+    username: String,
+}
+
+enum RdpTaskResult {
+    Status(Result<RdpStatusInfo, String>),
+    Toggle(Result<RdpStatusInfo, String>),
+    OpenSettings(Result<String, String>),
+    Connect(Result<String, String>),
+}
+
+fn parse_rdp_status(val: &Value, fallback_host: &str) -> RdpStatusInfo {
+    let raw_host = val["host"].as_str().unwrap_or("").trim();
+    let host = if raw_host.is_empty() {
+        fallback_host.trim().to_owned()
+    } else {
+        raw_host.to_owned()
+    };
+    let port = val["port"]
+        .as_u64()
+        .filter(|p| (1..=65535).contains(p))
+        .unwrap_or(3389) as u16;
+    RdpStatusInfo {
+        supported: val["supported"].as_bool().unwrap_or(false),
+        enabled: val["enabled"].as_bool().unwrap_or(false),
+        listening: val["listening"].as_bool().unwrap_or(false),
+        legacy: val["legacy"].as_bool().unwrap_or(false),
+        host,
+        port,
+        username: val["username"].as_str().unwrap_or("").trim().to_owned(),
+    }
+}
+
+fn build_rdp_file_contents(host: &str, port: u16, username: &str) -> String {
+    let mut lines = vec![format!("full address:s:{}:{port}", host.trim())];
+    if !username.trim().is_empty() {
+        lines.push(format!("username:s:{}", username.trim()));
+    }
+    lines.extend([
+        "prompt for credentials:i:1".to_owned(),
+        "screen mode id:i:2".to_owned(),
+        "smart sizing:i:1".to_owned(),
+        "audiomode:i:0".to_owned(),
+        "audiocapturemode:i:1".to_owned(),
+        "redirectclipboard:i:1".to_owned(),
+        "compression:i:1".to_owned(),
+        "networkautodetect:i:1".to_owned(),
+        "bandwidthautodetect:i:1".to_owned(),
+    ]);
+    format!("{}\r\n", lines.join("\r\n"))
+}
+
+fn prepare_rdp_payload(
+    downloaded: Option<&str>,
+    target_host: &str,
+    port: u16,
+    username: &str,
+) -> String {
+    let address_line = format!("full address:s:{}:{port}", target_host.trim());
+    if let Some(raw) = downloaded.map(str::trim).filter(|s| !s.is_empty()) {
+        let mut has_address = false;
+        let mut lines: Vec<String> = raw
+            .lines()
+            .map(|line| {
+                let clean = line.trim_end_matches('\r');
+                if clean.to_ascii_lowercase().starts_with("full address:s:") {
+                    has_address = true;
+                    address_line.clone()
+                } else {
+                    clean.to_owned()
+                }
+            })
+            .collect();
+        if !has_address {
+            lines.insert(0, address_line);
+        }
+        return format!("{}\r\n", lines.join("\r\n"));
+    }
+    build_rdp_file_contents(target_host, port, username)
+}
+
 fn decode_base64(input: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
     let mut buf: u32 = 0;
@@ -292,6 +380,12 @@ struct Remote {
     voice_rx: Option<mpsc::Receiver<VoiceEvent>>,
     host_audio: Option<(Arc<AtomicBool>, mpsc::Receiver<String>)>,
     audio_permission: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
+    rdp_dialog_open: bool,
+    rdp_loading: bool,
+    rdp_busy: bool,
+    rdp_info: Option<RdpStatusInfo>,
+    rdp_message: String,
+    rdp_rx: Option<mpsc::Receiver<RdpTaskResult>>,
 }
 
 impl Remote {
@@ -1100,6 +1194,364 @@ impl Remote {
         });
         self.voice_status = "Mic dimatikan.".into();
     }
+
+    fn refresh_rdp_status(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        self.rdp_rx = Some(rx);
+        self.rdp_loading = true;
+        self.rdp_message.clear();
+        let endpoint = self.endpoint.trim().to_owned();
+        let token = self.token.clone();
+        let device = self.device.clone();
+        let name = self.device_name.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let res = (|| -> Result<RdpStatusInfo, String> {
+                let agent = ureq::AgentBuilder::new()
+                    .redirects(0)
+                    .timeout(Duration::from_secs(4))
+                    .build();
+                match build_request(&agent, "GET", &endpoint, "/api/rdp/status", &token, &device, &name).call() {
+                    Ok(resp) => {
+                        let val: Value = resp.into_json().map_err(|e| format!("Status RDP tidak valid: {e}"))?;
+                        Ok(parse_rdp_status(&val, &endpoint))
+                    }
+                    Err(ureq::Error::Status(code, _resp)) if code == 404 || code == 405 => {
+                        let target = format!("{endpoint}:3389");
+                        let reachable = target
+                            .parse::<std::net::SocketAddr>()
+                            .ok()
+                            .is_some_and(|addr| {
+                                std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(1500)).is_ok()
+                            });
+                        Ok(RdpStatusInfo {
+                            supported: true,
+                            enabled: reachable,
+                            listening: reachable,
+                            legacy: true,
+                            host: endpoint,
+                            port: 3389,
+                            username: String::new(),
+                        })
+                    }
+                    Err(ureq::Error::Status(code, resp)) => {
+                        let body: Value = resp.into_json().unwrap_or_default();
+                        Err(body["error"].as_str().map(str::to_owned).unwrap_or_else(|| format!("HTTP {code}")))
+                    }
+                    Err(e) => Err(format!("Gagal memeriksa status RDP: {e}")),
+                }
+            })();
+            let _ = tx.send(RdpTaskResult::Status(res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn toggle_rdp(&mut self, enable: bool, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        self.rdp_rx = Some(rx);
+        self.rdp_busy = true;
+        self.rdp_message.clear();
+        let endpoint = self.endpoint.trim().to_owned();
+        let token = self.token.clone();
+        let device = self.device.clone();
+        let name = self.device_name.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let res = (|| -> Result<RdpStatusInfo, String> {
+                let agent = ureq::AgentBuilder::new()
+                    .redirects(0)
+                    .timeout(Duration::from_secs(30))
+                    .build();
+                match build_request(&agent, "POST", &endpoint, "/api/rdp/toggle", &token, &device, &name)
+                    .send_json(json!({ "enabled": enable }))
+                {
+                    Ok(resp) => {
+                        let val: Value = resp.into_json().map_err(|e| format!("Respons toggle RDP tidak valid: {e}"))?;
+                        Ok(parse_rdp_status(&val, &endpoint))
+                    }
+                    Err(ureq::Error::Status(code, resp)) => {
+                        let body: Value = resp.into_json().unwrap_or_default();
+                        Err(body["error"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("Gagal mengubah status RDP (HTTP {code})")))
+                    }
+                    Err(e) => Err(format!("Gagal mengubah status RDP: {e}")),
+                }
+            })();
+            let _ = tx.send(RdpTaskResult::Toggle(res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn open_rdp_host_settings(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        self.rdp_rx = Some(rx);
+        self.rdp_busy = true;
+        self.rdp_message.clear();
+        let endpoint = self.endpoint.trim().to_owned();
+        let token = self.token.clone();
+        let device = self.device.clone();
+        let name = self.device_name.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let res = (|| -> Result<String, String> {
+                let agent = ureq::AgentBuilder::new()
+                    .redirects(0)
+                    .timeout(Duration::from_secs(5))
+                    .build();
+                match build_request(&agent, "POST", &endpoint, "/api/rdp/open-settings", &token, &device, &name)
+                    .send_json(json!({}))
+                {
+                    Ok(_) => Ok("Pengaturan Remote Desktop dibuka di PC host — aktifkan lalu klik Refresh.".into()),
+                    Err(ureq::Error::Status(code, resp)) => {
+                        let body: Value = resp.into_json().unwrap_or_default();
+                        Err(body["error"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("Gagal membuka Pengaturan RDP (HTTP {code})")))
+                    }
+                    Err(e) => Err(format!("Gagal membuka Pengaturan RDP: {e}")),
+                }
+            })();
+            let _ = tx.send(RdpTaskResult::OpenSettings(res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn launch_microsoft_rdp(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        self.rdp_rx = Some(rx);
+        self.rdp_busy = true;
+        self.rdp_message.clear();
+        let endpoint = self.endpoint.trim().to_owned();
+        let fallback_host = self
+            .rdp_info
+            .as_ref()
+            .map(|i| i.host.clone())
+            .filter(|h| !h.trim().is_empty())
+            .unwrap_or_else(|| endpoint.clone());
+        let target_host = if !endpoint.is_empty() { endpoint.clone() } else { fallback_host };
+        let port = self.rdp_info.as_ref().map(|i| i.port).unwrap_or(3389);
+        let username = self
+            .rdp_info
+            .as_ref()
+            .map(|i| i.username.clone())
+            .unwrap_or_default();
+        let token = self.token.clone();
+        let device = self.device.clone();
+        let name = self.device_name.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let res = (|| -> Result<String, String> {
+                if target_host.is_empty() {
+                    return Err("Host belum tersambung".into());
+                }
+                let agent = ureq::AgentBuilder::new()
+                    .redirects(0)
+                    .timeout(Duration::from_secs(5))
+                    .build();
+                let downloaded = build_request(&agent, "GET", &endpoint, "/api/rdp/connect.rdp", &token, &device, &name)
+                    .call()
+                    .ok()
+                    .and_then(|resp| resp.into_string().ok());
+                let rdp_body = prepare_rdp_payload(downloaded.as_deref(), &target_host, port, &username);
+                let rdp_path = std::env::temp_dir().join("Capri-PC.rdp");
+                let launched = if std::fs::write(&rdp_path, rdp_body.as_bytes()).is_ok() {
+                    std::process::Command::new("mstsc.exe").arg(&rdp_path).spawn()
+                } else {
+                    std::process::Command::new("mstsc.exe")
+                        .arg(format!("/v:{target_host}:{port}"))
+                        .spawn()
+                };
+                launched.map_err(|e| format!("Gagal membuka mstsc.exe: {e}"))?;
+                Ok(format!("Membuka Microsoft Remote Desktop ke {target_host}:{port}"))
+            })();
+            let _ = tx.send(RdpTaskResult::Connect(res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn show_rdp_dialog(&mut self, ctx: &egui::Context) {
+        if !self.connected || !self.rdp_dialog_open {
+            return;
+        }
+        let mut open = self.rdp_dialog_open;
+        let bg_card = egui::Color32::from_rgb(19, 23, 29);
+        let bg_elevated = egui::Color32::from_rgb(26, 32, 40);
+        let border = egui::Color32::from_rgb(38, 46, 58);
+        let accent = egui::Color32::from_rgb(14, 116, 144);
+        let emerald = egui::Color32::from_rgb(16, 185, 129);
+        let amber = egui::Color32::from_rgb(245, 158, 11);
+        let text_primary = egui::Color32::from_rgb(243, 245, 248);
+        let text_muted = egui::Color32::from_rgb(154, 164, 178);
+
+        let info = self.rdp_info.clone();
+        let host = if !self.endpoint.trim().is_empty() {
+            self.endpoint.trim().to_owned()
+        } else {
+            info.as_ref().map(|i| i.host.clone()).unwrap_or_default()
+        };
+        let port = info.as_ref().map(|i| i.port).unwrap_or(3389);
+        let username = info.as_ref().map(|i| i.username.clone()).unwrap_or_default();
+        let listening = info.as_ref().is_some_and(|i| i.listening);
+        let supported = info.as_ref().is_some_and(|i| i.supported);
+        let legacy = info.as_ref().is_some_and(|i| i.legacy);
+
+        let mut close_clicked = false;
+        let mut refresh_clicked = false;
+        let mut toggle_target: Option<bool> = None;
+        let mut settings_clicked = false;
+        let mut connect_clicked = false;
+
+        egui::Window::new("Windows Remote Desktop (RDP)")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(430.0)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(bg_card)
+                    .stroke(egui::Stroke::new(1.0_f32, border))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Native Microsoft RDP (0 delay untuk video, audio & kursor). Catatan: layar fisik PC host otomatis ter-lock saat sesi RDP tersambung.",
+                    )
+                    .size(12.0)
+                    .color(text_muted),
+                );
+                ui.add_space(8.0);
+                egui::Frame::new()
+                    .fill(bg_elevated)
+                    .stroke(egui::Stroke::new(1.0_f32, border))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let target_label = if host.is_empty() {
+                                "Host belum tersambung".to_owned()
+                            } else {
+                                format!("{host}:{port}")
+                            };
+                            ui.label(
+                                egui::RichText::new(target_label)
+                                    .size(13.0)
+                                    .strong()
+                                    .monospace()
+                                    .color(text_primary),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let (badge_text, badge_color) = if self.rdp_loading {
+                                    ("Checking...", amber)
+                                } else if listening {
+                                    ("Siap Konek", emerald)
+                                } else {
+                                    ("Belum Aktif", amber)
+                                };
+                                ui.label(egui::RichText::new(badge_text).size(11.5).strong().color(badge_color));
+                            });
+                        });
+                        if legacy {
+                            ui.label(
+                                egui::RichText::new("Aktifkan RDP melalui Pengaturan Windows di PC host.")
+                                    .size(11.5)
+                                    .color(text_muted),
+                            );
+                        }
+                        if !username.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("User Windows: {username}"))
+                                    .size(11.5)
+                                    .monospace()
+                                    .color(text_muted),
+                            );
+                        }
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let toggle_label = if listening {
+                        "Matikan RDP di PC"
+                    } else {
+                        "Nyalakan RDP di PC"
+                    };
+                    let toggle_fill = if listening {
+                        egui::Color32::from_rgb(120, 53, 15)
+                    } else {
+                        accent
+                    };
+                    if ui
+                        .add_enabled(
+                            !self.rdp_busy && supported && !legacy,
+                            egui::Button::new(egui::RichText::new(toggle_label).size(12.5).color(text_primary))
+                                .fill(toggle_fill),
+                        )
+                        .clicked()
+                    {
+                        toggle_target = Some(!listening);
+                    }
+                    if ui
+                        .add_enabled(!self.rdp_loading && !self.rdp_busy, egui::Button::new("Refresh"))
+                        .clicked()
+                    {
+                        refresh_clicked = true;
+                    }
+                    if (!listening || legacy)
+                        && ui
+                            .add_enabled(!self.rdp_busy, egui::Button::new("Buka Pengaturan RDP"))
+                            .clicked()
+                    {
+                        settings_clicked = true;
+                    }
+                });
+                if !self.rdp_message.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(&self.rdp_message).size(12.0).color(amber));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.rdp_busy && !host.is_empty(),
+                            egui::Button::new(
+                                egui::RichText::new("Konek via Microsoft Remote Desktop")
+                                    .size(13.0)
+                                    .strong()
+                                    .color(text_primary),
+                            )
+                            .fill(egui::Color32::from_rgb(5, 122, 85)),
+                        )
+                        .clicked()
+                    {
+                        connect_clicked = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Tutup").clicked() {
+                            close_clicked = true;
+                        }
+                    });
+                });
+            });
+
+        self.rdp_dialog_open = open && !close_clicked;
+        if refresh_clicked {
+            self.refresh_rdp_status(ctx);
+        }
+        if let Some(enable) = toggle_target {
+            self.toggle_rdp(enable, ctx);
+        }
+        if settings_clicked {
+            self.open_rdp_host_settings(ctx);
+        }
+        if connect_clicked {
+            self.launch_microsoft_rdp(ctx);
+        }
+    }
 }
 
 impl eframe::App for Remote {
@@ -1153,6 +1605,53 @@ impl eframe::App for Remote {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
                     VoiceEvent::Status(s) | VoiceEvent::Error(s) => self.voice_status = s,
+                }
+            }
+        }
+        let rdp_events: Vec<RdpTaskResult> = self
+            .rdp_rx
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        for ev in rdp_events {
+            match ev {
+                RdpTaskResult::Status(Ok(info)) => {
+                    self.rdp_loading = false;
+                    self.rdp_info = Some(info);
+                }
+                RdpTaskResult::Status(Err(err)) => {
+                    self.rdp_loading = false;
+                    self.rdp_message = err;
+                }
+                RdpTaskResult::Toggle(Ok(info)) => {
+                    self.rdp_busy = false;
+                    self.rdp_message = if info.listening {
+                        "RDP aktif dan siap dikoneksikan.".into()
+                    } else {
+                        "RDP dimatikan.".into()
+                    };
+                    self.rdp_info = Some(info);
+                }
+                RdpTaskResult::Toggle(Err(err)) => {
+                    self.rdp_busy = false;
+                    self.rdp_message = err;
+                }
+                RdpTaskResult::OpenSettings(Ok(msg)) => {
+                    self.rdp_busy = false;
+                    self.rdp_message = msg;
+                }
+                RdpTaskResult::OpenSettings(Err(err)) => {
+                    self.rdp_busy = false;
+                    self.rdp_message = err;
+                }
+                RdpTaskResult::Connect(Ok(msg)) => {
+                    self.rdp_busy = false;
+                    self.status = msg;
+                    self.rdp_dialog_open = false;
+                }
+                RdpTaskResult::Connect(Err(err)) => {
+                    self.rdp_busy = false;
+                    self.rdp_message = err;
                 }
             }
         }
@@ -1575,60 +2074,11 @@ impl eframe::App for Remote {
                     .fill(egui::Color32::from_rgb(15, 118, 110));
                     if ui
                         .add(rdp_btn)
-                        .on_hover_text("Buka Microsoft Remote Desktop (mstsc) ke PC host.")
+                        .on_hover_text("Buka dialog Windows Remote Desktop (mstsc) ke PC host.")
                         .clicked()
                     {
-                        let host = self.endpoint.trim().to_owned();
-                        let port: u16 = build_request(
-                            &self.agent,
-                            "GET",
-                            &host,
-                            "/api/rdp/status",
-                            &self.token,
-                            &self.device,
-                            &self.device_name,
-                        )
-                        .timeout(Duration::from_millis(800))
-                        .call()
-                        .ok()
-                        .and_then(|r| r.into_json::<Value>().ok())
-                        .and_then(|v| v["port"].as_u64())
-                        .unwrap_or(3389) as u16;
-                        let target = format!("{host}:{port}");
-                        let reachable = target
-                            .parse::<std::net::SocketAddr>()
-                            .ok()
-                            .is_some_and(|addr| {
-                                std::net::TcpStream::connect_timeout(
-                                    &addr,
-                                    Duration::from_millis(200),
-                                )
-                                .is_ok()
-                            });
-                        if reachable {
-                            let _ = std::process::Command::new("mstsc.exe")
-                                .arg(format!("/v:{target}"))
-                                .spawn();
-                            self.status = format!("Membuka Microsoft Remote Desktop ke {target}");
-                        } else {
-                            let opened = build_request(
-                                &self.agent,
-                                "POST",
-                                &host,
-                                "/api/rdp/open-settings",
-                                &self.token,
-                                &self.device,
-                                &self.device_name,
-                            )
-                            .timeout(Duration::from_secs(2))
-                            .send_json(json!({}))
-                            .is_ok();
-                            self.status = if opened {
-                                "Pengaturan Remote Desktop dibuka di PC host — aktifkan lalu klik Windows RDP lagi.".into()
-                            } else {
-                                "Aktifkan Remote Desktop di Windows Settings PC host (port 3389 belum aktif).".into()
-                            };
-                        }
+                        self.rdp_dialog_open = true;
+                        self.refresh_rdp_status(ctx);
                     }
 
                     if !self.status.is_empty() {
@@ -1657,6 +2107,12 @@ impl eframe::App for Remote {
                             self.connected = false;
                             self.audio_permission = None;
                             self.stop_host_audio();
+                            self.rdp_dialog_open = false;
+                            self.rdp_loading = false;
+                            self.rdp_busy = false;
+                            self.rdp_info = None;
+                            self.rdp_message.clear();
+                            self.rdp_rx = None;
                             self.sync_stream_cfg();
                             self.stop_workers.store(true, Ordering::Relaxed);
                             self.frame = None;
@@ -1900,6 +2356,7 @@ impl eframe::App for Remote {
                     });
                 }
             });
+        self.show_rdp_dialog(ctx);
     }
 }
 
@@ -1976,6 +2433,12 @@ fn main() -> eframe::Result {
                 voice_rx: None,
                 host_audio: None,
                 audio_permission: None,
+                rdp_dialog_open: false,
+                rdp_loading: false,
+                rdp_busy: false,
+                rdp_info: None,
+                rdp_message: String::new(),
+                rdp_rx: None,
             };
             if !remote.endpoint.is_empty() {
                 if let Err(error) = remote.connect(false, &creation.egui_ctx) {
@@ -1988,4 +2451,47 @@ fn main() -> eframe::Result {
             Ok(Box::new(remote))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rdp_status_uses_defaults_and_fallback_host() {
+        let val = json!({
+            "supported": true,
+            "enabled": true,
+            "listening": true,
+            "host": "",
+            "port": 0,
+            "username": "ADMIN"
+        });
+        let info = parse_rdp_status(&val, "100.72.195.109");
+        assert!(info.supported);
+        assert!(info.enabled);
+        assert!(info.listening);
+        assert!(!info.legacy);
+        assert_eq!(info.host, "100.72.195.109");
+        assert_eq!(info.port, 3389);
+        assert_eq!(info.username, "ADMIN");
+    }
+
+    #[test]
+    fn prepare_rdp_payload_rewrites_full_address_to_connected_host() {
+        let server_rdp = "full address:s:192.168.1.5:3389\r\nusername:s:ADMIN\r\naudiomode:i:0\r\n";
+        let out = prepare_rdp_payload(Some(server_rdp), "100.72.195.109", 3389, "ADMIN");
+        assert!(out.starts_with("full address:s:100.72.195.109:3389\r\n"));
+        assert!(out.contains("username:s:ADMIN\r\n"));
+        assert!(!out.contains("192.168.1.5"));
+    }
+
+    #[test]
+    fn build_rdp_file_contents_includes_audio_and_smart_sizing() {
+        let out = prepare_rdp_payload(None, "100.72.195.109", 3390, "ivan");
+        assert!(out.contains("full address:s:100.72.195.109:3390\r\n"));
+        assert!(out.contains("username:s:ivan\r\n"));
+        assert!(out.contains("smart sizing:i:1\r\n"));
+        assert!(out.contains("audiomode:i:0\r\n"));
+    }
 }
