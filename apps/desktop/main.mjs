@@ -59,7 +59,7 @@ import {
 } from './renderer/voice-volume.mjs';
 import { ResolveAdapter } from '../../integrations/resolve/service.mjs';
 import { ComputerAgent } from './computer-agent.mjs';
-import { computerPlanner } from './computer-planner.mjs';
+import { computerIntentClassifier, computerPlanner } from './computer-planner.mjs';
 import { computerToolSelector } from './computer-tool-selection.mjs';
 import { spotifyPlanner } from './spotify-planner.mjs';
 import { computerVision } from './computer-vision.mjs';
